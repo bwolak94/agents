@@ -86,6 +86,30 @@ export const GAME_CSS = `
     pointer-events: none;
   }
   .zone-active { animation: zoneGlow 2s ease-in-out infinite; }
+  @keyframes shimmer {
+    0%   { background-position: -200% center; }
+    100% { background-position: 200% center; }
+  }
+  @keyframes pulseBar {
+    0%,100% { opacity: 0.5; }
+    50%      { opacity: 1; }
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .agent-card-enter { animation: fadeIn 0.25s ease-out; }
+
+  .progress-shimmer {
+    background: linear-gradient(90deg, transparent 25%, currentColor 50%, transparent 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.4s ease-in-out infinite;
+  }
+  .progress-pulse {
+    animation: pulseBar 1.5s ease-in-out infinite;
+  }
+
   .crt-overlay {
     position: absolute;
     inset: 0;

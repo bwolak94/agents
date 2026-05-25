@@ -34,11 +34,11 @@ services:
     build:
       context: ./web
       dockerfile: ../docker/Dockerfile.web
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
     container_name: agent-web
     ports:
       - "3000:3000"
-    environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
     depends_on:
       - api
     restart: unless-stopped

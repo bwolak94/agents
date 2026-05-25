@@ -98,6 +98,7 @@ export function useWebSocket(sessionId: string | null): UseWebSocketResult {
               task: ev.task,
               status: 'idle',
               tools: ev.tools,
+              startedAt: Date.now(),
             },
           }));
           break;

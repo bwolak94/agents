@@ -16,6 +16,7 @@ export interface Agent {
   status: AgentStatus;
   tools?: string[];
   tool?: string;
+  startedAt?: number;
 }
 
 export type AgentMap = Record<string, Agent>;
