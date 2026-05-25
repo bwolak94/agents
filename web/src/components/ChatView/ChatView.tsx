@@ -4,6 +4,9 @@ import type { ChatMessage } from '@/types/chat';
 import type { Dispatch, SetStateAction } from 'react';
 import { AGENT_CFG, DEFAULT_AGENT_CFG, MODEL_COLORS } from '@/constants/agents';
 import { useChat } from '@/hooks/useChat';
+import { FileUpload } from '@/components/FileUpload/FileUpload';
+import { VoiceInput } from '@/components/VoiceInput/VoiceInput';
+import { PromptLibrary } from '@/components/PromptLibrary/PromptLibrary';
 
 interface ChatViewProps {
   sessionId: string | null;
@@ -40,6 +43,18 @@ export function ChatView({ sessionId, messages, setMessages }: ChatViewProps) {
     }
   };
 
+  const handleFileUploaded = (reference: string, _filename: string) => {
+    setInput((prev) => (prev ? `${prev} ${reference}` : reference));
+  };
+
+  const handleTranscript = (text: string) => {
+    setInput(text);
+  };
+
+  const handleSelectPrompt = (content: string) => {
+    setInput(content);
+  };
+
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       <div
@@ -70,9 +85,13 @@ export function ChatView({ sessionId, messages, setMessages }: ChatViewProps) {
       <ChatInput
         value={input}
         loading={loading}
+        sessionId={sessionId}
         onChange={setInput}
         onKeyDown={handleKeyDown}
         onSend={handleSend}
+        onFileUploaded={handleFileUploaded}
+        onTranscript={handleTranscript}
+        onSelectPrompt={handleSelectPrompt}
       />
     </div>
   );
@@ -163,22 +182,50 @@ function ThinkingIndicator() {
 interface ChatInputProps {
   value: string;
   loading: boolean;
+  sessionId: string | null;
   onChange: (value: string) => void;
   onKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => void;
   onSend: () => void;
+  onFileUploaded: (reference: string, filename: string) => void;
+  onTranscript: (text: string) => void;
+  onSelectPrompt: (content: string) => void;
 }
 
-function ChatInput({ value, loading, onChange, onKeyDown, onSend }: ChatInputProps) {
+function ChatInput({
+  value,
+  loading,
+  sessionId,
+  onChange,
+  onKeyDown,
+  onSend,
+  onFileUploaded,
+  onTranscript,
+  onSelectPrompt,
+}: ChatInputProps) {
   const isDisabled = loading || !value.trim();
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 300)}px`;
+  }, [value]);
 
   return (
     <div style={{ padding: '12px 16px', background: '#0a0a1a', borderTop: '1px solid #1e1e2e' }}>
-      <div style={{ display: 'flex', gap: 8, maxWidth: 800, margin: '0 auto' }}>
+      <div style={{ display: 'flex', gap: 8, maxWidth: 800, margin: '0 auto', alignItems: 'flex-end' }}>
+        {/* Left controls */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 2, paddingBottom: 2 }}>
+          <FileUpload sessionId={sessionId} onUploaded={onFileUploaded} />
+        </div>
+
         <textarea
+          ref={textareaRef}
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="Ask a question... (Enter to send)"
+          placeholder="Ask a question... (Enter to send, Shift+Enter for new line)"
           rows={1}
           style={{
             flex: 1,
@@ -191,24 +238,38 @@ function ChatInput({ value, loading, onChange, onKeyDown, onSend }: ChatInputPro
             resize: 'none',
             outline: 'none',
             fontFamily: 'inherit',
+            lineHeight: 1.6,
+            overflowY: 'auto',
+            minHeight: 42,
+            maxHeight: 300,
           }}
         />
-        <button
-          onClick={onSend}
-          disabled={isDisabled}
-          style={{
-            background: isDisabled ? '#1e293b' : '#2563eb',
-            color: '#e2e8f0',
-            border: 'none',
-            borderRadius: 12,
-            padding: '10px 18px',
-            cursor: isDisabled ? 'not-allowed' : 'pointer',
-            fontSize: 16,
-            transition: 'background 0.2s',
-          }}
-        >
-          ↑
-        </button>
+
+        {/* Right controls */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+          <PromptLibrary
+            sessionId={sessionId}
+            onSelectPrompt={onSelectPrompt}
+            currentInput={value}
+          />
+          <VoiceInput onTranscript={onTranscript} disabled={loading} />
+          <button
+            onClick={onSend}
+            disabled={isDisabled}
+            style={{
+              background: isDisabled ? '#1e293b' : '#2563eb',
+              color: '#e2e8f0',
+              border: 'none',
+              borderRadius: 12,
+              padding: '10px 18px',
+              cursor: isDisabled ? 'not-allowed' : 'pointer',
+              fontSize: 16,
+              transition: 'background 0.2s',
+            }}
+          >
+            ↑
+          </button>
+        </div>
       </div>
     </div>
   );

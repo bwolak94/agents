@@ -1,17 +1,33 @@
 'use client';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 
-export function useSession(): string | null {
+function generateId() {
+  return 'session-' + Math.random().toString(36).slice(2, 10);
+}
+
+export function useSession() {
   const [sessionId, setSessionId] = useState<string | null>(null);
 
   useEffect(() => {
     let sid = localStorage.getItem('agent_session_id');
     if (!sid) {
-      sid = 'session-' + Math.random().toString(36).slice(2, 10);
+      sid = generateId();
       localStorage.setItem('agent_session_id', sid);
     }
     setSessionId(sid);
   }, []);
 
-  return sessionId;
+  const switchSession = useCallback((id: string) => {
+    localStorage.setItem('agent_session_id', id);
+    setSessionId(id);
+  }, []);
+
+  const newSession = useCallback(() => {
+    const id = generateId();
+    localStorage.setItem('agent_session_id', id);
+    setSessionId(id);
+    return id;
+  }, []);
+
+  return { sessionId, switchSession, newSession };
 }

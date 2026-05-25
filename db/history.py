@@ -14,6 +14,10 @@ async def init_db(mongo_url: str):
     _client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
     _db = _client["agent_system"]
     await _db["conversations"].create_index("session_id", unique=True)
+    await _db["analytics"].create_index("ts")
+    await _db["agent_memory"].create_index([("session_id", 1), ("agent_type", 1)], unique=True)
+    await _db["prompts"].create_index([("session_id", 1), ("created_at", -1)])
+    return _db
 
 
 async def load_history(session_id: str) -> list:
@@ -58,6 +62,19 @@ async def clear_history(session_id: str):
 async def list_sessions() -> list:
     cursor = _db["conversations"].find(
         {},
-        {"_id": 0, "session_id": 1, "updated_at": 1}
-    ).sort("updated_at", -1).limit(50)
-    return await cursor.to_list(length=50)
+        {"_id": 0, "session_id": 1, "updated_at": 1, "created_at": 1, "messages": {"$slice": 3}}
+    ).sort("updated_at", -1).limit(100)
+    docs = await cursor.to_list(length=100)
+    result = []
+    for doc in docs:
+        messages = doc.get("messages", [])
+        # Find first user message for preview title
+        first_user = next((m for m in messages if m.get("role") == "user"), None)
+        preview = first_user["content"][:80] if first_user else "Empty chat"
+        result.append({
+            "session_id": doc["session_id"],
+            "updated_at": doc.get("updated_at", ""),
+            "created_at": doc.get("created_at", ""),
+            "preview": preview,
+        })
+    return result

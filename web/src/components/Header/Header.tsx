@@ -1,10 +1,14 @@
 import type { Stats, Costs } from '@/types/chat';
 import type { WsStatus } from '@/hooks/useWebSocket';
 
+export type ViewId = 'chat' | 'analytics';
+
 interface HeaderProps {
   wsStatus: WsStatus;
   stats: Stats;
   costs: Costs | null;
+  view: ViewId;
+  onViewChange: (view: ViewId) => void;
 }
 
 const WS_STATUS_CONFIG: Record<WsStatus, { color: string; label: string }> = {
@@ -12,6 +16,11 @@ const WS_STATUS_CONFIG: Record<WsStatus, { color: string; label: string }> = {
   connecting: { color: '#eab308', label: 'Connecting' },
   offline: { color: '#dc2626', label: 'Offline' },
 };
+
+const NAV_TABS: { id: ViewId; icon: string; label: string }[] = [
+  { id: 'chat', icon: '💬', label: 'Chat' },
+  { id: 'analytics', icon: '📊', label: 'Analytics' },
+];
 
 interface StatPillProps {
   label: string;
@@ -28,7 +37,7 @@ function StatPill({ label, value, color }: StatPillProps) {
   );
 }
 
-export function Header({ wsStatus, stats, costs }: HeaderProps) {
+export function Header({ wsStatus, stats, costs, view, onViewChange }: HeaderProps) {
   const { color: dotColor, label: wsLabel } = WS_STATUS_CONFIG[wsStatus];
 
   return (
@@ -50,6 +59,39 @@ export function Header({ wsStatus, stats, costs }: HeaderProps) {
         <span style={{ fontWeight: 700, fontSize: 14, color: '#e2e8f0' }}>Agent System</span>
         <span style={{ fontSize: 11, color: '#334155' }}>Claude · Gemini · Ollama</span>
       </div>
+
+      {/* Divider */}
+      <div style={{ width: 1, height: 20, background: '#1a1a2e' }} />
+
+      {/* Nav tabs */}
+      <nav style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+        {NAV_TABS.map((tab) => {
+          const isActive = view === tab.id;
+          return (
+            <button
+              key={tab.id}
+              onClick={() => onViewChange(tab.id)}
+              style={{
+                background: isActive ? '#1a1a2e' : 'none',
+                border: isActive ? '1px solid #334155' : '1px solid transparent',
+                borderRadius: 8,
+                color: isActive ? '#e2e8f0' : '#64748b',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 5,
+                fontSize: 12,
+                fontWeight: isActive ? 600 : 400,
+                padding: '4px 10px',
+                transition: 'all 0.15s',
+              }}
+            >
+              <span>{tab.icon}</span>
+              <span>{tab.label}</span>
+            </button>
+          );
+        })}
+      </nav>
 
       {/* Divider */}
       <div style={{ width: 1, height: 20, background: '#1a1a2e' }} />

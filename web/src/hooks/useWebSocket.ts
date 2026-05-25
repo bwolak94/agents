@@ -171,7 +171,8 @@ export function useWebSocket(sessionId: string | null): UseWebSocketResult {
 
     const connect = () => {
       setWsStatus('connecting');
-      ws = new WebSocket(WS_URL);
+      const wsUrl = sessionId ? `${WS_URL}?session_id=${sessionId}` : WS_URL;
+      ws = new WebSocket(wsUrl);
 
       ws.onopen = () => setWsStatus('connected');
       ws.onclose = () => {
@@ -189,7 +190,7 @@ export function useWebSocket(sessionId: string | null): UseWebSocketResult {
       clearTimeout(retryTimer);
       ws?.close();
     };
-  }, [handleMessage]);
+  }, [handleMessage, sessionId]);
 
   return { agents, events, wsStatus, costs, stats };
 }
