@@ -1,0 +1,128 @@
+version: "3.9"
+
+services:
+  # ─────────────────────────────────────────
+  # API Backend (Python/FastAPI)
+  # ─────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: agent-api
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - SEARXNG_URL=http://searxng:8080/search
+      - PYTHONIOENCODING=utf-8
+      - PYTHONUTF8=1
+    volumes:
+      - .:/app
+      - ./data:/app/data
+    depends_on:
+      - ollama
+      - searxng
+    restart: unless-stopped
+    networks:
+      - agent-net
+
+  # ─────────────────────────────────────────
+  # Web UI (Node.js / Next.js)
+  # ─────────────────────────────────────────
+  web:
+    build:
+      context: ./web
+      dockerfile: ../docker/Dockerfile.web
+    container_name: agent-web
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - agent-net
+
+  # ─────────────────────────────────────────
+  # Ollama (lokalne modele LLM)
+  # ─────────────────────────────────────────
+  # ─────────────────────────────────────────
+  # MongoDB - chat history
+  # ─────────────────────────────────────────
+  mongo:
+    image: mongo:7
+    container_name: agent-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    restart: unless-stopped
+    networks:
+      - agent-net
+
+  # ─────────────────────────────────────────
+  # SearXNG - samohostowana wyszukiwarka
+  # Agreguje Google, Bing, DuckDuckGo bez API key
+  # ─────────────────────────────────────────
+  searxng:
+    image: searxng/searxng:latest
+    container_name: agent-searxng
+    ports:
+      - "8888:8080"
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080
+    volumes:
+      - ./searxng:/etc/searxng
+    restart: unless-stopped
+    networks:
+      - agent-net
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: agent-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+    networks:
+      - agent-net
+    # Uncomment if you have an NVIDIA GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # ─────────────────────────────────────────
+  # Ollama Model Puller (jednorazowy setup)
+  # ─────────────────────────────────────────
+  ollama-setup:
+    image: curlimages/curl:latest
+    container_name: agent-ollama-setup
+    depends_on:
+      - ollama
+    networks:
+      - agent-net
+    command: >
+      sh -c "
+        sleep 5 &&
+        curl -s http://ollama:11434/api/pull -d '{\"name\":\"llama3\"}' &&
+        curl -s http://ollama:11434/api/pull -d '{\"name\":\"mistral\"}' &&
+        echo 'Modele pobrane!'
+      "
+    restart: "no"
+
+volumes:
+  ollama-models:
+    name: agent-ollama-models
+  mongo-data:
+    name: agent-mongo-data
+
+networks:
+  agent-net:
+    driver: bridge

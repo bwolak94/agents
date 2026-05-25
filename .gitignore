@@ -1,0 +1,45 @@
+# dependencies
+vendor/
+node_modules/
+
+# build output
+dist/
+assets/build/
+
+# environment variables
+.env
+.env.production
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# macOS-specific files
+.DS_Store
+
+# IDE
+.idea/
+
+# generated types
+.astro/
+.claude/
+.snapshots/
+
+# Secrets
+.env.local
+docs/
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Docker
+docker-compose.override.yml
+
+# IDE
+.vscode/
