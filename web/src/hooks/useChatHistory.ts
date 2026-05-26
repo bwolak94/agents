@@ -15,26 +15,27 @@ interface HistoryResponse {
 
 export function useChatHistory(sessionId: string | null) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     if (!sessionId) return;
+    setLoading(true);
     fetch(`${API_URL}/history/${sessionId}`)
       .then((r) => r.json())
       .then((data: HistoryResponse) => {
-        if (data.messages && data.messages.length > 0) {
-          setMessages(
-            data.messages.map((m) => ({
-              role: m.role as ChatMessage['role'],
-              content: m.content,
-              model: m.model,
-              agent: m.agent,
-              tools: m.tools,
-            })),
-          );
-        }
+        setMessages(
+          (data.messages ?? []).map((m) => ({
+            role: m.role as ChatMessage['role'],
+            content: m.content,
+            model: m.model,
+            agent: m.agent,
+            tools: m.tools,
+          })),
+        );
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => setLoading(false));
   }, [sessionId]);
 
-  return { messages, setMessages };
+  return { messages, setMessages, historyLoading: loading };
 }

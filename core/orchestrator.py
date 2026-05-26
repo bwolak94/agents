@@ -5,6 +5,7 @@ Supports: parallel agents, model fallback chain, history summarization, agent co
 import asyncio
 import uuid
 import time
+import logging
 from typing import Optional
 from rich.console import Console
 from rich.panel import Panel
@@ -17,11 +18,13 @@ from core.events import event_bus
 from db.history import append_message
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 MAX_TOKENS_BY_COMPLEXITY = {"low": 1024, "medium": 2048, "high": 4096}
 MAX_RESPONSE_IN_HISTORY = 2000
 HISTORY_WINDOW = 20          # messages kept in sliding window
 SUMMARIZE_THRESHOLD = 16     # summarize when history exceeds this
+MAX_PARALLEL_SUBTASKS = 3
 
 SUMMARIZE_PROMPT = """Summarize the conversation so far in 3-5 concise bullet points.
 Capture: the user's goals, key decisions made, important facts learned, and any ongoing context.
@@ -59,12 +62,13 @@ class AgentOrchestrator:
 
         # STEP 1: Route (with conversation context)
         if decision is None:
-            await event_bus.emit({
+            # #11 — fire-and-forget: don't block the response pipeline on event delivery
+            asyncio.create_task(event_bus.emit({
                 "type": "routing",
                 "agent_id": agent_id,
                 "session_id": session_id,
                 "task": task_preview,
-            })
+            }))
             decision = await self.router.route(message, self.conversation_history)
 
         self.last_decision = decision
@@ -86,12 +90,12 @@ class AgentOrchestrator:
         )
 
         duration_ms = int((time.time() - t_start) * 1000)
-        await event_bus.emit({
+        asyncio.create_task(event_bus.emit({
             "type": "agent_done",
             "agent_id": agent_id,
             "session_id": session_id,
             "duration_ms": duration_ms,
-        })
+        }))
 
         await self._update_history(session_id, message, response)
         return response
@@ -145,7 +149,7 @@ class AgentOrchestrator:
             parent_orchestrator=self,
         )
 
-        await event_bus.emit({
+        asyncio.create_task(event_bus.emit({
             "type": "agent_start",
             "agent_id": agent_id,
             "session_id": session_id,
@@ -154,9 +158,13 @@ class AgentOrchestrator:
             "task": message[:80],
             "tools": tools,
             "complexity": complexity,
-        })
+        }))
 
-        await event_bus.emit({"type": "agent_thinking", "agent_id": agent_id, "session_id": session_id})
+        asyncio.create_task(event_bus.emit({
+            "type": "agent_thinking",
+            "agent_id": agent_id,
+            "session_id": session_id,
+        }))
 
         agent = get_agent(agent_name, self.llm, self.tools)
         response = await agent.run(
@@ -181,6 +189,14 @@ class AgentOrchestrator:
         parent_agent_id: str,
         t_start: float,
     ) -> str:
+        # #28 — warn if subtasks are truncated
+        if len(subtasks) > MAX_PARALLEL_SUBTASKS:
+            logger.warning(
+                "Router requested %d parallel subtasks; truncating to %d",
+                len(subtasks), MAX_PARALLEL_SUBTASKS,
+            )
+        capped = subtasks[:MAX_PARALLEL_SUBTASKS]
+
         async def run_subtask(subtask: dict, idx: int) -> str:
             sub_id = f"{parent_agent_id}-p{idx}"
             model = subtask.get("model", "claude")
@@ -201,12 +217,12 @@ class AgentOrchestrator:
                 return f"[{agent_name} failed: {e}]"
 
         results = await asyncio.gather(*[
-            run_subtask(st, i) for i, st in enumerate(subtasks[:3])
+            run_subtask(st, i) for i, st in enumerate(capped)
         ])
 
         # Synthesize parallel results
         synthesis_context = "\n\n".join([
-            f"--- Result from {subtasks[i].get('agent', 'agent')} ---\n{r}"
+            f"--- Result from {capped[i].get('agent', 'agent')} ---\n{r}"
             for i, r in enumerate(results)
         ])
         synthesis_prompt = (
@@ -225,12 +241,12 @@ class AgentOrchestrator:
         )
 
         duration_ms = int((time.time() - t_start) * 1000)
-        await event_bus.emit({
+        asyncio.create_task(event_bus.emit({
             "type": "agent_done",
             "agent_id": parent_agent_id,
             "session_id": session_id,
             "duration_ms": duration_ms,
-        })
+        }))
 
         await self._update_history(session_id, original_message, final)
         return final

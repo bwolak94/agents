@@ -14,6 +14,7 @@ interface UseWebSocketResult {
   wsStatus: WsStatus;
   costs: Costs | null;
   stats: Stats;
+  clearAgents: () => void;
 }
 
 const AGENT_FADE_DELAY_MS = 2000;
@@ -46,14 +47,19 @@ export function useWebSocket(sessionId: string | null): UseWebSocketResult {
     ]);
   }, []);
 
+  // #14 — debounced cost fetch: with parallel agents, agent_done fires multiple times
+  const fetchCostsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetchCosts = useCallback(() => {
     if (!sessionId) return;
-    fetch(`${API_URL}/stats?session_id=${sessionId}`)
-      .then((r) => r.json())
-      .then((d: { costs?: Costs }) => {
-        if (d.costs) setCosts(d.costs);
-      })
-      .catch(() => {});
+    if (fetchCostsDebounceRef.current) clearTimeout(fetchCostsDebounceRef.current);
+    fetchCostsDebounceRef.current = setTimeout(() => {
+      fetch(`${API_URL}/stats?session_id=${sessionId}`)
+        .then((r) => r.json())
+        .then((d: { costs?: Costs }) => {
+          if (d.costs) setCosts(d.costs);
+        })
+        .catch(() => {});
+    }, 500);
   }, [sessionId]);
 
   const handleMessage = useCallback(
@@ -192,5 +198,10 @@ export function useWebSocket(sessionId: string | null): UseWebSocketResult {
     };
   }, [handleMessage, sessionId]);
 
-  return { agents, events, wsStatus, costs, stats };
+  const clearAgents = useCallback(() => {
+    setAgents({});
+    setEvents([]);
+  }, []);
+
+  return { agents, events, wsStatus, costs, stats, clearAgents };
 }

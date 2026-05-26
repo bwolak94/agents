@@ -137,15 +137,15 @@ class RouterAgent:
         )
 
     def _build_router_prompt(self, user_message: str, context: list | None) -> str:
-        """Build the routing prompt, including last 2 turns of context."""
+        """Build the routing prompt, including last 4 turns of context (#29)."""
         parts = []
         if context:
-            recent = context[-4:]  # last 2 turns (user+assistant pairs)
+            recent = context[-8:]  # last 4 turns (user+assistant pairs)
             if recent:
                 parts.append("<recent_conversation>")
                 for msg in recent:
                     role = msg.get("role", "user")
-                    content = str(msg.get("content", ""))[:200]
+                    content = str(msg.get("content", ""))[:300]
                     parts.append(f"{role}: {content}")
                 parts.append("</recent_conversation>\n")
         parts.append(f"<current_request>{user_message}</current_request>")

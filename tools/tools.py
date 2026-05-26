@@ -3,7 +3,7 @@ Tools for agents:
 - WebSearch  (SearXNG → Brave → DuckDuckGo fallback chain)
 - CodeExecutor (Python subprocess sandbox)
 - FileReader / FileWriter
-- Shell (blocklist-protected)
+- Shell (allowlist-protected)
 - MemoryRead / MemoryWrite (persistent agent memory)
 - AgentCall (delegate to a specialist agent)
 """
@@ -22,6 +22,15 @@ if TYPE_CHECKING:
     pass
 
 UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", "/tmp/agent_uploads"))
+WORKSPACE_DIR = Path(os.getenv("AGENT_WORKSPACE", "/tmp/agent_workspace"))
+WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Allowed base paths for file reads
+_ALLOWED_READ_PREFIXES = [
+    str(UPLOADS_DIR),
+    str(WORKSPACE_DIR),
+    "/tmp",
+]
 
 
 # ─────────────────────────────────────────
@@ -102,7 +111,7 @@ class WebSearchTool:
 
 
 # ─────────────────────────────────────────
-# CODE EXECUTOR
+# CODE EXECUTOR  (#1 — sandboxed subprocess)
 # ─────────────────────────────────────────
 class CodeExecutorTool:
     TIMEOUT = 30
@@ -118,38 +127,54 @@ class CodeExecutorTool:
         return await self._execute(code)
 
     async def _execute(self, code: str) -> str:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write(code)
-            tmp_path = f.name
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, tmp_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.TIMEOUT)
-            except asyncio.TimeoutError:
-                proc.kill()
-                return f"TIMEOUT: Code ran for longer than {self.TIMEOUT}s"
+        # Use an isolated temp directory per execution
+        with tempfile.TemporaryDirectory(prefix="agent_exec_", dir=str(WORKSPACE_DIR)) as exec_dir:
+            tmp_path = Path(exec_dir) / "script.py"
+            tmp_path.write_text(code)
 
-            output = []
-            if stdout:
-                output.append(f"OUTPUT:\n{stdout.decode()}")
-            if stderr:
-                output.append(f"STDERR:\n{stderr.decode()}")
-            if proc.returncode != 0:
-                output.append(f"Exit code: {proc.returncode}")
-            return "\n".join(output) if output else "Code executed with no output."
-        finally:
-            os.unlink(tmp_path)
+            # Sanitized environment — strip credentials, keep only essentials
+            safe_env = {
+                "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                "PYTHONPATH": "",
+                "HOME": exec_dir,
+                "TMPDIR": exec_dir,
+            }
+
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, str(tmp_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=exec_dir,
+                    env=safe_env,
+                )
+                try:
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.TIMEOUT)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    return f"TIMEOUT: Code ran for longer than {self.TIMEOUT}s"
+
+                output = []
+                if stdout:
+                    output.append(f"OUTPUT:\n{stdout.decode()[:5000]}")
+                if stderr:
+                    output.append(f"STDERR:\n{stderr.decode()[:2000]}")
+                if proc.returncode != 0:
+                    output.append(f"Exit code: {proc.returncode}")
+                return "\n".join(output) if output else "Code executed with no output."
+            except Exception as e:
+                return f"Execution error: {e}"
 
 
 # ─────────────────────────────────────────
-# FILE READER
+# FILE READER  (#4 — path traversal protection)
 # ─────────────────────────────────────────
 class FileReaderTool:
     MAX_SIZE = 100_000  # ~100KB
+
+    def _is_allowed(self, path: Path) -> bool:
+        resolved = str(path.resolve())
+        return any(resolved.startswith(prefix) for prefix in _ALLOWED_READ_PREFIXES)
 
     async def run(self, message: str) -> str:
         # Support upload IDs (upload::<id>)
@@ -171,6 +196,8 @@ class FileReaderTool:
         return await self._read_file(Path(path_match.group(1)))
 
     async def _read_file(self, file_path: Path) -> str:
+        if not self._is_allowed(file_path):
+            return f"Access denied: {file_path} is outside allowed directories."
         if not file_path.exists():
             return f"File not found: {file_path}"
         size = file_path.stat().st_size
@@ -184,7 +211,7 @@ class FileReaderTool:
 
 
 # ─────────────────────────────────────────
-# FILE WRITER
+# FILE WRITER  (#3 — restricted to workspace)
 # ─────────────────────────────────────────
 class FileWriterTool:
     async def run(self, message: str) -> str:
@@ -196,20 +223,29 @@ class FileWriterTool:
 
     async def write(self, path: str, content: str) -> str:
         try:
-            p = Path(path)
+            p = (WORKSPACE_DIR / path).resolve()
+            # Ensure write stays inside workspace
+            if not str(p).startswith(str(WORKSPACE_DIR.resolve())):
+                return f"Access denied: writes are restricted to the workspace directory."
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
-            return f"Saved: {path} ({len(content)} characters)"
+            return f"Saved: {p} ({len(content)} characters)"
         except Exception as e:
             return f"Write error: {e}"
 
 
 # ─────────────────────────────────────────
-# SHELL TOOL
+# SHELL TOOL  (#2 — allowlist instead of blocklist)
 # ─────────────────────────────────────────
 class ShellTool:
     TIMEOUT = 30
-    BLOCKED = ["rm -rf", "mkfs", "dd if=", ":(){", "sudo rm", "shutdown", "reboot", "format"]
+    # Allowlist: only commands starting with these prefixes are permitted
+    ALLOWED_PREFIXES = (
+        "ls", "cat", "echo", "grep", "find", "pwd", "wc", "head", "tail",
+        "date", "env", "which", "python", "pip", "git status", "git log",
+        "git diff", "git branch", "git show", "curl", "wget", "jq",
+        "sort", "uniq", "cut", "awk", "sed", "tr", "xargs",
+    )
 
     async def run(self, message: str) -> str:
         match = re.search(r"```(?:bash|sh|shell)?\n?(.*?)```", message, re.DOTALL)
@@ -224,21 +260,22 @@ class ShellTool:
         return await self._run_command(command)
 
     async def _run_command(self, command: str) -> str:
-        for blocked in self.BLOCKED:
-            if blocked in command:
-                return f"BLOCKED: Command contains '{blocked}'"
+        cmd_lower = command.strip().lower()
+        if not any(cmd_lower.startswith(prefix) for prefix in self.ALLOWED_PREFIXES):
+            return f"BLOCKED: '{command}' is not in the allowed command list."
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                cwd=str(WORKSPACE_DIR),
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.TIMEOUT)
             result = ""
             if stdout:
-                result += stdout.decode()
+                result += stdout.decode()[:5000]
             if stderr:
-                result += f"\nSTDERR: {stderr.decode()}"
+                result += f"\nSTDERR: {stderr.decode()[:2000]}"
             return result or f"Command executed (exit code: {proc.returncode})"
         except asyncio.TimeoutError:
             return f"TIMEOUT after {self.TIMEOUT}s"

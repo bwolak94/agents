@@ -16,6 +16,12 @@ interface Props {
   refreshTrigger?: number;
 }
 
+// #23 — strip XML tags from preview for readability
+function stripXml(text: string): string {
+  const clean = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  return clean || text;
+}
+
 function formatDate(iso: string): string {
   if (!iso) return '';
   const d = new Date(iso);
@@ -140,7 +146,7 @@ export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTr
                   lineHeight: 1.4,
                 }}
               >
-                {s.preview}
+                {stripXml(s.preview)}
               </div>
               {/* Timestamp */}
               <div style={{ fontSize: 10, color: '#334155', marginTop: 2 }}>

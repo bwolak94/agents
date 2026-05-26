@@ -1,5 +1,5 @@
 'use client';
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { usePrompts } from '@/hooks/usePrompts';
 
 interface PromptLibraryProps {
@@ -14,8 +14,21 @@ export function PromptLibrary({ sessionId, onSelectPrompt, currentInput = '' }: 
   const [saveTitle, setSaveTitle] = useState('');
   const [saveTags, setSaveTags] = useState('');
   const [saving, setSaving] = useState(false);
+  const [search, setSearch] = useState(''); // #22
+  const [hoveredId, setHoveredId] = useState<string | null>(null); // #25
 
   const { prompts, loading, savePrompt, deletePrompt } = usePrompts(sessionId);
+
+  // #22 — filter prompts by search query (title + tags)
+  const filtered = useMemo(() => {
+    const q = search.toLowerCase().trim();
+    if (!q) return prompts;
+    return prompts.filter(
+      (p) =>
+        p.title.toLowerCase().includes(q) ||
+        p.tags.some((t) => t.toLowerCase().includes(q)),
+    );
+  }, [prompts, search]);
 
   const handleSave = async () => {
     if (!saveTitle.trim() || !currentInput.trim()) return;
@@ -63,12 +76,8 @@ export function PromptLibrary({ sessionId, onSelectPrompt, currentInput = '' }: 
           color: open ? '#e2e8f0' : '#64748b',
           transition: 'color 0.2s, background 0.2s',
         }}
-        onMouseEnter={(e) => {
-          (e.currentTarget as HTMLButtonElement).style.color = '#94a3b8';
-        }}
-        onMouseLeave={(e) => {
-          (e.currentTarget as HTMLButtonElement).style.color = open ? '#e2e8f0' : '#64748b';
-        }}
+        onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#94a3b8'; }}
+        onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = open ? '#e2e8f0' : '#64748b'; }}
       >
         📚
       </button>
@@ -81,7 +90,7 @@ export function PromptLibrary({ sessionId, onSelectPrompt, currentInput = '' }: 
             top: 0,
             right: 0,
             bottom: 0,
-            width: 280,
+            width: 300,
             background: '#050509',
             borderLeft: '1px solid #1a1a2e',
             zIndex: 200,
@@ -106,22 +115,25 @@ export function PromptLibrary({ sessionId, onSelectPrompt, currentInput = '' }: 
             </span>
             <button
               onClick={() => setOpen(false)}
-              style={{
-                background: 'none',
-                border: 'none',
-                color: '#64748b',
-                cursor: 'pointer',
-                fontSize: 16,
-                padding: 2,
-              }}
+              style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: 16, padding: 2 }}
             >
               ✕
             </button>
           </div>
 
+          {/* #22 — Search input */}
+          <div style={{ padding: '8px 16px', borderBottom: '1px solid #1a1a2e', flexShrink: 0 }}>
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search by title or tag…"
+              style={inputStyle}
+            />
+          </div>
+
           {/* Save current input */}
           {currentInput.trim() && (
-            <div style={{ padding: '10px 16px', borderBottom: '1px solid #1a1a2e', flexShrink: 0 }}>
+            <div style={{ padding: '8px 16px', borderBottom: '1px solid #1a1a2e', flexShrink: 0 }}>
               {!saveFormOpen ? (
                 <button
                   onClick={() => setSaveFormOpen(true)}
@@ -141,18 +153,8 @@ export function PromptLibrary({ sessionId, onSelectPrompt, currentInput = '' }: 
                 </button>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  <input
-                    value={saveTitle}
-                    onChange={(e) => setSaveTitle(e.target.value)}
-                    placeholder="Title"
-                    style={inputStyle}
-                  />
-                  <input
-                    value={saveTags}
-                    onChange={(e) => setSaveTags(e.target.value)}
-                    placeholder="Tags (comma separated)"
-                    style={inputStyle}
-                  />
+                  <input value={saveTitle} onChange={(e) => setSaveTitle(e.target.value)} placeholder="Title" style={inputStyle} />
+                  <input value={saveTags} onChange={(e) => setSaveTags(e.target.value)} placeholder="Tags (comma separated)" style={inputStyle} />
                   <div style={{ display: 'flex', gap: 6 }}>
                     <button
                       onClick={handleSave}
@@ -171,20 +173,8 @@ export function PromptLibrary({ sessionId, onSelectPrompt, currentInput = '' }: 
                       {saving ? 'Saving…' : 'Save'}
                     </button>
                     <button
-                      onClick={() => {
-                        setSaveFormOpen(false);
-                        setSaveTitle('');
-                        setSaveTags('');
-                      }}
-                      style={{
-                        background: '#1a1a2e',
-                        color: '#94a3b8',
-                        border: 'none',
-                        borderRadius: 6,
-                        padding: '6px 10px',
-                        cursor: 'pointer',
-                        fontSize: 12,
-                      }}
+                      onClick={() => { setSaveFormOpen(false); setSaveTitle(''); setSaveTags(''); }}
+                      style={{ background: '#1a1a2e', color: '#94a3b8', border: 'none', borderRadius: 6, padding: '6px 10px', cursor: 'pointer', fontSize: 12 }}
                     >
                       Cancel
                     </button>
@@ -197,19 +187,30 @@ export function PromptLibrary({ sessionId, onSelectPrompt, currentInput = '' }: 
           {/* Prompt list */}
           <div style={{ flex: 1, overflowY: 'auto', padding: '10px 12px' }}>
             {loading && (
-              <div style={{ fontSize: 12, color: '#475569', textAlign: 'center', padding: 20 }}>
-                Loading…
-              </div>
+              <div style={{ fontSize: 12, color: '#475569', textAlign: 'center', padding: 20 }}>Loading…</div>
             )}
             {!loading && prompts.length === 0 && (
+              <div style={{ fontSize: 12, color: '#475569', textAlign: 'center', padding: 20 }}>No saved prompts yet.</div>
+            )}
+            {!loading && prompts.length > 0 && filtered.length === 0 && (
               <div style={{ fontSize: 12, color: '#475569', textAlign: 'center', padding: 20 }}>
-                No saved prompts yet.
+                No prompts match &quot;{search}&quot;
               </div>
             )}
+
+            {/* Result count */}
+            {search && filtered.length > 0 && (
+              <div style={{ fontSize: 10, color: '#334155', marginBottom: 8, textAlign: 'right' }}>
+                {filtered.length} of {prompts.length}
+              </div>
+            )}
+
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {prompts.map((prompt) => (
+              {filtered.map((prompt) => (
                 <div
                   key={prompt.prompt_id}
+                  onMouseEnter={() => setHoveredId(prompt.prompt_id)}
+                  onMouseLeave={() => setHoveredId(null)}
                   style={{
                     background: '#0d0d1a',
                     border: '1px solid #1a1a2e',
@@ -218,67 +219,66 @@ export function PromptLibrary({ sessionId, onSelectPrompt, currentInput = '' }: 
                     display: 'flex',
                     flexDirection: 'column',
                     gap: 6,
+                    position: 'relative',
                   }}
                 >
-                  <div style={{ fontWeight: 600, fontSize: 12, color: '#e2e8f0' }}>
+                  <div style={{ fontWeight: 600, fontSize: 12, color: '#e2e8f0', paddingRight: 24 }}>
                     {prompt.title}
                   </div>
                   <div style={{ fontSize: 11, color: '#64748b', lineHeight: 1.4 }}>
-                    {prompt.content.slice(0, 80)}
-                    {prompt.content.length > 80 ? '…' : ''}
+                    {prompt.content.slice(0, 80)}{prompt.content.length > 80 ? '…' : ''}
                   </div>
                   {prompt.tags.length > 0 && (
                     <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
                       {prompt.tags.map((tag) => (
                         <span
                           key={tag}
-                          style={{
-                            background: '#1a1a2e',
-                            color: '#60a5fa',
-                            fontSize: 10,
-                            padding: '2px 6px',
-                            borderRadius: 4,
-                          }}
+                          style={{ background: '#1a1a2e', color: '#60a5fa', fontSize: 10, padding: '2px 6px', borderRadius: 4 }}
                         >
                           {tag}
                         </span>
                       ))}
                     </div>
                   )}
-                  <div style={{ display: 'flex', gap: 6 }}>
-                    <button
-                      onClick={() => {
-                        onSelectPrompt(prompt.content);
-                        setOpen(false);
-                      }}
-                      style={{
-                        flex: 1,
-                        background: '#1d4ed8',
-                        color: '#e2e8f0',
-                        border: 'none',
-                        borderRadius: 6,
-                        padding: '5px 8px',
-                        cursor: 'pointer',
-                        fontSize: 11,
-                      }}
-                    >
-                      Use prompt
-                    </button>
+
+                  <button
+                    onClick={() => { onSelectPrompt(prompt.content); setOpen(false); }}
+                    style={{
+                      background: '#1d4ed8',
+                      color: '#e2e8f0',
+                      border: 'none',
+                      borderRadius: 6,
+                      padding: '5px 8px',
+                      cursor: 'pointer',
+                      fontSize: 11,
+                      width: '100%',
+                    }}
+                  >
+                    Use prompt
+                  </button>
+
+                  {/* #25 — delete only on hover */}
+                  {hoveredId === prompt.prompt_id && (
                     <button
                       onClick={() => deletePrompt(prompt.prompt_id)}
+                      title="Delete prompt"
                       style={{
-                        background: '#450a0a',
-                        color: '#fca5a5',
+                        position: 'absolute',
+                        top: 8,
+                        right: 8,
+                        background: 'none',
                         border: 'none',
-                        borderRadius: 6,
-                        padding: '5px 8px',
+                        color: '#475569',
                         cursor: 'pointer',
-                        fontSize: 11,
+                        fontSize: 15,
+                        lineHeight: 1,
+                        padding: '2px 4px',
+                        borderRadius: 4,
                       }}
                     >
-                      Delete
+                      ×
                     </button>
-                  </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -290,12 +290,7 @@ export function PromptLibrary({ sessionId, onSelectPrompt, currentInput = '' }: 
       {open && (
         <div
           onClick={() => setOpen(false)}
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 199,
-            background: 'rgba(0,0,0,0.3)',
-          }}
+          style={{ position: 'fixed', inset: 0, zIndex: 199, background: 'rgba(0,0,0,0.3)' }}
         />
       )}
     </>

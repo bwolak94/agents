@@ -1,5 +1,7 @@
 'use client';
-import { useState, useRef, useEffect, type KeyboardEvent } from 'react';
+import { useState, useRef, useEffect, useCallback, type KeyboardEvent } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import type { ChatMessage } from '@/types/chat';
 import type { Dispatch, SetStateAction } from 'react';
 import { AGENT_CFG, DEFAULT_AGENT_CFG, MODEL_COLORS } from '@/constants/agents';
@@ -12,11 +14,13 @@ interface ChatViewProps {
   sessionId: string | null;
   messages: ChatMessage[];
   setMessages: Dispatch<SetStateAction<ChatMessage[]>>;
+  historyLoading?: boolean;  // #17
+  onClearChat?: () => void;  // #24
 }
 
 const THINKING_DOTS = [0, 1, 2];
 
-export function ChatView({ sessionId, messages, setMessages }: ChatViewProps) {
+export function ChatView({ sessionId, messages, setMessages, historyLoading, onClearChat }: ChatViewProps) {
   const [input, setInput] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
   const { loading, send } = useChat(sessionId);
@@ -47,16 +51,50 @@ export function ChatView({ sessionId, messages, setMessages }: ChatViewProps) {
     setInput((prev) => (prev ? `${prev} ${reference}` : reference));
   };
 
-  const handleTranscript = (text: string) => {
+  // #18 — memoized so VoiceInput doesn't re-create SpeechRecognition on every render
+  const handleTranscript = useCallback((text: string) => {
     setInput(text);
-  };
+  }, []);
 
-  const handleSelectPrompt = (content: string) => {
+  const handleSelectPrompt = useCallback((content: string) => {
     setInput(content);
-  };
+  }, []);
+
+  const isEmpty = messages.length === 0;
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      {/* #24 — chat header with clear button */}
+      {(messages.length > 0 || onClearChat) && (
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'flex-end',
+            padding: '6px 16px',
+            borderBottom: '1px solid #1a1a2e',
+            flexShrink: 0,
+          }}
+        >
+          {messages.length > 0 && onClearChat && (
+            <button
+              onClick={onClearChat}
+              title="Clear chat history"
+              style={{
+                background: 'none',
+                border: '1px solid #334155',
+                borderRadius: 6,
+                color: '#475569',
+                cursor: 'pointer',
+                fontSize: 11,
+                padding: '3px 10px',
+              }}
+            >
+              Clear chat
+            </button>
+          )}
+        </div>
+      )}
+
       <div
         style={{
           flex: 1,
@@ -67,14 +105,46 @@ export function ChatView({ sessionId, messages, setMessages }: ChatViewProps) {
           gap: 12,
         }}
       >
-        {messages.length === 0 && (
+        {/* #17 — loading skeleton while history fetches */}
+        {historyLoading && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: '20px 0' }}>
+            {[80, 55, 95, 65].map((w, i) => (
+              <div
+                key={i}
+                style={{
+                  display: 'flex',
+                  justifyContent: i % 2 === 0 ? 'flex-end' : 'flex-start',
+                }}
+              >
+                <div
+                  style={{
+                    width: `${w}%`,
+                    height: 40,
+                    borderRadius: 14,
+                    background: 'linear-gradient(90deg, #1a1a2e 25%, #1e293b 50%, #1a1a2e 75%)',
+                    backgroundSize: '200% 100%',
+                    animation: 'shimmer 1.5s infinite',
+                  }}
+                />
+              </div>
+            ))}
+            <style>{`
+              @keyframes shimmer {
+                0% { background-position: 200% 0; }
+                100% { background-position: -200% 0; }
+              }
+            `}</style>
+          </div>
+        )}
+
+        {!historyLoading && isEmpty && (
           <div style={{ textAlign: 'center', color: '#475569', marginTop: 60 }}>
             <div style={{ fontSize: 48 }}>🧠</div>
             <p style={{ marginTop: 12, color: '#64748b' }}>How can I help you?</p>
           </div>
         )}
 
-        {messages.map((msg, i) => (
+        {!historyLoading && messages.map((msg, i) => (
           <MessageBubble key={i} message={msg} />
         ))}
 
@@ -96,6 +166,80 @@ export function ChatView({ sessionId, messages, setMessages }: ChatViewProps) {
     </div>
   );
 }
+
+import type { Components } from 'react-markdown';
+
+// #21 — markdown renderer styles
+const mdComponents: Components = {
+  code({ className, children, ...props }) {
+    const isBlock = String(children).includes('\n');
+    if (!isBlock) {
+      return (
+        <code
+          style={{
+            background: '#0d0d1a',
+            border: '1px solid #334155',
+            borderRadius: 4,
+            padding: '1px 5px',
+            fontSize: '0.9em',
+            fontFamily: 'monospace',
+          }}
+          {...props}
+        >
+          {children}
+        </code>
+      );
+    }
+    return (
+      <pre
+        style={{
+          background: '#0d0d1a',
+          border: '1px solid #334155',
+          borderRadius: 8,
+          padding: '12px 14px',
+          overflowX: 'auto',
+          margin: '8px 0',
+          fontSize: 12,
+          fontFamily: 'monospace',
+          lineHeight: 1.5,
+        }}
+      >
+        <code className={className} {...props}>
+          {children}
+        </code>
+      </pre>
+    );
+  },
+  p({ children }) {
+    return <p style={{ margin: '6px 0', lineHeight: 1.6 }}>{children}</p>;
+  },
+  ul({ children }) {
+    return <ul style={{ margin: '6px 0', paddingLeft: 20 }}>{children}</ul>;
+  },
+  ol({ children }) {
+    return <ol style={{ margin: '6px 0', paddingLeft: 20 }}>{children}</ol>;
+  },
+  li({ children }) {
+    return <li style={{ marginBottom: 4 }}>{children}</li>;
+  },
+  blockquote({ children }) {
+    return (
+      <blockquote
+        style={{
+          borderLeft: '3px solid #334155',
+          margin: '8px 0',
+          paddingLeft: 12,
+          color: '#94a3b8',
+        }}
+      >
+        {children}
+      </blockquote>
+    );
+  },
+  h1({ children }) { return <h1 style={{ fontSize: 18, margin: '12px 0 6px', color: '#e2e8f0' }}>{children}</h1>; },
+  h2({ children }) { return <h2 style={{ fontSize: 16, margin: '10px 0 4px', color: '#e2e8f0' }}>{children}</h2>; },
+  h3({ children }) { return <h3 style={{ fontSize: 14, margin: '8px 0 4px', color: '#e2e8f0' }}>{children}</h3>; },
+};
 
 function MessageBubble({ message: msg }: { message: ChatMessage }) {
   const agentCfg = (name?: string) => (name ? (AGENT_CFG[name] ?? DEFAULT_AGENT_CFG) : DEFAULT_AGENT_CFG);
@@ -140,9 +284,18 @@ function MessageBubble({ message: msg }: { message: ChatMessage }) {
             borderBottomLeftRadius: isUser ? 14 : 4,
           }}
         >
-          <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'inherit' }}>
-            {msg.content}
-          </pre>
+          {/* #21 — markdown rendering for assistant messages */}
+          {isUser || isError ? (
+            <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'inherit' }}>
+              {msg.content}
+            </pre>
+          ) : (
+            <div style={{ fontFamily: 'inherit' }}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                {msg.content}
+              </ReactMarkdown>
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -246,7 +399,7 @@ function ChatInput({
         />
 
         {/* Right controls */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 2, paddingBottom: 2 }}>
           <PromptLibrary
             sessionId={sessionId}
             onSelectPrompt={onSelectPrompt}

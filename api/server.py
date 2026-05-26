@@ -69,9 +69,16 @@ async def startup():
 
 # ─── Sessions ─────────────────────────────────────────────────────────────────
 _sessions: dict[str, tuple[AgentOrchestrator, float]] = {}
+_session_locks: dict[str, asyncio.Lock] = {}  # #6 — per-session lock
 _request_ids: dict[str, float] = {}  # deduplication: request_id → timestamp
 SESSION_TTL = 3600
 REQUEST_ID_TTL = 60  # seconds
+
+
+def _get_session_lock(session_id: str) -> asyncio.Lock:
+    if session_id not in _session_locks:
+        _session_locks[session_id] = asyncio.Lock()
+    return _session_locks[session_id]
 
 
 async def get_session(session_id: str) -> AgentOrchestrator:
@@ -152,13 +159,15 @@ async def chat(req: ChatRequest):
         _request_ids[req.request_id] = time.time()
 
     try:
-        orch = await get_session(req.session_id)
-        response = await orch.process(
-            message=req.message,
-            stream=False,
-            show_routing=False,
-            session_id=req.session_id,
-        )
+        # #6 — serialize requests within the same session to prevent race conditions
+        async with _get_session_lock(req.session_id):
+            orch = await get_session(req.session_id)
+            response = await orch.process(
+                message=req.message,
+                stream=False,
+                show_routing=False,
+                session_id=req.session_id,
+            )
         d = orch.last_decision
 
         # Record analytics

@@ -97,13 +97,13 @@ class LLMManager:
         """
         if model in ("claude", "claude-haiku"):
             if "claude" not in self.clients:
-                raise ValueError("Brak klucza API Anthropic! Ustaw ANTHROPIC_API_KEY")
+                raise ValueError("Anthropic API key not set. Configure ANTHROPIC_API_KEY.")
             variant = "haiku" if model == "claude-haiku" else "sonnet"
             return await self.clients["claude"].call(messages, system_prompt, max_tokens, temperature, stream, variant)
 
         elif model == "gemini":
             if "gemini" not in self.clients:
-                raise ValueError("Brak klucza API Google! Ustaw GEMINI_API_KEY")
+                raise ValueError("Google API key not set. Configure GEMINI_API_KEY.")
             return await self.clients["gemini"].call(messages, system_prompt, max_tokens, temperature, stream)
 
         elif model.startswith("ollama/"):
@@ -111,7 +111,7 @@ class LLMManager:
             return await self.clients["ollama"].call(ollama_model, messages, system_prompt, max_tokens, temperature, stream)
 
         else:
-            raise ValueError(f"Nieznany model: {model}")
+            raise ValueError(f"Unknown model: {model}")
 
     def get_cost_stats(self) -> dict:
         """Return cost statistics for Claude."""
@@ -131,8 +131,22 @@ class LLMManager:
 
 
 # ─────────────────────────────────────────
-# CLAUDE (Anthropic)
+# CLAUDE (Anthropic)  (#12 — shared HTTP client)
 # ─────────────────────────────────────────
+# Module-level shared client for connection pooling
+_anthropic_http_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_anthropic_client() -> httpx.AsyncClient:
+    global _anthropic_http_client
+    if _anthropic_http_client is None or _anthropic_http_client.is_closed:
+        _anthropic_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _anthropic_http_client
+
+
 class AnthropicClient:
     BASE_URL = "https://api.anthropic.com/v1/messages"
     MODELS = {
@@ -168,8 +182,8 @@ class AnthropicClient:
             ]
 
         if stream:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                return await self._stream(client, headers, payload)
+            client = _get_anthropic_client()
+            return await self._stream(client, headers, payload)
 
         resp = await self._post_with_retry(headers, payload)
         data = resp.json()
@@ -178,10 +192,10 @@ class AnthropicClient:
 
     async def _post_with_retry(self, headers: dict, payload: dict, max_retries: int = 3) -> httpx.Response:
         """POST with exponential backoff on 429 (rate limit) and 529 (overload)."""
+        client = _get_anthropic_client()
         last_resp = None
         for attempt in range(max_retries):
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                last_resp = await client.post(self.BASE_URL, json=payload, headers=headers)
+            last_resp = await client.post(self.BASE_URL, json=payload, headers=headers)
             if last_resp.status_code in (429, 529) and attempt < max_retries - 1:
                 wait = (2 ** attempt) + random.uniform(0, 1)
                 await asyncio.sleep(wait)
@@ -250,7 +264,7 @@ class GeminiClient:
 
 
 # ─────────────────────────────────────────
-# OLLAMA (lokalne modele)
+# OLLAMA (local models)
 # ─────────────────────────────────────────
 class OllamaClient:
     def __init__(self, base_url: str):
