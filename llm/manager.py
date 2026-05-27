@@ -6,6 +6,7 @@ import os
 import asyncio
 import random
 import sys
+import time
 from typing import Optional
 import httpx
 
@@ -63,9 +64,13 @@ class CostTracker:
 
 
 class LLMManager:
+    # Model health tracking (Imp 6): unhealthy models are skipped for _HEALTH_COOLDOWN seconds
+    _HEALTH_COOLDOWN = 300  # 5 minutes
+
     def __init__(self, config: dict):
         self.config = config
         self.clients = {}
+        self._unhealthy: dict[str, float] = {}  # model -> timestamp marked unhealthy
         self._init_clients()
 
     def _init_clients(self):
@@ -163,6 +168,30 @@ class LLMManager:
         else:
             models.extend(["ollama/llama3", "ollama/mistral", "ollama/phi3"])
         return models
+
+    def is_model_healthy(self, model: str) -> bool:
+        """Return True if the model is not currently marked as unhealthy (Imp 6)."""
+        if model not in self._unhealthy:
+            return True
+        if time.time() - self._unhealthy[model] > self._HEALTH_COOLDOWN:
+            del self._unhealthy[model]
+            return True
+        return False
+
+    def mark_model_unhealthy(self, model: str) -> None:
+        """Mark a model as temporarily unavailable (Imp 6)."""
+        self._unhealthy[model] = time.time()
+
+    def get_health_status(self) -> dict:
+        """Return health status for all models."""
+        now = time.time()
+        status = {}
+        for m in self.available_models():
+            if m in self._unhealthy and now - self._unhealthy[m] < self._HEALTH_COOLDOWN:
+                status[m] = "unhealthy"
+            else:
+                status[m] = "healthy"
+        return status
 
     async def refresh_ollama_models(self) -> list[str]:
         """Discover which Ollama models are actually installed and cache the list."""

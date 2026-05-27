@@ -114,6 +114,30 @@ def _strip_xml(text: str) -> str:
     return clean if clean else text
 
 
+async def set_session_title(session_id: str, title: str) -> None:
+    """Update the human-readable title for a session."""
+    await _db["conversations"].update_one(
+        {"session_id": session_id},
+        {"$set": {"title": title, "updated_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
+
+
+async def get_session_title(session_id: str) -> str:
+    doc = await _db["conversations"].find_one({"session_id": session_id}, {"_id": 0, "title": 1})
+    return doc.get("title", "") if doc else ""
+
+
+async def add_auto_tags(session_id: str, tags: list[str]) -> None:
+    """Add auto-generated tags (prefixed 'auto:') without overwriting manual tags."""
+    auto_tags = [f"auto:{t}" for t in tags]
+    await _db["conversations"].update_one(
+        {"session_id": session_id},
+        {"$addToSet": {"auto_tags": {"$each": auto_tags}}},
+        upsert=True,
+    )
+
+
 async def clear_history(session_id: str):
     await _db["conversations"].delete_one({"session_id": session_id})
 
@@ -124,7 +148,7 @@ async def list_sessions(limit: int = 50, skip: int = 0) -> list:
     """
     cursor = _db["conversations"].find(
         {"session_id": {"$nin": list(_SYSTEM_SESSIONS)}},
-        {"_id": 0, "session_id": 1, "updated_at": 1, "created_at": 1, "preview": 1, "messages": {"$slice": 1}}
+        {"_id": 0, "session_id": 1, "updated_at": 1, "created_at": 1, "preview": 1, "title": 1, "auto_tags": 1, "messages": {"$slice": 1}}
     ).sort("updated_at", -1).skip(skip).limit(limit)
     docs = await cursor.to_list(length=limit)
 
@@ -141,5 +165,7 @@ async def list_sessions(limit: int = 50, skip: int = 0) -> list:
             "updated_at": doc.get("updated_at", ""),
             "created_at": doc.get("created_at", ""),
             "preview": preview,
+            "title": doc.get("title", ""),
+            "auto_tags": doc.get("auto_tags", []),
         })
     return result

@@ -197,7 +197,7 @@ class TestBaseAgentRun:
         second_call_kwargs = llm.call.call_args_list[1].kwargs
         messages = second_call_kwargs.get("messages", [])
         # Find the tool_result message injected by the ReAct loop
-        tool_result_messages = [m for m in messages if "<tool_result>" in m.get("content", "")]
+        tool_result_messages = [m for m in messages if "<tool_result" in m.get("content", "")]
         assert len(tool_result_messages) == 1
         assert "Search result text" in tool_result_messages[0]["content"]
         assert result == "research answer"

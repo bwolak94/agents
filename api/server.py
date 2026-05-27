@@ -36,6 +36,12 @@ from db import file_versions as file_versions_db
 from db import cache as cache_db
 from db import personas as personas_db
 from db import tags as tags_db
+from db import agent_checkpoints as agent_checkpoints_db
+from db import collab_graph as collab_graph_db
+from db import macros as macros_db
+from db import batch as batch_db
+from db.history import set_session_title, add_auto_tags, get_session_title
+from api.preprocessor import preprocess as preprocess_message
 from config.settings import load_config
 
 logger = logging.getLogger(__name__)
@@ -64,12 +70,20 @@ async def lifespan(app: FastAPI):
     cache_db.set_db(db)
     personas_db.set_db(db)
     tags_db.set_db(db)
+    agent_checkpoints_db.set_db(db)
+    collab_graph_db.set_db(db)
+    macros_db.set_db(db)
+    batch_db.set_db(db)
     await feedback_db.ensure_indexes()
     await rag_db.ensure_indexes()
     await file_versions_db.ensure_indexes()
     await cache_db.ensure_indexes()
     await personas_db.ensure_indexes()
     await tags_db.ensure_indexes()
+    await agent_checkpoints_db.ensure_indexes()
+    await collab_graph_db.ensure_indexes()
+    await macros_db.ensure_indexes()
+    await batch_db.ensure_indexes()
     # Wire scheduler and discover Ollama models
     default_orch = await get_session("default")
     scheduler.set_handler(
@@ -207,8 +221,18 @@ class ChatRequest(BaseModel):
     stream: bool = False
     show_routing: bool = False
     request_id: str | None = Field(default=None, description="Idempotency key — prevents duplicate sends")
+    # Imp 7: per-session model preference
+    preferred_model: str = ""
+    # Feature 3: self-reflection
+    enable_reflection: bool = False
+    # Feature 6: checkpoint resume
+    checkpoint_id: str = ""
+    # Feature 8: multimodal
+    image_base64: str | None = None
+    image_url: str | None = None
+    # Active persona name
+    persona: str = ""
 
-    # #6 — validate session_id format in the model itself
     @field_validator("session_id")
     @classmethod
     def validate_session_id(cls, v: str) -> str:
@@ -301,6 +325,173 @@ class AdminKeyRequest(BaseModel):
     gemini_api_key: str | None = None
 
 
+class StructuredChatRequest(BaseModel):
+    message: str
+    session_id: str = "default"
+    response_schema: dict = Field(default_factory=dict)
+    model: str = ""
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not _SESSION_ID_RE.match(v):
+            raise ValueError("session_id must be 1-64 alphanumeric characters, hyphens, or underscores.")
+        return v
+
+
+class HandoffPipelineRequest(BaseModel):
+    message: str
+    session_id: str = "default"
+    pipeline: list[dict] = Field(..., description="List of {agent, model, task_template, tools} steps")
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not _SESSION_ID_RE.match(v):
+            raise ValueError("session_id must be 1-64 alphanumeric characters, hyphens, or underscores.")
+        return v
+
+
+class DebateRequest(BaseModel):
+    topic: str
+    session_id: str = "default"
+    rounds: int = Field(default=2, ge=1, le=5)
+    model_a: str = "claude"
+    model_b: str = "gemini"
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not _SESSION_ID_RE.match(v):
+            raise ValueError("session_id must be 1-64 alphanumeric characters, hyphens, or underscores.")
+        return v
+
+
+class FanOutRequest(BaseModel):
+    message: str
+    session_id: str = "default"
+    agents: list[str] = Field(default_factory=list)
+    model: str = "claude"
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not _SESSION_ID_RE.match(v):
+            raise ValueError("session_id must be 1-64 alphanumeric characters, hyphens, or underscores.")
+        return v
+
+
+class AgentSystemPromptRequest(BaseModel):
+    system_prompt: str
+
+
+class MacroRequest(BaseModel):
+    name: str = Field(pattern=r"^/?[a-zA-Z_\-]{1,32}$")
+    template: str
+    description: str = ""
+
+
+class BatchRequest(BaseModel):
+    tasks: list[dict] = Field(..., description="List of {message, session_id} objects")
+
+
+class VariantsRequest(BaseModel):
+    message: str
+    session_id: str = "default"
+    count: int = Field(default=3, ge=2, le=5)
+    temperature: float = Field(default=0.9, ge=0.0, le=2.0)
+    model: str = ""
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not _SESSION_ID_RE.match(v):
+            raise ValueError("session_id must be 1-64 alphanumeric characters, hyphens, or underscores.")
+        return v
+
+
+class GitDiffRequest(BaseModel):
+    diff: str
+    session_id: str = "default"
+    focus: str = ""  # optional focus: "security", "performance", "style"
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not _SESSION_ID_RE.match(v):
+            raise ValueError("session_id must be 1-64 alphanumeric characters, hyphens, or underscores.")
+        return v
+
+
+class SessionFindRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+
+
+class ImportContextRequest(BaseModel):
+    summary_only: bool = True
+
+
+class IncrementalContextRequest(BaseModel):
+    context: str = Field(..., min_length=1)
+
+
+class SessionTitleRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=80)
+
+
+# ─── Per-session rate limiting (Imp 19) ───────────────────────────────────────
+_SESSION_RATE_LIMIT = int(os.getenv("SESSION_RATE_LIMIT_RPM", "20"))
+_session_rate_windows: dict[str, list[float]] = defaultdict(list)
+
+# ─── Max cost guard (Imp 12) ──────────────────────────────────────────────────
+_MAX_REQUEST_COST_USD = float(os.getenv("MAX_REQUEST_COST_USD", "0"))  # 0 = disabled
+
+# ─── Background helpers ───────────────────────────────────────────────────────
+async def _auto_title_session(session_id: str, first_message: str, orch: AgentOrchestrator) -> None:
+    """Generate and save a short session title if one doesn't exist yet."""
+    try:
+        existing = await get_session_title(session_id)
+        if existing:
+            return
+        title = await orch.llm.call(
+            model="claude-haiku",
+            messages=[{"role": "user", "content": first_message[:300]}],
+            system_prompt="Generate a 4-6 word title for this conversation. Output ONLY the title, no punctuation, no quotes.",
+            max_tokens=20,
+            temperature=0.3,
+        )
+        await set_session_title(session_id, title.strip()[:80])
+    except Exception:
+        pass
+
+
+async def _auto_tag_session(session_id: str, message: str, response: str, orch: AgentOrchestrator) -> None:
+    """Classify session into 1-3 topic tags using haiku."""
+    try:
+        combined = f"User: {message[:200]}\nAssistant: {response[:200]}"
+        tags_raw = await orch.llm.call(
+            model="claude-haiku",
+            messages=[{"role": "user", "content": combined}],
+            system_prompt=(
+                "Classify this conversation exchange into 1-3 short topic tags. "
+                "Choose from: python, javascript, debugging, refactoring, research, writing, "
+                "data, devops, security, api, database, testing, math, general, cli, frontend, backend. "
+                "Output ONLY a comma-separated list of tags, e.g.: python,debugging"
+            ),
+            max_tokens=30,
+            temperature=0.1,
+        )
+        tags = [t.strip().lower() for t in tags_raw.split(",") if t.strip()][:3]
+        if tags:
+            await add_auto_tags(session_id, tags)
+    except Exception:
+        pass
+
+
+# ─── Session incremental context store (in-memory, per orchestrator) ──────────
+_session_extra_context: dict[str, list[str]] = {}
+
+
 # ─── Health ───────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
@@ -322,16 +513,104 @@ async def chat(req: ChatRequest):
             raise HTTPException(status_code=409, detail="Duplicate request_id — already processed")
         _request_ids[req.request_id] = time.time()
 
+    # Per-session rate limiting (Imp 19)
+    now = time.time()
+    _session_rate_windows[req.session_id] = [
+        t for t in _session_rate_windows[req.session_id] if now - t < 60
+    ]
+    if len(_session_rate_windows[req.session_id]) >= _SESSION_RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Session rate limit exceeded.")
+    _session_rate_windows[req.session_id].append(now)
+
+    # Max cost guard (Imp 12)
+    if _MAX_REQUEST_COST_USD > 0:
+        try:
+            orch_check = await get_session(req.session_id)
+            current_cost = orch_check.llm.get_cost_stats().get("total_cost_usd", 0)
+            if current_cost >= _MAX_REQUEST_COST_USD:
+                raise HTTPException(
+                    status_code=402,
+                    detail=f"Cost limit reached (${current_cost:.4f} >= ${_MAX_REQUEST_COST_USD:.4f}). Reset the session or increase MAX_REQUEST_COST_USD.",
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
     try:
         lock = await _acquire_session_lock(req.session_id)
         try:
             orch = await get_session(req.session_id)
+
+            # Persona auto-injection (Imp 8)
+            if req.persona:
+                try:
+                    p = await personas_db.get_persona(req.persona)
+                    if p:
+                        orch.set_persona(p.get("system_prompt", ""))
+                except Exception:
+                    pass
+
+            # Preprocessing: macros, @file, model prefix, format detection
+            processed_message, model_override = await preprocess_message(req.message)
+            if model_override and not req.preferred_model:
+                req = req.model_copy(update={"preferred_model": model_override})
+
+            # Multimodal: encode image into message content (Feature 8)
+            message = processed_message
+            if req.image_base64 or req.image_url:
+                import base64
+                if req.image_base64:
+                    image_bytes = base64.b64decode(req.image_base64)
+                else:
+                    # Fetch from URL
+                    try:
+                        import httpx as _httpx
+                        async with _httpx.AsyncClient(timeout=10) as c:
+                            r = await c.get(req.image_url)
+                            image_bytes = r.content
+                    except Exception as e:
+                        image_bytes = None
+                        logger.warning("Failed to fetch image from URL: %s", e)
+
+                # Route to gemini for vision tasks and pass image
+                if image_bytes:
+                    try:
+                        img_response = await orch.llm.clients["gemini"].call(
+                            messages=[{"role": "user", "content": message}],
+                            system_prompt=None,
+                            max_tokens=2048,
+                            temperature=0.7,
+                            stream=False,
+                            image_data=image_bytes,
+                        )
+                        # Wrap gemini response in orchestrator update
+                        await orch._update_history(req.session_id, message, img_response)
+                        orch.last_decision = type("D", (), {
+                            "model": "gemini", "agent": "general_agent", "tools": [],
+                            "reasoning": "multimodal vision routing", "complexity": "medium",
+                        })()
+                        duration_ms = 0
+                        return ChatResponse(
+                            response=img_response,
+                            model_used="gemini",
+                            agent_used="general_agent",
+                            tools_used=[],
+                            reasoning="multimodal vision routing",
+                            duration_ms=0,
+                        )
+                    except Exception as e:
+                        logger.warning("Vision call failed: %s — falling through to text", e)
+
             t_start = time.time()
             response = await orch.process(
-                message=req.message,
+                message=message,
                 stream=False,
                 show_routing=False,
                 session_id=req.session_id,
+                preferred_model=req.preferred_model,
+                enable_reflection=req.enable_reflection,
+                checkpoint_id=req.checkpoint_id,
             )
             duration_ms = int((time.time() - t_start) * 1000)
         finally:
@@ -339,6 +618,16 @@ async def chat(req: ChatRequest):
 
         d = orch.last_decision
         cost_stats = orch.llm.get_cost_stats()
+
+        # Context window utilization tracking (Imp 14)
+        try:
+            estimated = orch.llm.estimate_tokens(orch.conversation_history)
+            context_limits = {"claude": 190_000, "claude-haiku": 190_000, "gemini": 1_000_000}
+            limit = context_limits.get(d.model if d else "claude", 32_000)
+            context_pct = round(estimated / limit * 100, 1)
+        except Exception:
+            context_pct = 0
+
         try:
             await analytics_db.record_request(
                 session_id=req.session_id,
@@ -347,9 +636,15 @@ async def chat(req: ChatRequest):
                 tools=d.tools if d else [],
                 duration_ms=duration_ms,
                 cost_usd=cost_stats.get("total_cost_usd", 0) if cost_stats else 0,
+                context_pct=context_pct,
             )
         except Exception as exc:
             logger.warning("Failed to record analytics: %s", exc)
+
+        # Auto-title: generate title on first message (background task)
+        asyncio.create_task(_auto_title_session(req.session_id, message, orch))
+        # Auto-tag: classify session topic after each response (background task)
+        asyncio.create_task(_auto_tag_session(req.session_id, message, response, orch))
 
         return ChatResponse(
             response=response,
@@ -520,13 +815,7 @@ async def delete_prompt(session_id: str, prompt_id: str):
     return {"status": "deleted"}
 
 
-# ─── Feedback ─────────────────────────────────────────────────────────────────
-@app.post("/feedback")
-async def save_feedback(req: FeedbackRequest):
-    fid = await feedback_db.save_feedback(req.session_id, req.message_idx, req.rating, req.comment)
-    return {"feedback_id": fid, "status": "saved"}
-
-
+# ─── Feedback (with auto-retry on thumbs-down) ────────────────────────────────
 @app.get("/feedback/{session_id}")
 async def get_feedback(session_id: str):
     _validate_session_id(session_id)
@@ -863,6 +1152,493 @@ async def refresh_models():
     orch = await get_session("default")
     models = await orch.llm.refresh_ollama_models()
     return {"ollama_models": models, "all_models": orch.llm.available_models()}
+
+
+@app.get("/models/health")
+async def models_health():
+    """Return health status for all models (Imp 6)."""
+    orch = await get_session("default")
+    return {"health": orch.llm.get_health_status()}
+
+
+# ─── Structured Output (Feature 4) ────────────────────────────────────────────
+@app.post("/chat/structured")
+async def chat_structured(req: StructuredChatRequest):
+    """Return a JSON response validated against the provided schema."""
+    orch = await get_session(req.session_id)
+    schema_str = json.dumps(req.response_schema, indent=2) if req.response_schema else ""
+    prompt = (
+        f"{req.message}\n\nRespond with ONLY valid JSON matching this schema:\n{schema_str}"
+        if schema_str
+        else req.message
+    )
+    model = req.model or "claude"
+    try:
+        response = await orch.llm.call(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2048,
+            temperature=0.2,
+        )
+        # Parse and re-serialize to validate JSON
+        cleaned = re.sub(r"```(?:json)?\s*", "", response).strip()
+        json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if json_match:
+            cleaned = json_match.group(0)
+        parsed = json.loads(cleaned)
+        return {"response": parsed, "model_used": model, "valid": True}
+    except json.JSONDecodeError:
+        return {"response": response, "model_used": model, "valid": False, "error": "Response was not valid JSON"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Document Q&A (Feature 10) ────────────────────────────────────────────────
+@app.post("/chat/rag")
+async def chat_rag(req: ChatRequest):
+    """Answer a question using only the session's knowledge base."""
+    _validate_session_id(req.session_id)
+    chunks = await rag_db.search(req.session_id, req.message, limit=5)
+    if not chunks:
+        return {"response": "No relevant documents found in the knowledge base for this session.", "chunks_used": 0}
+    ctx = "\n\n".join(f"[{c['title']}]\n{c['content']}" for c in chunks)
+    orch = await get_session(req.session_id)
+    from agents.agents import DocumentAgent
+    doc_agent = DocumentAgent(orch.llm, orch.tools)
+    response = await doc_agent.run(
+        message=req.message,
+        model="claude",
+        tool_names=[],
+        conversation_history=[],
+        session_id=req.session_id,
+        active_persona=f"<context>\n{ctx}\n</context>",
+    )
+    return {"response": response, "chunks_used": len(chunks)}
+
+
+# ─── Multi-Agent Fan-Out (Feature 1) ──────────────────────────────────────────
+@app.post("/chat/fan-out")
+async def chat_fan_out(req: FanOutRequest):
+    """Run the same message through multiple specialist agents simultaneously."""
+    _validate_session_id(req.session_id)
+    from agents.agents import AGENT_REGISTRY
+    agents = req.agents or list(AGENT_REGISTRY.keys())[:4]
+    orch = await get_session(req.session_id)
+    result = await orch.run_fan_out(
+        message=req.message,
+        agents=agents,
+        session_id=req.session_id,
+        model=req.model,
+    )
+    return result
+
+
+# ─── Agent Handoff Pipeline (Feature 2) ───────────────────────────────────────
+@app.post("/chat/pipeline")
+async def chat_pipeline(req: HandoffPipelineRequest):
+    """Run a sequential agent pipeline where each step's output feeds the next."""
+    _validate_session_id(req.session_id)
+    orch = await get_session(req.session_id)
+    result = await orch.run_pipeline(
+        message=req.message,
+        pipeline=req.pipeline,
+        session_id=req.session_id,
+    )
+    return {"response": result, "steps": len(req.pipeline)}
+
+
+# ─── Agent Debate (Feature 5) ─────────────────────────────────────────────────
+@app.post("/chat/debate")
+async def chat_debate(req: DebateRequest):
+    """Run two agents debating a topic for N rounds with a judge."""
+    _validate_session_id(req.session_id)
+    orch = await get_session(req.session_id)
+    result = await orch.run_debate(
+        topic=req.topic,
+        session_id=req.session_id,
+        rounds=req.rounds,
+        model_a=req.model_a,
+        model_b=req.model_b,
+    )
+    return {"response": result, "topic": req.topic, "rounds": req.rounds}
+
+
+# ─── Checkpoints (Feature 6) ──────────────────────────────────────────────────
+@app.get("/checkpoints/{session_id}")
+async def list_checkpoints(session_id: str):
+    _validate_session_id(session_id)
+    from db.agent_checkpoints import list_checkpoints as _list
+    return {"session_id": session_id, "checkpoints": await _list(session_id)}
+
+
+@app.delete("/checkpoints/{session_id}/{checkpoint_id}")
+async def delete_checkpoint(session_id: str, checkpoint_id: str):
+    _validate_session_id(session_id)
+    from db.agent_checkpoints import delete_checkpoint as _delete
+    deleted = await _delete(session_id, checkpoint_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
+    return {"status": "deleted"}
+
+
+# ─── Agent Collaboration Graph (Imp 17) ───────────────────────────────────────
+@app.get("/agents/collab-graph")
+async def agent_collab_graph(session_id: str | None = None):
+    from db.collab_graph import get_summary, get_graph
+    return {
+        "summary": await get_summary(),
+        "recent": await get_graph(session_id),
+    }
+
+
+# ─── System Prompt Hot Reload (Imp 18) ────────────────────────────────────────
+@app.put("/agents/{agent_name}/system-prompt")
+async def set_agent_system_prompt(agent_name: str, req: AgentSystemPromptRequest):
+    from agents.agents import AGENT_REGISTRY, set_agent_system_prompt as _set
+    if agent_name not in AGENT_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found. Available: {list(AGENT_REGISTRY.keys())}")
+    _set(agent_name, req.system_prompt)
+    # Clear cached instances so they pick up the override
+    for _, (orch, _) in _sessions.items():
+        orch._agent_cache.pop(agent_name, None)
+    return {"status": "updated", "agent": agent_name}
+
+
+@app.delete("/agents/{agent_name}/system-prompt")
+async def reset_agent_system_prompt(agent_name: str):
+    from agents.agents import _system_prompt_overrides
+    _system_prompt_overrides.pop(agent_name, None)
+    for _, (orch, _) in _sessions.items():
+        orch._agent_cache.pop(agent_name, None)
+    return {"status": "reset", "agent": agent_name}
+
+
+# ─── Persona activation per session ───────────────────────────────────────────
+# ─── Macros (Feature 1: prompt macros) ───────────────────────────────────────
+@app.get("/macros")
+async def list_macros():
+    return {"macros": await macros_db.list_macros()}
+
+
+@app.post("/macros")
+async def save_macro(req: MacroRequest):
+    await macros_db.save_macro(req.name, req.template, req.description)
+    return {"status": "saved", "name": req.name}
+
+
+@app.delete("/macros/{name}")
+async def delete_macro(name: str):
+    deleted = await macros_db.delete_macro(name)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Macro not found or is a builtin (cannot delete builtins)")
+    return {"status": "deleted", "name": name}
+
+
+# ─── Chat: prompt variants (Feature 10: parallel variants) ────────────────────
+@app.post("/chat/variants")
+async def chat_variants(req: VariantsRequest):
+    """Run the same prompt N times concurrently with high temperature for variety."""
+    orch = await get_session(req.session_id)
+    processed, model_override = await preprocess_message(req.message)
+    model = req.model or model_override or "claude"
+
+    async def _call_once(idx: int) -> dict:
+        try:
+            result = await orch.llm.call(
+                model=model,
+                messages=[{"role": "user", "content": processed}],
+                max_tokens=1024,
+                temperature=req.temperature,
+            )
+            return {"variant": idx + 1, "response": result, "error": None}
+        except Exception as e:
+            return {"variant": idx + 1, "response": None, "error": str(e)}
+
+    results = await asyncio.gather(*[_call_once(i) for i in range(req.count)])
+    return {"message": req.message, "model": model, "variants": list(results)}
+
+
+# ─── Git diff code review (Feature 20) ────────────────────────────────────────
+@app.post("/chat/git-diff")
+async def chat_git_diff(req: GitDiffRequest):
+    """Structured code review of a git diff."""
+    if not req.diff.strip():
+        raise HTTPException(status_code=400, detail="diff must not be empty")
+    focus_hint = f"\n\nFocus especially on: {req.focus}." if req.focus else ""
+    prompt = (
+        f"Review the following git diff carefully.{focus_hint}\n\n"
+        "Provide structured feedback with these sections:\n"
+        "1. **Summary** — what changed and why (inferred)\n"
+        "2. **Correctness** — logic bugs, off-by-one errors, missing edge cases\n"
+        "3. **Security** — injection risks, auth issues, exposed secrets, unsafe operations\n"
+        "4. **Performance** — N+1 queries, unnecessary allocations, blocking calls\n"
+        "5. **Style** — naming, readability, dead code\n"
+        "6. **Tests needed** — what test cases should be added\n"
+        "7. **Verdict** — LGTM / Needs changes / Major issues\n\n"
+        f"```diff\n{req.diff[:8000]}\n```"
+    )
+    orch = await get_session(req.session_id)
+    response = await orch.llm.call(
+        model="claude",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2048,
+        temperature=0.2,
+    )
+    return {"review": response, "session_id": req.session_id}
+
+
+# ─── Batch processing (Feature 16) ────────────────────────────────────────────
+@app.post("/batch")
+async def submit_batch(req: BatchRequest):
+    """Submit a batch of tasks. Returns batch_id to poll."""
+    if not req.tasks:
+        raise HTTPException(status_code=400, detail="tasks must not be empty")
+    if len(req.tasks) > 50:
+        raise HTTPException(status_code=400, detail="max 50 tasks per batch")
+
+    batch_id = await batch_db.create_batch(req.tasks)
+
+    async def _run_batch():
+        await batch_db.set_batch_status(batch_id, "running")
+        for task in req.tasks:
+            msg = task.get("message", "")
+            sid = task.get("session_id", "default")
+            try:
+                processed, model_override = await preprocess_message(msg)
+                orch = await get_session(sid)
+                response = await orch.process(
+                    message=processed,
+                    session_id=sid,
+                    preferred_model=model_override,
+                )
+                await batch_db.append_result(batch_id, {
+                    "message": msg[:200], "session_id": sid,
+                    "response": response, "error": None,
+                })
+            except Exception as e:
+                await batch_db.append_result(batch_id, {
+                    "message": msg[:200], "session_id": sid,
+                    "response": None, "error": str(e),
+                })
+        await batch_db.set_batch_status(batch_id, "completed")
+
+    asyncio.create_task(_run_batch())
+    return {"batch_id": batch_id, "total": len(req.tasks), "status": "running"}
+
+
+@app.get("/batch/{batch_id}")
+async def get_batch(batch_id: str):
+    job = await batch_db.get_batch(batch_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    return job
+
+
+# ─── Smart session resume (Feature 12) ────────────────────────────────────────
+@app.post("/sessions/find")
+async def find_session(req: SessionFindRequest):
+    """Find the most relevant session for a query using full-text search."""
+    from db.history import _db as hist_db
+    if hist_db is None:
+        return {"session_id": None, "sessions": []}
+    try:
+        cursor = hist_db["conversations"].find(
+            {"$text": {"$search": req.query}},
+            {"_id": 0, "session_id": 1, "preview": 1, "title": 1, "updated_at": 1,
+             "score": {"$meta": "textScore"}},
+        ).sort([("score", {"$meta": "textScore"})]).limit(5)
+        results = await cursor.to_list(5)
+        return {
+            "query": req.query,
+            "best_match": results[0]["session_id"] if results else None,
+            "sessions": results,
+        }
+    except Exception:
+        return {"session_id": None, "sessions": []}
+
+
+# ─── Cross-session context import (Feature 13) ────────────────────────────────
+@app.post("/sessions/{session_id}/import-context/{source_id}")
+async def import_context(session_id: str, source_id: str, req: ImportContextRequest):
+    """Import key context from another session into this session."""
+    _validate_session_id(session_id)
+    _validate_session_id(source_id)
+    source_history = await load_history(source_id)
+    if not source_history:
+        raise HTTPException(status_code=404, detail="Source session has no history")
+
+    orch = await get_session(session_id)
+    if req.summary_only:
+        # Summarize source session and inject as context
+        combined = "\n".join(
+            f"{m['role'].upper()}: {m['content'][:200]}"
+            for m in source_history[-20:]
+        )
+        try:
+            summary = await orch.llm.call(
+                model="claude-haiku",
+                messages=[{"role": "user", "content": combined}],
+                system_prompt="Summarize this conversation in 5 key bullet points. Output ONLY the bullets.",
+                max_tokens=300,
+                temperature=0.2,
+            )
+            context_block = f"<imported_context from='{source_id}'>\n{summary}\n</imported_context>"
+        except Exception:
+            context_block = f"<imported_context from='{source_id}'>\n{combined[:500]}\n</imported_context>"
+    else:
+        msgs = [{"role": m["role"], "content": m["content"]} for m in source_history[-10:]]
+        orch.conversation_history = msgs + orch.conversation_history
+
+    if req.summary_only:
+        orch.conversation_history.insert(0, {"role": "user", "content": context_block})
+        orch.conversation_history.insert(1, {"role": "assistant", "content": "Understood. I have the context from the imported session."})
+
+    return {"status": "imported", "session_id": session_id, "source_id": source_id, "messages_imported": len(source_history)}
+
+
+# ─── Incremental context building (Feature 14) ────────────────────────────────
+@app.post("/sessions/{session_id}/context")
+async def add_incremental_context(session_id: str, req: IncrementalContextRequest):
+    """Add context to a session without triggering a response."""
+    _validate_session_id(session_id)
+    _session_extra_context.setdefault(session_id, []).append(req.context)
+    orch = await get_session(session_id)
+    # Inject as a silent system message into conversation history
+    orch.conversation_history.append({
+        "role": "user",
+        "content": f"<context_addition>\n{req.context}\n</context_addition>",
+    })
+    orch.conversation_history.append({
+        "role": "assistant",
+        "content": "Context noted.",
+    })
+    return {"status": "added", "session_id": session_id, "total_additions": len(_session_extra_context[session_id])}
+
+
+@app.get("/sessions/{session_id}/context")
+async def get_incremental_context(session_id: str):
+    _validate_session_id(session_id)
+    return {"session_id": session_id, "context_additions": _session_extra_context.get(session_id, [])}
+
+
+# ─── Session title management ──────────────────────────────────────────────────
+@app.get("/sessions/{session_id}/title")
+async def get_title(session_id: str):
+    _validate_session_id(session_id)
+    title = await get_session_title(session_id)
+    return {"session_id": session_id, "title": title}
+
+
+@app.put("/sessions/{session_id}/title")
+async def set_title(session_id: str, req: SessionTitleRequest):
+    _validate_session_id(session_id)
+    await set_session_title(session_id, req.title)
+    return {"status": "updated", "session_id": session_id, "title": req.title}
+
+
+# ─── Focus mode (Feature 15) ──────────────────────────────────────────────────
+_focus_sessions: set[str] = set()
+
+
+@app.post("/sessions/{session_id}/focus")
+async def enable_focus(session_id: str):
+    _validate_session_id(session_id)
+    _focus_sessions.add(session_id)
+    return {"status": "focus_enabled", "session_id": session_id}
+
+
+@app.delete("/sessions/{session_id}/focus")
+async def disable_focus(session_id: str):
+    _validate_session_id(session_id)
+    _focus_sessions.discard(session_id)
+    return {"status": "focus_disabled", "session_id": session_id}
+
+
+# ─── Auto-retry on thumbs-down (Feature 17) ────────────────────────────────────
+@app.post("/feedback")
+async def save_feedback(req: FeedbackRequest):
+    fid = await feedback_db.save_feedback(req.session_id, req.message_idx, req.rating, req.comment)
+    result = {"feedback_id": fid, "status": "saved"}
+
+    # On thumbs-down, fire auto-retry in background
+    if req.rating == -1:
+        asyncio.create_task(_auto_retry_feedback(req.session_id, req.message_idx, req.comment))
+
+    return result
+
+
+async def _auto_retry_feedback(session_id: str, message_idx: int, comment: str) -> None:
+    """Re-run the original user message with improvement hint after thumbs-down."""
+    try:
+        messages = await load_history(session_id)
+        # Find the user message just before this assistant message
+        if message_idx > 0 and message_idx < len(messages):
+            # Walk backwards to find the user message
+            for i in range(message_idx - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    original = messages[i]["content"]
+                    improvement = (
+                        f"{original}\n\n[Note: A previous answer was rated unsatisfactory"
+                        + (f" because: {comment}" if comment else "")
+                        + ". Please provide a significantly improved response.]"
+                    )
+                    orch = await get_session(session_id)
+                    await orch.process(message=improvement, session_id=session_id)
+                    break
+    except Exception:
+        pass
+
+
+# ─── Scheduled daily briefing (Feature 18) ────────────────────────────────────
+@app.post("/briefing/schedule")
+async def schedule_briefing(
+    session_id: str = "default",
+    hour: int = Query(default=9, ge=0, le=23),
+):
+    """Schedule a daily briefing at the specified hour (24h format, UTC)."""
+    _validate_session_id(session_id)
+    briefing_prompt = (
+        "Generate my daily briefing. Include:\n"
+        "1. A summary of our recent conversations and any unresolved topics\n"
+        "2. Key facts or decisions we made together\n"
+        "3. Any suggestions for what to focus on today\n"
+        "Keep it concise — 5-10 bullet points."
+    )
+    # Schedule as a recurring task with ~24h interval
+    task_id = scheduler.schedule_recurring(session_id, briefing_prompt, interval_seconds=86400)
+    return {"status": "scheduled", "task_id": task_id, "session_id": session_id, "daily_at_hour_utc": hour}
+
+
+# ─── Expand macro endpoint (for preview) ──────────────────────────────────────
+@app.post("/macros/expand")
+async def expand_macro_preview(body: dict):
+    """Preview what a message looks like after macro expansion."""
+    message = body.get("message", "")
+    variables = body.get("variables", {})
+    processed, model_override = await preprocess_message(message)
+    if variables:
+        from db.macros import expand_macro
+        processed = expand_macro(processed, variables)
+    return {"original": message, "expanded": processed, "model_override": model_override}
+
+
+@app.post("/sessions/{session_id}/persona/{persona_name}")
+async def activate_persona(session_id: str, persona_name: str):
+    _validate_session_id(session_id)
+    p = await personas_db.get_persona(persona_name)
+    if not p:
+        raise HTTPException(status_code=404, detail="Persona not found")
+    orch = await get_session(session_id)
+    orch.set_persona(p["system_prompt"])
+    return {"status": "activated", "session_id": session_id, "persona": persona_name}
+
+
+@app.delete("/sessions/{session_id}/persona")
+async def deactivate_persona(session_id: str):
+    _validate_session_id(session_id)
+    orch = await get_session(session_id)
+    orch.set_persona("")
+    return {"status": "deactivated", "session_id": session_id}
 
 
 # ─── WebSocket — session-filtered events ──────────────────────────────────────

@@ -195,7 +195,7 @@ class RouterAgent:
         parts.append(f"<current_request>{user_message}</current_request>")
         return "\n".join(parts)
 
-    async def route(self, user_message: str, context: list | None = None) -> RouterDecision:
+    async def route(self, user_message: str, context: list | None = None, estimated_tokens: int = 0) -> RouterDecision:
         """Analyse the message and return a routing decision."""
         # #16/#21 — check cache under lock before calling LLM
         cache_key = _routing_cache_key(user_message, context)
@@ -230,6 +230,13 @@ class RouterAgent:
             model = data.get("model", "claude")
             fallbacks = data.get("fallback_models") or MODEL_FALLBACKS.get(model, [])
 
+            # Token-aware routing (Imp 11): prefer cheaper model for long-context tasks
+            if estimated_tokens > 50_000 and model == "claude":
+                logger.debug("Token-aware routing: %d tokens → staying on claude (large context)", estimated_tokens)
+            elif estimated_tokens > 100_000:
+                model = "gemini"  # Gemini has 1M context window
+                fallbacks = ["claude"] + fallbacks
+
             decision = RouterDecision(
                 model=model,
                 fallback_models=fallbacks,
@@ -241,7 +248,7 @@ class RouterAgent:
                 needs_internet=data.get("needs_internet", False),
                 parallel_tasks=data.get("parallel_tasks"),
             )
-            # #16/#21 — store in cache under lock
+            # Store in cache under lock
             async with _get_cache_lock():
                 _cache_put(cache_key, decision)
             return decision

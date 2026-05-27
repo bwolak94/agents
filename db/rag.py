@@ -46,12 +46,15 @@ async def add_document(session_id: str, title: str, content: str, chunk_size: in
     return [d["chunk_id"] for d in docs]
 
 
-async def search(session_id: str, query: str, limit: int = 5) -> list[dict]:
-    """Full-text search over knowledge base for a session."""
+async def search(session_id: str, query: str, limit: int = 5, agent_type: str = "") -> list[dict]:
+    """Full-text search over knowledge base for a session (optionally filtered by agent_type)."""
     if _db is None:
         return []
+    match: dict = {"session_id": session_id, "$text": {"$search": query}}
+    if agent_type:
+        match["agent_type"] = {"$in": [agent_type, ""]}
     cursor = _db["knowledge"].find(
-        {"session_id": session_id, "$text": {"$search": query}},
+        match,
         {"_id": 0, "chunk_id": 1, "doc_id": 1, "title": 1, "content": 1, "chunk_index": 1, "score": {"$meta": "textScore"}},
     ).sort([("score", {"$meta": "textScore"})]).limit(limit)
     return await cursor.to_list(length=limit)

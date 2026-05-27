@@ -35,8 +35,16 @@ def _make_mock_orchestrator(response: str = "hello from agent"):
     orch.llm.get_cost_stats = MagicMock(return_value=cost)
     orch.llm.available_models = MagicMock(return_value=["claude", "claude-haiku"])
     orch.llm.refresh_ollama_models = AsyncMock(return_value=[])
+    orch.llm.get_health_status = MagicMock(return_value={"claude": "healthy", "claude-haiku": "healthy"})
+    orch.llm.estimate_tokens = MagicMock(return_value=100)
     orch.get_stats = MagicMock(return_value={"messages_in_history": 0})
     orch.clear_history = MagicMock()
+    orch.set_persona = MagicMock()
+    orch._agent_cache = {}
+    orch._update_history = AsyncMock()
+    orch.run_fan_out = AsyncMock(return_value={"message": "hello", "results": []})
+    orch.run_pipeline = AsyncMock(return_value="pipeline result")
+    orch.run_debate = AsyncMock(return_value="debate result")
 
     router = MagicMock()
     router.route = AsyncMock(return_value=decision)
@@ -46,64 +54,97 @@ def _make_mock_orchestrator(response: str = "hello from agent"):
 
 # ─── Fixture — patch all I/O before importing the app ─────────────────────────
 
+def _configure_mocks(mocks: dict) -> None:
+    """Set up all mock behaviours in one place."""
+    async def _pp(msg): return msg, ""
+
+    mocks["init_db"].return_value = MagicMock()
+    mocks["memory_db"].set_db = MagicMock()
+    mocks["analytics_db"].set_db = MagicMock()
+    mocks["analytics_db"].record_request = AsyncMock()
+    mocks["analytics_db"].get_summary = AsyncMock(return_value={
+        "totals": {"total_requests": 1, "total_cost_usd": 0.001, "avg_duration_ms": 100.0,
+                   "total_input_tokens": 50, "total_output_tokens": 30},
+        "by_agent": [{"agent": "general_agent", "count": 1, "cost_usd": 0.001}],
+        "by_model": [{"model": "claude-haiku", "count": 1, "cost_usd": 0.001}],
+        "daily": [{"date": "2026-05-27", "count": 1, "cost_usd": 0.001}],
+    })
+    mocks["prompts_db"].set_db = MagicMock()
+    mocks["prompts_db"].list_prompts = AsyncMock(return_value=[])
+    mocks["prompts_db"].save_prompt = AsyncMock(return_value="prompt-id-123")
+    mocks["prompts_db"].delete_prompt = AsyncMock(return_value=True)
+    mocks["feedback_db"].set_db = MagicMock()
+    mocks["feedback_db"].ensure_indexes = AsyncMock()
+    mocks["feedback_db"].save_feedback = AsyncMock(return_value="feedback-id-1")
+    mocks["feedback_db"].get_feedback = AsyncMock(return_value=[])
+    mocks["feedback_db"].get_summary = AsyncMock(return_value={"total": 0, "positive": 0, "negative": 0})
+    mocks["rag_db"].set_db = MagicMock()
+    mocks["rag_db"].ensure_indexes = AsyncMock()
+    mocks["rag_db"].add_document = AsyncMock(return_value=["chunk-1"])
+    mocks["rag_db"].list_documents = AsyncMock(return_value=[])
+    mocks["rag_db"].search = AsyncMock(return_value=[])
+    mocks["rag_db"].delete_document = AsyncMock(return_value=1)
+    mocks["file_versions_db"].set_db = MagicMock()
+    mocks["file_versions_db"].ensure_indexes = AsyncMock()
+    mocks["cache_db"].set_db = MagicMock()
+    mocks["cache_db"].ensure_indexes = AsyncMock()
+    mocks["personas_db"].set_db = MagicMock()
+    mocks["personas_db"].ensure_indexes = AsyncMock()
+    mocks["personas_db"].list_personas = AsyncMock(return_value=[])
+    mocks["tags_db"].set_db = MagicMock()
+    mocks["tags_db"].ensure_indexes = AsyncMock()
+    mocks["tags_db"].all_tags = AsyncMock(return_value=[])
+    mocks["agent_checkpoints_db"].set_db = MagicMock()
+    mocks["agent_checkpoints_db"].ensure_indexes = AsyncMock()
+    mocks["collab_graph_db"].set_db = MagicMock()
+    mocks["collab_graph_db"].ensure_indexes = AsyncMock()
+    mocks["macros_db"].set_db = MagicMock()
+    mocks["macros_db"].ensure_indexes = AsyncMock()
+    mocks["macros_db"].list_macros = AsyncMock(return_value=[])
+    mocks["batch_db"].set_db = MagicMock()
+    mocks["batch_db"].ensure_indexes = AsyncMock()
+    mocks["preprocess_message"].side_effect = _pp
+    mocks["get_session"].return_value = mocks["mock_orch"]
+    mocks["scheduler"].schedule = MagicMock(return_value="task-1")
+    mocks["scheduler"].list_tasks = MagicMock(return_value=[])
+    mocks["scheduler"].get_task = MagicMock(return_value=None)
+    mocks["scheduler"].set_handler = MagicMock()
+
+
 @pytest.fixture(scope="module")
 def client():
+    from contextlib import ExitStack
     mock_orch = _make_mock_orchestrator()
 
-    with patch("api.server.init_db", new_callable=AsyncMock) as mock_init_db, \
-         patch("api.server.memory_db") as mock_mem, \
-         patch("api.server.analytics_db") as mock_ana, \
-         patch("api.server.prompts_db") as mock_prompts, \
-         patch("api.server.feedback_db") as mock_feedback, \
-         patch("api.server.rag_db") as mock_rag, \
-         patch("api.server.file_versions_db") as mock_fv, \
-         patch("api.server.cache_db") as mock_cache, \
-         patch("api.server.personas_db") as mock_personas, \
-         patch("api.server.tags_db") as mock_tags, \
-         patch("api.server.get_session", new_callable=AsyncMock) as mock_get_session, \
-         patch("api.server.scheduler") as mock_sched:
+    patches = {
+        "init_db":              patch("api.server.init_db", new_callable=AsyncMock),
+        "memory_db":            patch("api.server.memory_db"),
+        "analytics_db":        patch("api.server.analytics_db"),
+        "prompts_db":           patch("api.server.prompts_db"),
+        "feedback_db":          patch("api.server.feedback_db"),
+        "rag_db":               patch("api.server.rag_db"),
+        "file_versions_db":     patch("api.server.file_versions_db"),
+        "cache_db":             patch("api.server.cache_db"),
+        "personas_db":          patch("api.server.personas_db"),
+        "tags_db":              patch("api.server.tags_db"),
+        "agent_checkpoints_db": patch("api.server.agent_checkpoints_db"),
+        "collab_graph_db":      patch("api.server.collab_graph_db"),
+        "macros_db":            patch("api.server.macros_db"),
+        "batch_db":             patch("api.server.batch_db"),
+        "preprocess_message":   patch("api.server.preprocess_message", new_callable=AsyncMock),
+        "_auto_title_session":  patch("api.server._auto_title_session", new_callable=AsyncMock),
+        "_auto_tag_session":    patch("api.server._auto_tag_session", new_callable=AsyncMock),
+        "set_session_title":    patch("api.server.set_session_title", new_callable=AsyncMock),
+        "add_auto_tags":        patch("api.server.add_auto_tags", new_callable=AsyncMock),
+        "get_session_title":    patch("api.server.get_session_title", new_callable=AsyncMock),
+        "get_session":          patch("api.server.get_session", new_callable=AsyncMock),
+        "scheduler":            patch("api.server.scheduler"),
+    }
 
-        mock_init_db.return_value = MagicMock()
-        mock_mem.set_db = MagicMock()
-        mock_ana.set_db = MagicMock()
-        mock_ana.record_request = AsyncMock()
-        mock_ana.get_summary = AsyncMock(return_value={
-            "totals": {"total_requests": 1, "total_cost_usd": 0.001, "avg_duration_ms": 100.0,
-                       "total_input_tokens": 50, "total_output_tokens": 30},
-            "by_agent": [{"agent": "general_agent", "count": 1, "cost_usd": 0.001}],
-            "by_model": [{"model": "claude-haiku", "count": 1, "cost_usd": 0.001}],
-            "daily": [{"date": "2026-05-27", "count": 1, "cost_usd": 0.001}],
-        })
-        mock_prompts.set_db = MagicMock()
-        mock_prompts.list_prompts = AsyncMock(return_value=[])
-        mock_prompts.save_prompt = AsyncMock(return_value="prompt-id-123")
-        mock_prompts.delete_prompt = AsyncMock(return_value=True)
-        mock_feedback.set_db = MagicMock()
-        mock_feedback.ensure_indexes = AsyncMock()
-        mock_feedback.save_feedback = AsyncMock(return_value="feedback-id-1")
-        mock_feedback.get_feedback = AsyncMock(return_value=[])
-        mock_feedback.get_summary = AsyncMock(return_value={"total": 0, "positive": 0, "negative": 0})
-        mock_rag.set_db = MagicMock()
-        mock_rag.ensure_indexes = AsyncMock()
-        mock_rag.add_document = AsyncMock(return_value=["chunk-1"])
-        mock_rag.list_documents = AsyncMock(return_value=[])
-        mock_rag.search = AsyncMock(return_value=[])
-        mock_rag.delete_document = AsyncMock(return_value=1)
-        mock_fv.set_db = MagicMock()
-        mock_fv.ensure_indexes = AsyncMock()
-        mock_cache.set_db = MagicMock()
-        mock_cache.ensure_indexes = AsyncMock()
-        mock_personas.set_db = MagicMock()
-        mock_personas.ensure_indexes = AsyncMock()
-        mock_personas.list_personas = AsyncMock(return_value=[])
-        mock_tags.set_db = MagicMock()
-        mock_tags.ensure_indexes = AsyncMock()
-        mock_tags.all_tags = AsyncMock(return_value=[])
-        mock_get_session.return_value = mock_orch
-        mock_sched.schedule = MagicMock(return_value="task-1")
-        mock_sched.list_tasks = MagicMock(return_value=[])
-        mock_sched.get_task = MagicMock(return_value=None)
-        mock_sched.set_handler = MagicMock()
+    with ExitStack() as stack:
+        mocks = {k: stack.enter_context(v) for k, v in patches.items()}
+        mocks["mock_orch"] = mock_orch
+        _configure_mocks(mocks)
 
         from api.server import app
         with TestClient(app, raise_server_exceptions=True) as c:

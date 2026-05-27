@@ -1,10 +1,21 @@
 """
 Specialist agents — each has a focused system prompt.
 All agents share a ReAct loop: LLM decides which tool to call, sees result, repeats.
+
+Round 4 improvements:
+- Parallel tool execution (Imp 1)
+- Tool result summarization >6KB (Imp 2)
+- Tool call deduplication within session (Imp 3)
+- Tool error auto-retry up to 2 times (Imp 4)
+- ReAct step streaming via event_bus (Imp 10)
+- Agent self-reflection loop (Feature 3)
+- Agent memory consolidation >2000 chars (Feature 7)
+- Per-agent RAG namespacing (Imp 16)
 """
 import json
 import re
 import asyncio
+import hashlib
 import logging
 from abc import ABC, abstractmethod
 
@@ -13,9 +24,13 @@ from core.events import event_bus
 logger = logging.getLogger(__name__)
 
 MAX_REACT_ITERATIONS = 6
-# #14 — maximum seconds per LLM call inside the ReAct loop
 REACT_ITERATION_TIMEOUT = 60
+TOOL_RESULT_MAX_CHARS = 6_000   # summarize results larger than this (Imp 2)
+TOOL_ERROR_MAX_RETRIES = 2      # auto-retry tool errors (Imp 4)
+MEMORY_CONSOLIDATION_THRESHOLD = 2000  # chars before compressing memory (Feature 7)
+
 TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+MULTI_TOOL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 
 TOOL_DESCRIPTIONS = {
     "web_search":   "Search the internet. Args: your search query.",
@@ -41,6 +56,7 @@ def _build_tool_instructions(tool_names: list[str]) -> str:
         '{"name": "tool_name", "args": "your input"}',
         "</tool_call>",
         "",
+        "You may output MULTIPLE tool calls in a single response when the calls are independent.",
         "After receiving a <tool_result>, continue reasoning. When ready to answer, respond normally with no tool call block.",
         "",
         "Available tools:",
@@ -51,19 +67,29 @@ def _build_tool_instructions(tool_names: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _parse_all_tool_calls(text: str) -> list[dict]:
+    """Parse ALL tool calls from a response (supports parallel calls)."""
+    matches = MULTI_TOOL_PATTERN.findall(text)
+    calls = []
+    for raw in matches:
+        raw = raw.strip()
+        try:
+            calls.append(json.loads(raw))
+        except json.JSONDecodeError:
+            if "|" in raw:
+                parts = raw.split("|", 1)
+                calls.append({"name": parts[0].strip(), "args": parts[1].strip()})
+    return calls
+
+
 def _parse_tool_call(text: str) -> dict | None:
-    match = TOOL_CALL_PATTERN.search(text)
-    if not match:
-        return None
-    raw = match.group(1).strip()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        # Fallback: try name|args style
-        if "|" in raw:
-            parts = raw.split("|", 1)
-            return {"name": parts[0].strip(), "args": parts[1].strip()}
-        return None
+    """Parse single (first) tool call — used for backward compat."""
+    calls = _parse_all_tool_calls(text)
+    return calls[0] if calls else None
+
+
+def _tool_dedup_key(tool_name: str, args) -> str:
+    return hashlib.md5(f"{tool_name}|{args}".encode(), usedforsecurity=False).hexdigest()
 
 
 # ─────────────────────────────────────────
@@ -79,6 +105,45 @@ class BaseAgent(ABC):
     def system_prompt(self) -> str:
         pass
 
+    async def _summarize_tool_result(self, result: str, model: str) -> str:
+        """Compress a large tool result using the LLM (Imp 2)."""
+        try:
+            summary = await asyncio.wait_for(
+                self.llm.call(
+                    model="claude-haiku",
+                    messages=[{"role": "user", "content": f"Summarize this tool output concisely (max 500 words):\n\n{result[:8000]}"}],
+                    max_tokens=700,
+                    temperature=0.2,
+                ),
+                timeout=30,
+            )
+            return f"[Tool output summarized due to size]\n{summary}"
+        except Exception:
+            return result[:TOOL_RESULT_MAX_CHARS] + "\n... [truncated]"
+
+    async def _consolidate_memory(self, session_id: str, agent_type: str, memory: str, model: str) -> str:
+        """Compress oversized agent memory (Feature 7)."""
+        try:
+            compressed = await asyncio.wait_for(
+                self.llm.call(
+                    model="claude-haiku",
+                    messages=[{"role": "user", "content": f"Compress this agent memory into the most important facts (max 300 words):\n\n{memory}"}],
+                    max_tokens=400,
+                    temperature=0.2,
+                ),
+                timeout=30,
+            )
+            # Persist compressed memory
+            try:
+                await self.tools.get("memory_write") and None  # just check it exists
+                from db import memory as memory_db
+                await memory_db.memory_write(session_id, agent_type, f"[consolidated]\n{compressed}")
+            except Exception:
+                pass
+            return f"[consolidated]\n{compressed}"
+        except Exception:
+            return memory[:MEMORY_CONSOLIDATION_THRESHOLD]
+
     async def run(
         self,
         message: str,
@@ -88,82 +153,170 @@ class BaseAgent(ABC):
         stream: bool = False,
         max_tokens: int = 4096,
         agent_id: str = "",
+        session_id: str = "",
+        enable_reflection: bool = False,
+        checkpoint_id: str = "",
+        active_persona: str = "",
     ) -> str:
         """
-        ReAct loop:
-          1. Call LLM with message + tool instructions
-          2. Parse response for <tool_call>
-          3. Execute tool, inject <tool_result>
-          4. Repeat up to MAX_REACT_ITERATIONS
-          5. Return final response (no tool call in output)
+        ReAct loop with round-4 improvements:
+        - Parallel tool execution
+        - Tool result summarization
+        - Tool call deduplication
+        - Tool error auto-retry
+        - ReAct step streaming
+        - Checkpoint save/resume
         """
+        agent_type = self.__class__.__name__.lower().replace("agent", "_agent")
         system = self.system_prompt + _build_tool_instructions(tool_names)
+
+        # Active persona injection (Imp 8) — if passed from orchestrator
+        if active_persona:
+            system = f"<persona>\n{active_persona}\n</persona>\n\n" + system
+
         messages = list(conversation_history) + [{"role": "user", "content": message}]
 
-        # RAG auto-context: prepend top matching knowledge chunks to system prompt
-        if agent_id:
+        # RAG auto-context with per-agent namespacing (Imp 16)
+        rag_session = session_id or (agent_id.split("-")[0] if "-" in agent_id else "")
+        if rag_session:
             try:
                 from db.rag import search as rag_search
-                # Extract session_id from agent_id prefix (format: "session_id-uuid")
-                session_id = agent_id.split("-")[0] if "-" in agent_id else ""
-                if session_id:
-                    chunks = await rag_search(session_id, message, limit=3)
-                    if chunks:
-                        ctx = "\n\n".join(f"[{c['title']}]\n{c['content']}" for c in chunks)
-                        system = f"<context>\n{ctx}\n</context>\n\n" + system
+                chunks = await rag_search(rag_session, message, limit=3, agent_type=agent_type)
+                if chunks:
+                    ctx = "\n\n".join(f"[{c['title']}]\n{c['content']}" for c in chunks)
+                    system = f"<context>\n{ctx}\n</context>\n\n" + system
             except Exception:
                 pass
 
-        for iteration in range(MAX_REACT_ITERATIONS):
-            # #14 — per-iteration timeout so a hung LLM call doesn't block forever
+        # Checkpoint resume (Feature 6)
+        tool_dedup_cache: dict[str, str] = {}
+        start_iteration = 0
+        if checkpoint_id and rag_session:
+            try:
+                from db.agent_checkpoints import load_checkpoint
+                cp = await load_checkpoint(rag_session, checkpoint_id)
+                if cp:
+                    messages = cp["messages"]
+                    tool_dedup_cache = cp.get("tool_call_cache", {})
+                    start_iteration = cp.get("iteration", 0)
+                    logger.info("Resumed checkpoint %s at iteration %d", checkpoint_id, start_iteration)
+            except Exception:
+                pass
+
+        for iteration in range(start_iteration, MAX_REACT_ITERATIONS):
+            # Emit react_step event (Imp 10)
+            if agent_id:
+                asyncio.create_task(event_bus.emit({
+                    "type": "react_step",
+                    "agent_id": agent_id,
+                    "iteration": iteration,
+                    "session_id": session_id,
+                }))
+
             try:
                 response = await asyncio.wait_for(
                     self.llm.call(
                         model=model,
                         messages=messages,
                         system_prompt=system,
-                        stream=False,  # streaming handled at API/CLI level
+                        stream=False,
                         max_tokens=max_tokens,
                     ),
                     timeout=REACT_ITERATION_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                logger.warning(
-                    "Agent %s iteration %d timed out after %ds",
-                    agent_id, iteration, REACT_ITERATION_TIMEOUT,
-                )
+                logger.warning("Agent %s iteration %d timed out", agent_id, iteration)
                 return "I'm sorry, the response timed out. Please try again."
 
-            tool_call = _parse_tool_call(response)
-            if tool_call is None:
-                # No tool call — this is the final answer
+            # Parse ALL tool calls for parallel execution (Imp 1)
+            tool_calls = _parse_all_tool_calls(response)
+
+            if not tool_calls:
+                # No tool call — final answer; optionally self-reflect (Feature 3)
+                if enable_reflection:
+                    response = await self._self_reflect(response, message, model, max_tokens)
                 return response
 
-            tool_name = tool_call.get("name", "")
-            tool_args = tool_call.get("args", "")
+            # Memory consolidation check (Feature 7)
+            for tc in tool_calls:
+                if tc.get("name") == "memory_read" and rag_session:
+                    try:
+                        from db import memory as memory_db
+                        mem = await memory_db.memory_read(rag_session, agent_type)
+                        if mem and len(mem) > MEMORY_CONSOLIDATION_THRESHOLD:
+                            mem = await self._consolidate_memory(rag_session, agent_type, mem, model)
+                    except Exception:
+                        pass
 
-            tool = self.tools.get(tool_name)
-            if tool is None:
-                tool_result = f"Unknown tool: {tool_name}"
-            else:
-                # Emit tool event
+            # Execute tool calls — parallel for multiple (Imp 1)
+            async def _execute_single(tc: dict) -> tuple[str, str]:
+                tool_name = tc.get("name", "")
+                tool_args = tc.get("args", "")
+
+                # Deduplication (Imp 3)
+                dedup_key = _tool_dedup_key(tool_name, tool_args)
+                if dedup_key in tool_dedup_cache:
+                    return tool_name, f"[cached]\n{tool_dedup_cache[dedup_key]}"
+
+                tool = self.tools.get(tool_name)
+                if tool is None:
+                    return tool_name, f"Unknown tool: {tool_name}"
+
                 if agent_id:
-                    await event_bus.emit({
+                    asyncio.create_task(event_bus.emit({
                         "type": "agent_tools",
                         "agent_id": agent_id,
                         "tools": [tool_name],
-                    })
-                try:
-                    tool_result = await tool.run(tool_args)
-                except Exception as e:
-                    tool_result = f"Tool error [{tool_name}]: {e}"
+                    }))
 
-            # Append assistant's tool call and the result to message history
+                # Error auto-retry (Imp 4)
+                last_error = None
+                for attempt in range(TOOL_ERROR_MAX_RETRIES + 1):
+                    try:
+                        result = await tool.run(tool_args)
+                        # Summarize if too large (Imp 2)
+                        if len(str(result)) > TOOL_RESULT_MAX_CHARS:
+                            result = await self._summarize_tool_result(str(result), model)
+                        tool_dedup_cache[dedup_key] = str(result)
+                        return tool_name, result
+                    except Exception as e:
+                        last_error = e
+                        if attempt < TOOL_ERROR_MAX_RETRIES:
+                            logger.warning("Tool %s attempt %d failed: %s — retrying", tool_name, attempt + 1, e)
+                            await asyncio.sleep(0.5 * (attempt + 1))
+
+                return tool_name, f"Tool error [{tool_name}] after {TOOL_ERROR_MAX_RETRIES} retries: {last_error}"
+
+            if len(tool_calls) == 1:
+                tool_name, tool_result = await _execute_single(tool_calls[0])
+                tool_results = [(tool_name, tool_result)]
+            else:
+                # Parallel execution (Imp 1)
+                tool_results = await asyncio.gather(*[_execute_single(tc) for tc in tool_calls])
+
+            # Checkpoint save (Feature 6)
+            if checkpoint_id and rag_session:
+                try:
+                    from db.agent_checkpoints import save_checkpoint
+                    await save_checkpoint(
+                        session_id=rag_session,
+                        checkpoint_id=checkpoint_id,
+                        messages=messages,
+                        tool_call_cache=tool_dedup_cache,
+                        iteration=iteration + 1,
+                        agent_name=self.__class__.__name__,
+                        model=model,
+                    )
+                except Exception:
+                    pass
+
+            # Append response + all tool results to message history
             messages.append({"role": "assistant", "content": response})
-            messages.append({
-                "role": "user",
-                "content": f"<tool_result>\n{tool_result}\n</tool_result>",
-            })
+            combined_results = "\n\n".join(
+                f"<tool_result name='{name}'>\n{result}\n</tool_result>"
+                for name, result in tool_results
+            )
+            messages.append({"role": "user", "content": combined_results})
 
         # Max iterations reached — ask for final answer
         messages.append({
@@ -184,6 +337,31 @@ class BaseAgent(ABC):
         except asyncio.TimeoutError:
             logger.warning("Agent %s final synthesis timed out", agent_id)
             return "I'm sorry, the response timed out. Please try again."
+
+    async def _self_reflect(self, response: str, original_message: str, model: str, max_tokens: int) -> str:
+        """Self-reflection: agent critiques its response and optionally revises (Feature 3)."""
+        try:
+            reflection_prompt = (
+                f"You just produced this response:\n\n{response}\n\n"
+                f"Original question: {original_message}\n\n"
+                "Critically evaluate: Is the response accurate, complete, and well-structured? "
+                "If it is good enough, reply 'APPROVED'. "
+                "If it needs improvement, reply with a revised, improved version only (no preamble)."
+            )
+            reflection = await asyncio.wait_for(
+                self.llm.call(
+                    model=model,
+                    messages=[{"role": "user", "content": reflection_prompt}],
+                    max_tokens=max_tokens,
+                    temperature=0.3,
+                ),
+                timeout=REACT_ITERATION_TIMEOUT,
+            )
+            if reflection.strip().upper().startswith("APPROVED"):
+                return response
+            return reflection
+        except Exception:
+            return response
 
 
 # ─────────────────────────────────────────
@@ -350,6 +528,23 @@ You are a highly capable, versatile AI assistant. You are direct, honest, and in
 </constraints>"""
 
 
+class DocumentAgent(BaseAgent):
+    """Dedicated RAG/Document Q&A agent (Feature 10)."""
+    @property
+    def system_prompt(self) -> str:
+        return """<role>
+You are a precise document Q&A specialist. You answer questions exclusively from the provided context.
+</role>
+
+<instructions>
+1. ONLY use information from the <context> section provided in the system prompt.
+2. If the answer is not in the context, say "This information is not in the provided documents."
+3. Cite the document title for every claim: [Source: title].
+4. Be concise — answer the question directly, then quote the supporting passage.
+5. Never hallucinate content beyond what is in the context.
+</instructions>"""
+
+
 # ─────────────────────────────────────────
 # PLANNER AGENT
 # ─────────────────────────────────────────
@@ -389,15 +584,21 @@ You are an expert project planner and task decomposer.
         stream: bool = False,
         max_tokens: int = 4096,
         agent_id: str = "",
+        session_id: str = "",
+        enable_reflection: bool = False,
+        checkpoint_id: str = "",
+        active_persona: str = "",
     ) -> str:
-        # Emit a plan_start event before delegating to the base ReAct loop
         if agent_id:
             await event_bus.emit({
                 "type": "plan_start",
                 "agent_id": agent_id,
                 "message": message[:200],
             })
-        result = await super().run(message, model, tool_names, conversation_history, stream, max_tokens, agent_id)
+        result = await super().run(
+            message, model, tool_names, conversation_history, stream, max_tokens,
+            agent_id, session_id, enable_reflection, checkpoint_id, active_persona,
+        )
         if agent_id:
             await event_bus.emit({
                 "type": "plan_done",
@@ -416,9 +617,32 @@ AGENT_REGISTRY: dict[str, type[BaseAgent]] = {
     "file_agent":     FileAgent,
     "general_agent":  GeneralAgent,
     "planner_agent":  PlannerAgent,
+    "document_agent": DocumentAgent,
 }
 
+# In-memory overrides for system prompts (Imp 18)
+_system_prompt_overrides: dict[str, str] = {}
 
-def get_agent(agent_name: str, llm_manager, tools_manager) -> BaseAgent:
+
+def set_agent_system_prompt(agent_name: str, system_prompt: str) -> None:
+    _system_prompt_overrides[agent_name] = system_prompt
+
+
+def get_agent_system_prompt_override(agent_name: str) -> str | None:
+    return _system_prompt_overrides.get(agent_name)
+
+
+def get_agent(agent_name: str, llm_manager, tools_manager) -> "BaseAgent":
     cls = AGENT_REGISTRY.get(agent_name, GeneralAgent)
+
+    # Apply system prompt override if present (Imp 18)
+    override = _system_prompt_overrides.get(agent_name)
+    if override:
+        # Dynamically subclass to inject the override
+        class _OverriddenAgent(cls):  # type: ignore[valid-type]
+            @property
+            def system_prompt(self) -> str:
+                return override
+        return _OverriddenAgent(llm_manager, tools_manager)
+
     return cls(llm_manager, tools_manager)

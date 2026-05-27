@@ -21,6 +21,7 @@ async def record_request(
     input_tokens: int = 0,
     output_tokens: int = 0,
     cost_usd: float = 0.0,
+    context_pct: float = 0.0,
 ) -> None:
     """Append one request record to the analytics collection."""
     if _db is None:
@@ -35,7 +36,7 @@ async def record_request(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost_usd": cost_usd,
-        # Store as datetime so the TTL index can expire old records (#20)
+        "context_pct": context_pct,
         "ts": now,
         "date": now.strftime("%Y-%m-%d"),
     })
