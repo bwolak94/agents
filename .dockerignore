@@ -1,0 +1,20 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+*.egg-info
+
+# Git
+.git
+.gitignore
+
+# Node / web (API doesn't need this)
+web/node_modules
+web/.next
+
+# Env secrets
+.env.local
+
+# OS
+.DS_Store

@@ -2,7 +2,10 @@
 System configuration - loads from .env or environment variables.
 """
 import os
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def load_config() -> dict:
@@ -32,11 +35,11 @@ def load_config() -> dict:
         "web_port": int(os.getenv("WEB_PORT", "3000")),
     }
 
-    # Validation - warn if keys are missing
+    # Validation - warn if keys are missing (#28 — use logging not print)
     if not config["anthropic_api_key"]:
-        print("⚠️  WARNING: Missing ANTHROPIC_API_KEY — Claude unavailable")
+        logger.warning("Missing ANTHROPIC_API_KEY — Claude unavailable")
     if not config["gemini_api_key"]:
-        print("⚠️  WARNING: Missing GEMINI_API_KEY — Gemini unavailable")
+        logger.warning("Missing GEMINI_API_KEY — Gemini unavailable")
 
     return config
 

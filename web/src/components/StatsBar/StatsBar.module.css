@@ -1,0 +1,28 @@
+/* #27 — CSS module replacing inline styles in StatsBar */
+
+.bar {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #050509;
+  border-bottom: 1px solid #1a1a2e;
+  flex-wrap: wrap;
+}
+
+.box {
+  background: #0d0d1a;
+  border-radius: 4px;
+  padding: 8px 14px;
+  text-align: center;
+}
+
+.value {
+  font-family: "'Press Start 2P', monospace";
+  font-size: 16px;
+  margin-bottom: 4px;
+}
+
+.label {
+  font-family: "'Press Start 2P', monospace";
+  font-size: 6px;
+}

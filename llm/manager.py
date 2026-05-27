@@ -5,6 +5,8 @@ Supports: Claude (Anthropic), Gemini (Google), Ollama (local models)
 import os
 import asyncio
 import random
+import sys
+import time
 from typing import Optional
 import httpx
 
@@ -62,9 +64,13 @@ class CostTracker:
 
 
 class LLMManager:
+    # Model health tracking (Imp 6): unhealthy models are skipped for _HEALTH_COOLDOWN seconds
+    _HEALTH_COOLDOWN = 300  # 5 minutes
+
     def __init__(self, config: dict):
         self.config = config
         self.clients = {}
+        self._unhealthy: dict[str, float] = {}  # model -> timestamp marked unhealthy
         self._init_clients()
 
     def _init_clients(self):
@@ -89,29 +95,58 @@ class LLMManager:
         max_tokens: int = 4096,
         temperature: float = 0.7,
         stream: bool = False,
+        stream_callback=None,
     ) -> str:
         """
         Call any model through a unified interface.
 
         model: "claude" | "claude-haiku" | "gemini" | "ollama/llama3" | "ollama/mistral" | "ollama/phi3"
+        stream_callback: optional callable(token: str) invoked for each streamed token
         """
+        self.check_token_budget(messages, system_prompt, max_tokens, model)
+
+        # Check response cache (skip for streaming requests)
+        if not stream and not stream_callback:
+            try:
+                from db.cache import get as cache_get, put as cache_put
+                cached = await cache_get(model, messages, system_prompt)
+                if cached is not None:
+                    return cached
+            except Exception:
+                cached = None
+                cache_get = cache_put = None  # type: ignore
+
+        result: str
         if model in ("claude", "claude-haiku"):
             if "claude" not in self.clients:
-                raise ValueError("Brak klucza API Anthropic! Ustaw ANTHROPIC_API_KEY")
+                raise ValueError("Anthropic API key not set. Configure ANTHROPIC_API_KEY.")
             variant = "haiku" if model == "claude-haiku" else "sonnet"
-            return await self.clients["claude"].call(messages, system_prompt, max_tokens, temperature, stream, variant)
+            result = await self.clients["claude"].call(
+                messages, system_prompt, max_tokens, temperature, stream, variant,
+                stream_callback=stream_callback,
+            )
 
         elif model == "gemini":
             if "gemini" not in self.clients:
-                raise ValueError("Brak klucza API Google! Ustaw GEMINI_API_KEY")
-            return await self.clients["gemini"].call(messages, system_prompt, max_tokens, temperature, stream)
+                raise ValueError("Google API key not set. Configure GEMINI_API_KEY.")
+            result = await self.clients["gemini"].call(messages, system_prompt, max_tokens, temperature, stream)
 
         elif model.startswith("ollama/"):
             ollama_model = model.split("/", 1)[1]
-            return await self.clients["ollama"].call(ollama_model, messages, system_prompt, max_tokens, temperature, stream)
+            result = await self.clients["ollama"].call(ollama_model, messages, system_prompt, max_tokens, temperature, stream)
 
         else:
-            raise ValueError(f"Nieznany model: {model}")
+            raise ValueError(f"Unknown model: {model}")
+
+        # Store in cache for future identical requests
+        if not stream and not stream_callback:
+            try:
+                from db.cache import put as cache_put
+                await cache_put(model, messages, result, system_prompt)
+            except Exception:
+                pass
+
+        return result
 
     def get_cost_stats(self) -> dict:
         """Return cost statistics for Claude."""
@@ -120,19 +155,91 @@ class LLMManager:
         return {}
 
     def available_models(self) -> list[str]:
-        """Return list of available models."""
+        """Return list of available models (Ollama models are discovered at startup)."""
         models = []
         if "claude" in self.clients:
             models.extend(["claude", "claude-haiku"])
         if "gemini" in self.clients:
             models.extend(["gemini"])
-        models.extend(["ollama/llama3", "ollama/mistral", "ollama/phi3"])
+        # Use discovered Ollama models; fall back to defaults if not yet populated
+        ollama_models = getattr(self.clients.get("ollama"), "_discovered_models", None)
+        if ollama_models:
+            models.extend([f"ollama/{m}" for m in ollama_models])
+        else:
+            models.extend(["ollama/llama3", "ollama/mistral", "ollama/phi3"])
         return models
 
+    def is_model_healthy(self, model: str) -> bool:
+        """Return True if the model is not currently marked as unhealthy (Imp 6)."""
+        if model not in self._unhealthy:
+            return True
+        if time.time() - self._unhealthy[model] > self._HEALTH_COOLDOWN:
+            del self._unhealthy[model]
+            return True
+        return False
+
+    def mark_model_unhealthy(self, model: str) -> None:
+        """Mark a model as temporarily unavailable (Imp 6)."""
+        self._unhealthy[model] = time.time()
+
+    def get_health_status(self) -> dict:
+        """Return health status for all models."""
+        now = time.time()
+        status = {}
+        for m in self.available_models():
+            if m in self._unhealthy and now - self._unhealthy[m] < self._HEALTH_COOLDOWN:
+                status[m] = "unhealthy"
+            else:
+                status[m] = "healthy"
+        return status
+
+    async def refresh_ollama_models(self) -> list[str]:
+        """Discover which Ollama models are actually installed and cache the list."""
+        if "ollama" not in self.clients:
+            return []
+        models = await self.clients["ollama"].list_models()
+        self.clients["ollama"]._discovered_models = models
+        return [f"ollama/{m}" for m in models]
+
+    @staticmethod
+    def estimate_tokens(messages: list, system_prompt: str | None = None) -> int:
+        """Rough token estimate: words × 1.3 (good enough to catch runaway prompts)."""
+        text = " ".join(m.get("content", "") for m in messages)
+        if system_prompt:
+            text += " " + system_prompt
+        return int(len(text.split()) * 1.3)
+
+    def check_token_budget(self, messages: list, system_prompt: str | None, max_tokens: int, model: str) -> None:
+        """Raise ValueError if estimated input tokens would exceed the model's context window."""
+        context_limits = {
+            "claude": 190_000, "claude-haiku": 190_000,
+            "gemini": 1_000_000,
+        }
+        limit = context_limits.get(model, 32_000)
+        estimated = self.estimate_tokens(messages, system_prompt)
+        if estimated + max_tokens > limit:
+            raise ValueError(
+                f"Estimated prompt ({estimated} tokens) + max_tokens ({max_tokens}) "
+                f"exceeds context window ({limit}) for model '{model}'."
+            )
+
 
 # ─────────────────────────────────────────
-# CLAUDE (Anthropic)
+# CLAUDE (Anthropic) — shared HTTP client
 # ─────────────────────────────────────────
+_anthropic_http_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_anthropic_client() -> httpx.AsyncClient:
+    global _anthropic_http_client
+    if _anthropic_http_client is None or _anthropic_http_client.is_closed:
+        _anthropic_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _anthropic_http_client
+
+
 class AnthropicClient:
     BASE_URL = "https://api.anthropic.com/v1/messages"
     MODELS = {
@@ -144,7 +251,16 @@ class AnthropicClient:
         self.api_key = api_key
         self.cost_tracker = CostTracker()
 
-    async def call(self, messages, system_prompt, max_tokens, temperature, stream, model_variant: str = "sonnet") -> str:
+    async def call(
+        self,
+        messages,
+        system_prompt,
+        max_tokens,
+        temperature,
+        stream,
+        model_variant: str = "sonnet",
+        stream_callback=None,
+    ) -> str:
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
@@ -157,7 +273,7 @@ class AnthropicClient:
             "temperature": temperature,
             "messages": messages,
         }
-        # Prompt caching - system prompt is static, cache saves up to 90% of tokens
+        # Prompt caching — system prompt is static, cache saves up to 90% of tokens
         if system_prompt:
             payload["system"] = [
                 {
@@ -168,20 +284,26 @@ class AnthropicClient:
             ]
 
         if stream:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                return await self._stream(client, headers, payload)
+            client = _get_anthropic_client()
+            return await self._stream(client, headers, payload, stream_callback=stream_callback)
 
         resp = await self._post_with_retry(headers, payload)
         data = resp.json()
         self.cost_tracker.record(model_variant, data.get("usage", {}))
-        return data["content"][0]["text"]
+
+        # #11 — guard against missing 'content' key (e.g. content policy blocks)
+        content = data.get("content")
+        if not content or not isinstance(content, list):
+            stop_reason = data.get("stop_reason", "unknown")
+            raise ValueError(f"Anthropic response missing content (stop_reason={stop_reason})")
+        return content[0]["text"]
 
     async def _post_with_retry(self, headers: dict, payload: dict, max_retries: int = 3) -> httpx.Response:
         """POST with exponential backoff on 429 (rate limit) and 529 (overload)."""
+        client = _get_anthropic_client()
         last_resp = None
         for attempt in range(max_retries):
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                last_resp = await client.post(self.BASE_URL, json=payload, headers=headers)
+            last_resp = await client.post(self.BASE_URL, json=payload, headers=headers)
             if last_resp.status_code in (429, 529) and attempt < max_retries - 1:
                 wait = (2 ** attempt) + random.uniform(0, 1)
                 await asyncio.sleep(wait)
@@ -191,31 +313,55 @@ class AnthropicClient:
         last_resp.raise_for_status()
         return last_resp
 
-    async def _stream(self, client, headers, payload):
+    async def _stream(self, client, headers, payload, stream_callback=None) -> str:
+        """Stream tokens from the API.
+
+        #10 — uses stream_callback if provided (API/programmatic use),
+        otherwise writes directly to stdout (CLI use).
+        """
         payload["stream"] = True
         full_text = ""
         async with client.stream("POST", self.BASE_URL, json=payload, headers=headers) as resp:
             async for line in resp.aiter_lines():
                 if line.startswith("data: "):
-                    import json
+                    import json as _json
                     chunk = line[6:]
                     if chunk == "[DONE]":
                         break
                     try:
-                        data = json.loads(chunk)
+                        data = _json.loads(chunk)
                         if data.get("type") == "content_block_delta":
                             text = data["delta"].get("text", "")
                             full_text += text
-                            print(text, end="", flush=True)
+                            if stream_callback is not None:
+                                stream_callback(text)
+                            else:
+                                sys.stdout.write(text)
+                                sys.stdout.flush()
                     except Exception:
                         pass
-        print()  # newline after stream
+        if stream_callback is None:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
         return full_text
 
 
 # ─────────────────────────────────────────
-# GEMINI (Google)
+# GEMINI (Google) — shared HTTP client (#8)
 # ─────────────────────────────────────────
+_gemini_http_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_gemini_client() -> httpx.AsyncClient:
+    global _gemini_http_client
+    if _gemini_http_client is None or _gemini_http_client.is_closed:
+        _gemini_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=5.0),
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        )
+    return _gemini_http_client
+
+
 class GeminiClient:
     BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
@@ -233,25 +379,77 @@ class GeminiClient:
             contents.append({"role": role, "parts": [{"text": msg["content"]}]})
         return contents
 
-    async def call(self, messages, system_prompt, max_tokens, temperature, stream) -> str:
+    async def _post_with_retry(self, url: str, payload: dict, max_retries: int = 3) -> dict:
+        """POST with exponential backoff on 429/500."""
+        import random as _random
+        client = _get_gemini_client()
+        last_exc: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                resp = await client.post(url, json=payload)
+                if resp.status_code in (429, 500, 503) and attempt < max_retries - 1:
+                    await asyncio.sleep((2 ** attempt) + _random.uniform(0, 0.5))
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                last_exc = e
+                if attempt < max_retries - 1:
+                    await asyncio.sleep((2 ** attempt) + _random.uniform(0, 0.5))
+        raise last_exc or RuntimeError("Gemini request failed")
+
+    async def call(
+        self,
+        messages,
+        system_prompt,
+        max_tokens,
+        temperature,
+        stream,
+        image_data: bytes | None = None,
+        image_mime: str = "image/jpeg",
+    ) -> str:
         url = f"{self.BASE_URL}?key={self.api_key}"
+        contents = self._convert_messages(messages, system_prompt)
+        # Vision: attach image to the last user part if image_data provided
+        if image_data:
+            import base64
+            b64 = base64.b64encode(image_data).decode()
+            if contents and contents[-1]["role"] == "user":
+                contents[-1]["parts"].append({
+                    "inlineData": {"mimeType": image_mime, "data": b64}
+                })
+            else:
+                contents.append({
+                    "role": "user",
+                    "parts": [{"inlineData": {"mimeType": image_mime, "data": b64}}],
+                })
         payload = {
-            "contents": self._convert_messages(messages, system_prompt),
+            "contents": contents,
             "generationConfig": {
                 "maxOutputTokens": max_tokens,
                 "temperature": temperature,
             },
         }
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
+        data = await self._post_with_retry(url, payload)
+        return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
 # ─────────────────────────────────────────
-# OLLAMA (lokalne modele)
+# OLLAMA (local models) — shared HTTP client (#9)
 # ─────────────────────────────────────────
+_ollama_http_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_ollama_client() -> httpx.AsyncClient:
+    global _ollama_http_client
+    if _ollama_http_client is None or _ollama_http_client.is_closed:
+        _ollama_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0),
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        )
+    return _ollama_http_client
+
+
 class OllamaClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
@@ -278,18 +476,28 @@ class OllamaClient:
                 "temperature": temperature,
             },
         }
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["response"]
+        client = _get_ollama_client()
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = await client.post(url, json=payload)
+                if resp.status_code in (429, 500, 503) and attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                resp.raise_for_status()
+                return resp.json()["response"]
+            except Exception as e:
+                last_exc = e
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+        raise last_exc or RuntimeError("Ollama request failed")
 
     async def list_models(self) -> list[str]:
         """List available models in Ollama."""
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(f"{self.base_url}/api/tags")
-                data = resp.json()
-                return [m["name"] for m in data.get("models", [])]
+            client = _get_ollama_client()
+            resp = await client.get(f"{self.base_url}/api/tags")
+            data = resp.json()
+            return [m["name"] for m in data.get("models", [])]
         except Exception:
             return []
