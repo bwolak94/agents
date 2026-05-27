@@ -16,21 +16,40 @@ _SYSTEM_SESSIONS = {"default"}
 
 
 async def init_db(mongo_url: str):
-    """Initialize the MongoDB connection. Safe to call multiple times — only initializes once.
-    #23 — guard against duplicate initialization that would leak the old connection.
+    """Initialize the MongoDB connection.
+
+    Safe to call multiple times — only initializes once.
+    If a previous call failed (connection drop), the guard is reset so a retry
+    is possible (#27).
     """
     global _client, _db
     if _db is not None:
         return _db
 
-    _client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
-    _db = _client["agent_system"]
+    # Create a fresh client; store in a local first so _db stays None on failure
+    client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
+    db = client["agent_system"]
 
-    # Verify MongoDB is actually reachable at startup
-    await _client.admin.command("ping")
+    # Verify MongoDB is actually reachable at startup; raises on failure
+    await client.admin.command("ping")
+
+    # Only commit to globals after a successful ping so callers can retry
+    _client = client
+    _db = db
 
     await _db["conversations"].create_index("session_id", unique=True)
-    await _db["analytics"].create_index("ts")
+    # Full-text search index on message content
+    try:
+        await _db["conversations"].create_index([("messages.content", "text"), ("preview", "text")])
+    except Exception:
+        pass  # Index may already exist
+    # TTL index: analytics records expire after 90 days (#20).
+    # Drop the old non-TTL index first if it exists so we can recreate it.
+    try:
+        await _db["analytics"].drop_index("ts_1")
+    except Exception:
+        pass
+    await _db["analytics"].create_index("ts", expireAfterSeconds=90 * 24 * 3600)
     await _db["agent_memory"].create_index([("session_id", 1), ("agent_type", 1)], unique=True)
     await _db["prompts"].create_index([("session_id", 1), ("created_at", -1)])
     return _db
@@ -45,10 +64,14 @@ async def load_history(session_id: str) -> list:
     return doc["messages"] if doc else []
 
 
-async def load_context(session_id: str) -> list:
+_CONTEXT_MESSAGE_LIMIT = 40  # keep last 40 messages to avoid blowing up the LLM context (#23)
+
+
+async def load_context(session_id: str, limit: int = _CONTEXT_MESSAGE_LIMIT) -> list:
     """Return history in {role, content} format for the LLM (without metadata)."""
     messages = await load_history(session_id)
-    return [{"role": m["role"], "content": m["content"]} for m in messages]
+    recent = messages[-limit:] if len(messages) > limit else messages
+    return [{"role": m["role"], "content": m["content"]} for m in recent]
 
 
 async def append_message(session_id: str, role: str, content: str, **meta):

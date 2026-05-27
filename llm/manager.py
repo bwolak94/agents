@@ -98,11 +98,25 @@ class LLMManager:
         model: "claude" | "claude-haiku" | "gemini" | "ollama/llama3" | "ollama/mistral" | "ollama/phi3"
         stream_callback: optional callable(token: str) invoked for each streamed token
         """
+        self.check_token_budget(messages, system_prompt, max_tokens, model)
+
+        # Check response cache (skip for streaming requests)
+        if not stream and not stream_callback:
+            try:
+                from db.cache import get as cache_get, put as cache_put
+                cached = await cache_get(model, messages, system_prompt)
+                if cached is not None:
+                    return cached
+            except Exception:
+                cached = None
+                cache_get = cache_put = None  # type: ignore
+
+        result: str
         if model in ("claude", "claude-haiku"):
             if "claude" not in self.clients:
                 raise ValueError("Anthropic API key not set. Configure ANTHROPIC_API_KEY.")
             variant = "haiku" if model == "claude-haiku" else "sonnet"
-            return await self.clients["claude"].call(
+            result = await self.clients["claude"].call(
                 messages, system_prompt, max_tokens, temperature, stream, variant,
                 stream_callback=stream_callback,
             )
@@ -110,14 +124,24 @@ class LLMManager:
         elif model == "gemini":
             if "gemini" not in self.clients:
                 raise ValueError("Google API key not set. Configure GEMINI_API_KEY.")
-            return await self.clients["gemini"].call(messages, system_prompt, max_tokens, temperature, stream)
+            result = await self.clients["gemini"].call(messages, system_prompt, max_tokens, temperature, stream)
 
         elif model.startswith("ollama/"):
             ollama_model = model.split("/", 1)[1]
-            return await self.clients["ollama"].call(ollama_model, messages, system_prompt, max_tokens, temperature, stream)
+            result = await self.clients["ollama"].call(ollama_model, messages, system_prompt, max_tokens, temperature, stream)
 
         else:
             raise ValueError(f"Unknown model: {model}")
+
+        # Store in cache for future identical requests
+        if not stream and not stream_callback:
+            try:
+                from db.cache import put as cache_put
+                await cache_put(model, messages, result, system_prompt)
+            except Exception:
+                pass
+
+        return result
 
     def get_cost_stats(self) -> dict:
         """Return cost statistics for Claude."""
@@ -126,14 +150,49 @@ class LLMManager:
         return {}
 
     def available_models(self) -> list[str]:
-        """Return list of available models."""
+        """Return list of available models (Ollama models are discovered at startup)."""
         models = []
         if "claude" in self.clients:
             models.extend(["claude", "claude-haiku"])
         if "gemini" in self.clients:
             models.extend(["gemini"])
-        models.extend(["ollama/llama3", "ollama/mistral", "ollama/phi3"])
+        # Use discovered Ollama models; fall back to defaults if not yet populated
+        ollama_models = getattr(self.clients.get("ollama"), "_discovered_models", None)
+        if ollama_models:
+            models.extend([f"ollama/{m}" for m in ollama_models])
+        else:
+            models.extend(["ollama/llama3", "ollama/mistral", "ollama/phi3"])
         return models
+
+    async def refresh_ollama_models(self) -> list[str]:
+        """Discover which Ollama models are actually installed and cache the list."""
+        if "ollama" not in self.clients:
+            return []
+        models = await self.clients["ollama"].list_models()
+        self.clients["ollama"]._discovered_models = models
+        return [f"ollama/{m}" for m in models]
+
+    @staticmethod
+    def estimate_tokens(messages: list, system_prompt: str | None = None) -> int:
+        """Rough token estimate: words × 1.3 (good enough to catch runaway prompts)."""
+        text = " ".join(m.get("content", "") for m in messages)
+        if system_prompt:
+            text += " " + system_prompt
+        return int(len(text.split()) * 1.3)
+
+    def check_token_budget(self, messages: list, system_prompt: str | None, max_tokens: int, model: str) -> None:
+        """Raise ValueError if estimated input tokens would exceed the model's context window."""
+        context_limits = {
+            "claude": 190_000, "claude-haiku": 190_000,
+            "gemini": 1_000_000,
+        }
+        limit = context_limits.get(model, 32_000)
+        estimated = self.estimate_tokens(messages, system_prompt)
+        if estimated + max_tokens > limit:
+            raise ValueError(
+                f"Estimated prompt ({estimated} tokens) + max_tokens ({max_tokens}) "
+                f"exceeds context window ({limit}) for model '{model}'."
+            )
 
 
 # ─────────────────────────────────────────
@@ -291,20 +350,58 @@ class GeminiClient:
             contents.append({"role": role, "parts": [{"text": msg["content"]}]})
         return contents
 
-    async def call(self, messages, system_prompt, max_tokens, temperature, stream) -> str:
+    async def _post_with_retry(self, url: str, payload: dict, max_retries: int = 3) -> dict:
+        """POST with exponential backoff on 429/500."""
+        import random as _random
+        client = _get_gemini_client()
+        last_exc: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                resp = await client.post(url, json=payload)
+                if resp.status_code in (429, 500, 503) and attempt < max_retries - 1:
+                    await asyncio.sleep((2 ** attempt) + _random.uniform(0, 0.5))
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                last_exc = e
+                if attempt < max_retries - 1:
+                    await asyncio.sleep((2 ** attempt) + _random.uniform(0, 0.5))
+        raise last_exc or RuntimeError("Gemini request failed")
+
+    async def call(
+        self,
+        messages,
+        system_prompt,
+        max_tokens,
+        temperature,
+        stream,
+        image_data: bytes | None = None,
+        image_mime: str = "image/jpeg",
+    ) -> str:
         url = f"{self.BASE_URL}?key={self.api_key}"
+        contents = self._convert_messages(messages, system_prompt)
+        # Vision: attach image to the last user part if image_data provided
+        if image_data:
+            import base64
+            b64 = base64.b64encode(image_data).decode()
+            if contents and contents[-1]["role"] == "user":
+                contents[-1]["parts"].append({
+                    "inlineData": {"mimeType": image_mime, "data": b64}
+                })
+            else:
+                contents.append({
+                    "role": "user",
+                    "parts": [{"inlineData": {"mimeType": image_mime, "data": b64}}],
+                })
         payload = {
-            "contents": self._convert_messages(messages, system_prompt),
+            "contents": contents,
             "generationConfig": {
                 "maxOutputTokens": max_tokens,
                 "temperature": temperature,
             },
         }
-        # #8 — use shared client instead of creating a new one per call
-        client = _get_gemini_client()
-        resp = await client.post(url, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data = await self._post_with_retry(url, payload)
         return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
@@ -350,12 +447,21 @@ class OllamaClient:
                 "temperature": temperature,
             },
         }
-        # #9 — use shared client instead of creating a new one per call
         client = _get_ollama_client()
-        resp = await client.post(url, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["response"]
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = await client.post(url, json=payload)
+                if resp.status_code in (429, 500, 503) and attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                resp.raise_for_status()
+                return resp.json()["response"]
+            except Exception as e:
+                last_exc = e
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+        raise last_exc or RuntimeError("Ollama request failed")
 
     async def list_models(self) -> list[str]:
         """List available models in Ollama."""

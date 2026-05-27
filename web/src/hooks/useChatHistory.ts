@@ -16,12 +16,17 @@ interface HistoryResponse {
 export function useChatHistory(sessionId: string | null) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!sessionId) return;
     setLoading(true);
+    setError(null);
     fetch(`${API_URL}/history/${sessionId}`)
-      .then((r) => r.json())
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
       .then((data: HistoryResponse) => {
         setMessages(
           (data.messages ?? []).map((m) => ({
@@ -33,9 +38,11 @@ export function useChatHistory(sessionId: string | null) {
           })),
         );
       })
-      .catch(() => {})
+      .catch((err: unknown) => {
+        setError(err instanceof Error ? err.message : 'Failed to load history');
+      })
       .finally(() => setLoading(false));
   }, [sessionId]);
 
-  return { messages, setMessages, historyLoading: loading };
+  return { messages, setMessages, historyLoading: loading, historyError: error };
 }

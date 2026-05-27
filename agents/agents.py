@@ -100,6 +100,20 @@ class BaseAgent(ABC):
         system = self.system_prompt + _build_tool_instructions(tool_names)
         messages = list(conversation_history) + [{"role": "user", "content": message}]
 
+        # RAG auto-context: prepend top matching knowledge chunks to system prompt
+        if agent_id:
+            try:
+                from db.rag import search as rag_search
+                # Extract session_id from agent_id prefix (format: "session_id-uuid")
+                session_id = agent_id.split("-")[0] if "-" in agent_id else ""
+                if session_id:
+                    chunks = await rag_search(session_id, message, limit=3)
+                    if chunks:
+                        ctx = "\n\n".join(f"[{c['title']}]\n{c['content']}" for c in chunks)
+                        system = f"<context>\n{ctx}\n</context>\n\n" + system
+            except Exception:
+                pass
+
         for iteration in range(MAX_REACT_ITERATIONS):
             # #14 — per-iteration timeout so a hung LLM call doesn't block forever
             try:
@@ -337,6 +351,62 @@ You are a highly capable, versatile AI assistant. You are direct, honest, and in
 
 
 # ─────────────────────────────────────────
+# PLANNER AGENT
+# ─────────────────────────────────────────
+class PlannerAgent(BaseAgent):
+    @property
+    def system_prompt(self) -> str:
+        return """<role>
+You are an expert project planner and task decomposer.
+</role>
+
+<capabilities>
+- Break complex goals into clear, ordered steps
+- Identify dependencies and parallelisable work
+- Estimate effort and flag risks for each step
+- Delegate steps to the right specialist agents
+</capabilities>
+
+<instructions>
+1. DECOMPOSE: Split the user's goal into numbered steps.
+2. LABEL: Mark each step with [code], [research], [file], or [general].
+3. DEPENDENCIES: Note which steps must complete before others.
+4. EXECUTE: For each step, delegate via agent_call or perform it directly.
+5. SUMMARISE: End with a concise summary of what was accomplished.
+</instructions>
+
+<constraints>
+- Do not skip steps.
+- Always confirm your plan before executing when the task is complex.
+</constraints>"""
+
+    async def run(
+        self,
+        message: str,
+        model: str,
+        tool_names: list[str],
+        conversation_history: list,
+        stream: bool = False,
+        max_tokens: int = 4096,
+        agent_id: str = "",
+    ) -> str:
+        # Emit a plan_start event before delegating to the base ReAct loop
+        if agent_id:
+            await event_bus.emit({
+                "type": "plan_start",
+                "agent_id": agent_id,
+                "message": message[:200],
+            })
+        result = await super().run(message, model, tool_names, conversation_history, stream, max_tokens, agent_id)
+        if agent_id:
+            await event_bus.emit({
+                "type": "plan_done",
+                "agent_id": agent_id,
+            })
+        return result
+
+
+# ─────────────────────────────────────────
 # AGENT REGISTRY
 # ─────────────────────────────────────────
 AGENT_REGISTRY: dict[str, type[BaseAgent]] = {
@@ -345,6 +415,7 @@ AGENT_REGISTRY: dict[str, type[BaseAgent]] = {
     "learn_agent":    LearnAgent,
     "file_agent":     FileAgent,
     "general_agent":  GeneralAgent,
+    "planner_agent":  PlannerAgent,
 }
 
 

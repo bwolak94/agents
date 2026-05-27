@@ -2,7 +2,12 @@
 Session-aware event bus — each WebSocket subscriber can filter by session_id.
 """
 import asyncio
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+_MAX_SUBSCRIBERS = 500  # cap to prevent unbounded growth on rapid reconnects (#19)
 
 
 class EventBus:
@@ -12,6 +17,12 @@ class EventBus:
 
     def subscribe(self, session_id: Optional[str] = None) -> asyncio.Queue:
         """Subscribe to events. Pass session_id to receive only that session's events."""
+        if len(self._subscribers) >= _MAX_SUBSCRIBERS:
+            logger.warning(
+                "EventBus subscriber cap (%d) reached — rejecting new subscription",
+                _MAX_SUBSCRIBERS,
+            )
+            raise RuntimeError("Too many WebSocket subscribers — server is at capacity")
         q: asyncio.Queue = asyncio.Queue(maxsize=200)
         self._subscribers[q] = session_id
         return q

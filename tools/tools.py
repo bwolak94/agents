@@ -115,7 +115,7 @@ class WebSearchTool:
 # CODE EXECUTOR (sandboxed subprocess with resource limits)
 # ─────────────────────────────────────────
 class CodeExecutorTool:
-    TIMEOUT = 30
+    TIMEOUT = int(os.getenv("CODE_EXEC_TIMEOUT", "30"))
 
     async def run(self, code_or_message: str) -> str:
         code_match = re.search(r"```(?:python)?\n(.*?)```", code_or_message, re.DOTALL)
@@ -247,9 +247,19 @@ class FileWriterTool:
             # Ensure write stays inside workspace
             if not str(p).startswith(str(WORKSPACE_DIR.resolve())):
                 return "Access denied: writes are restricted to the workspace directory."
+            # Save previous version and compute diff
+            diff_output = ""
+            try:
+                from db.file_versions import save_version, compute_diff, get_previous
+                prev = await get_previous(str(p))
+                if prev is not None:
+                    diff_output = "\n\nDIFF:\n" + compute_diff(prev, content, path)
+                await save_version(str(p), content if p.exists() else "")
+            except Exception:
+                pass
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
-            return f"Saved: {p} ({len(content)} characters)"
+            return f"Saved: {p} ({len(content)} characters){diff_output}"
         except Exception as e:
             return f"Write error: {e}"
 
@@ -258,7 +268,7 @@ class FileWriterTool:
 # SHELL TOOL  (allowlist-protected, exec not shell)
 # ─────────────────────────────────────────
 class ShellTool:
-    TIMEOUT = 30
+    TIMEOUT = int(os.getenv("SHELL_TIMEOUT", "30"))
     # Allowlist: only commands starting with these prefixes are permitted
     ALLOWED_PREFIXES = (
         "ls", "cat", "echo", "grep", "find", "pwd", "wc", "head", "tail",
@@ -407,3 +417,37 @@ class ToolsManager:
         self._tools["memory_write"] = MemoryWriteTool(session_id, agent_type)
         if parent_orchestrator is not None:
             self._tools["agent_call"] = AgentCallTool(parent_orchestrator)
+
+    def register_webhook(self, name: str, url: str, method: str = "POST") -> None:
+        """Dynamically register a webhook tool."""
+        self._tools[name] = WebhookTool(url, method)
+
+
+# ─────────────────────────────────────────
+# WEBHOOK TOOL
+# ─────────────────────────────────────────
+class WebhookTool:
+    """Call an HTTP webhook with the provided JSON payload."""
+
+    def __init__(self, url: str, method: str = "POST"):
+        self.url = url
+        self.method = method.upper()
+
+    async def run(self, message: str) -> str:
+        try:
+            payload = json.loads(message) if message.strip().startswith("{") else {"input": message}
+        except json.JSONDecodeError:
+            payload = {"input": message}
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                if self.method == "GET":
+                    resp = await client.get(self.url, params=payload)
+                else:
+                    resp = await client.post(self.url, json=payload)
+                resp.raise_for_status()
+                try:
+                    return json.dumps(resp.json(), indent=2)
+                except Exception:
+                    return resp.text[:2000]
+        except Exception as e:
+            return f"Webhook error: {e}"

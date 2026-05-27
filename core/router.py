@@ -2,6 +2,7 @@
 Router Agent — analyses the task and decides: model, agent, tools.
 Now context-aware (uses recent history) and returns a fallback model chain.
 """
+import asyncio
 import json
 import re
 import hashlib
@@ -86,12 +87,22 @@ _FILE_RE = re.compile(
 )
 
 # #16 — simple LRU-style routing cache (maxsize=128 entries)
+# #21 — protected by asyncio.Lock to prevent concurrent-write races
 _ROUTE_CACHE: dict[str, "RouterDecision"] = {}
 _ROUTE_CACHE_ORDER: list[str] = []
 _ROUTE_CACHE_MAX = 128
+_ROUTE_CACHE_LOCK: asyncio.Lock | None = None  # created lazily inside the event loop
+
+
+def _get_cache_lock() -> asyncio.Lock:
+    global _ROUTE_CACHE_LOCK
+    if _ROUTE_CACHE_LOCK is None:
+        _ROUTE_CACHE_LOCK = asyncio.Lock()
+    return _ROUTE_CACHE_LOCK
 
 
 def _cache_put(key: str, decision: "RouterDecision") -> None:
+    """Must be called while holding _get_cache_lock()."""
     if key in _ROUTE_CACHE:
         _ROUTE_CACHE_ORDER.remove(key)
     elif len(_ROUTE_CACHE) >= _ROUTE_CACHE_MAX:
@@ -186,11 +197,12 @@ class RouterAgent:
 
     async def route(self, user_message: str, context: list | None = None) -> RouterDecision:
         """Analyse the message and return a routing decision."""
-        # #16 — check cache before calling LLM
+        # #16/#21 — check cache under lock before calling LLM
         cache_key = _routing_cache_key(user_message, context)
-        if cache_key in _ROUTE_CACHE:
-            logger.debug("Router cache hit for key %s", cache_key[:8])
-            return _ROUTE_CACHE[cache_key]
+        async with _get_cache_lock():
+            if cache_key in _ROUTE_CACHE:
+                logger.debug("Router cache hit for key %s", cache_key[:8])
+                return _ROUTE_CACHE[cache_key]
 
         prompt = self._build_router_prompt(user_message, context)
         messages = [{"role": "user", "content": prompt}]
@@ -229,8 +241,9 @@ class RouterAgent:
                 needs_internet=data.get("needs_internet", False),
                 parallel_tasks=data.get("parallel_tasks"),
             )
-            # #16 — store in cache
-            _cache_put(cache_key, decision)
+            # #16/#21 — store in cache under lock
+            async with _get_cache_lock():
+                _cache_put(cache_key, decision)
             return decision
         except (json.JSONDecodeError, KeyError):
             return self._heuristic_route(user_message, context)

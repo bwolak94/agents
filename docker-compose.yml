@@ -16,14 +16,31 @@ services:
       - PYTHONIOENCODING=utf-8
       - PYTHONUTF8=1
     volumes:
-      - .:/app
+      # Mount only source directories, not the entire repo (#26)
+      - ./api:/app/api
+      - ./core:/app/core
+      - ./agents:/app/agents
+      - ./tools:/app/tools
+      - ./llm:/app/llm
+      - ./db:/app/db
+      - ./config:/app/config
       - ./data:/app/data
     depends_on:
-      - ollama
-      - searxng
+      mongo:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+      searxng:
+        condition: service_started
     restart: unless-stopped
     networks:
       - agent-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
   # ─────────────────────────────────────────
   # Web UI (Node.js / Next.js)
@@ -38,14 +55,18 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - agent-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
-  # ─────────────────────────────────────────
-  # Ollama (lokalne modele LLM)
-  # ─────────────────────────────────────────
   # ─────────────────────────────────────────
   # MongoDB - chat history
   # ─────────────────────────────────────────
@@ -59,6 +80,12 @@ services:
     restart: unless-stopped
     networks:
       - agent-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   # ─────────────────────────────────────────
   # SearXNG - samohostowana wyszukiwarka
@@ -76,6 +103,12 @@ services:
     restart: unless-stopped
     networks:
       - agent-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ > /dev/null 2>&1 || curl -sf http://localhost:8080/ > /dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   ollama:
     image: ollama/ollama:latest
@@ -87,6 +120,12 @@ services:
     restart: unless-stopped
     networks:
       - agent-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:11434/ || wget -qO- http://localhost:11434/ > /dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     # Uncomment if you have an NVIDIA GPU:
     # deploy:
     #   resources:
@@ -103,12 +142,12 @@ services:
     image: curlimages/curl:latest
     container_name: agent-ollama-setup
     depends_on:
-      - ollama
+      ollama:
+        condition: service_started
     networks:
       - agent-net
     command: >
       sh -c "
-        sleep 5 &&
         curl -s http://ollama:11434/api/pull -d '{\"name\":\"llama3\"}' &&
         curl -s http://ollama:11434/api/pull -d '{\"name\":\"mistral\"}' &&
         echo 'Modele pobrane!'

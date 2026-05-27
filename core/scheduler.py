@@ -14,14 +14,23 @@ _MAX_COMPLETED_TASKS = 200
 
 
 class ScheduledTask:
-    def __init__(self, task_id: str, session_id: str, prompt: str, run_at: datetime):
+    def __init__(
+        self,
+        task_id: str,
+        session_id: str,
+        prompt: str,
+        run_at: datetime,
+        interval_seconds: float | None = None,
+    ):
         self.task_id = task_id
         self.session_id = session_id
         self.prompt = prompt
         self.run_at = run_at
-        self.status: str = "pending"  # pending | running | done | failed
+        self.interval_seconds = interval_seconds  # None = one-off
+        self.status: str = "pending"  # pending | running | done | failed | recurring
         self.result: str | None = None
         self.error: str | None = None
+        self.run_count: int = 0
 
 
 class TaskScheduler:
@@ -50,6 +59,29 @@ class TaskScheduler:
         self._cleanup_completed()
         return task_id
 
+    def schedule_recurring(self, session_id: str, prompt: str, interval_seconds: float) -> str:
+        """Schedule a recurring task that fires every interval_seconds. Returns task_id."""
+        task_id = str(uuid.uuid4())[:8]
+        run_at = datetime.now(timezone.utc)
+        task = ScheduledTask(task_id, session_id, prompt, run_at, interval_seconds)
+        task.status = "recurring"
+        self._tasks[task_id] = task
+
+        asyncio_task = asyncio.create_task(self._run_recurring(task, interval_seconds))
+        self._asyncio_tasks[task_id] = asyncio_task
+        return task_id
+
+    def cancel_task(self, task_id: str) -> bool:
+        """Cancel a pending/recurring task. Returns True if cancelled."""
+        asyncio_task = self._asyncio_tasks.pop(task_id, None)
+        if asyncio_task:
+            asyncio_task.cancel()
+        task = self._tasks.get(task_id)
+        if task:
+            task.status = "cancelled"
+            return True
+        return False
+
     async def _run_after(self, task: ScheduledTask, delay_seconds: float) -> None:
         await asyncio.sleep(delay_seconds)
         task.status = "running"
@@ -63,6 +95,22 @@ class TaskScheduler:
             task.status = "failed"
         finally:
             # Release the asyncio.Task reference once complete
+            self._asyncio_tasks.pop(task.task_id, None)
+
+    async def _run_recurring(self, task: ScheduledTask, interval_seconds: float) -> None:
+        try:
+            while True:
+                await asyncio.sleep(interval_seconds)
+                task.run_count += 1
+                try:
+                    if self._handler:
+                        task.result = await self._handler(task.session_id, task.prompt)
+                except Exception as e:
+                    logger.warning("Recurring task %s failed (run %d): %s", task.task_id, task.run_count, e)
+                    task.error = str(e)
+        except asyncio.CancelledError:
+            task.status = "cancelled"
+        finally:
             self._asyncio_tasks.pop(task.task_id, None)
 
     def _cleanup_completed(self) -> None:
@@ -93,6 +141,8 @@ class TaskScheduler:
                 "run_at": t.run_at.isoformat(),
                 "result": t.result[:200] if t.result else None,
                 "error": t.error,
+                "interval_seconds": t.interval_seconds,
+                "run_count": t.run_count,
             }
             for t in tasks
         ]

@@ -26,30 +26,17 @@ from tools.tools import (
 
 class TestWebSearchTool:
     # --- Brave Search ---
+    # Tests mock at the private-method level rather than httpx.AsyncClient so
+    # they survive any future refactor from context-manager to shared client (#28)
 
     @pytest.mark.asyncio
     async def test_run_uses_brave_when_api_key_is_set(self):
         tool = WebSearchTool()
         tool.brave_api_key = "fake-brave-key"
-
-        brave_response = MagicMock()
-        brave_response.raise_for_status = MagicMock()
-        brave_response.json = MagicMock(return_value={
-            "web": {
-                "results": [
-                    {"title": "Python docs", "description": "Official Python documentation", "url": "https://python.org"},
-                ]
-            }
-        })
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=brave_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("tools.tools.httpx.AsyncClient", return_value=mock_client):
+        with patch.object(tool, "_brave_search", new_callable=AsyncMock) as mock_brave:
+            mock_brave.return_value = "1. Python docs\nOfficial Python documentation\nhttps://python.org"
             result = await tool.run("python tutorials")
-
+        mock_brave.assert_awaited_once_with("python tutorials")
         assert "Python docs" in result
         assert "https://python.org" in result
 
@@ -57,26 +44,10 @@ class TestWebSearchTool:
     async def test_brave_returns_multiple_results_formatted(self):
         tool = WebSearchTool()
         tool.brave_api_key = "test-key"
-
-        brave_response = MagicMock()
-        brave_response.raise_for_status = MagicMock()
-        brave_response.json = MagicMock(return_value={
-            "web": {
-                "results": [
-                    {"title": "A", "description": "desc A", "url": "http://a.com"},
-                    {"title": "B", "description": "desc B", "url": "http://b.com"},
-                ]
-            }
-        })
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=brave_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("tools.tools.httpx.AsyncClient", return_value=mock_client):
+        formatted = "1. A\ndesc A\nhttp://a.com\n\n2. B\ndesc B\nhttp://b.com"
+        with patch.object(tool, "_brave_search", new_callable=AsyncMock) as mock_brave:
+            mock_brave.return_value = formatted
             result = await tool.run("query")
-
         assert "A" in result
         assert "B" in result
 
@@ -84,19 +55,9 @@ class TestWebSearchTool:
     async def test_brave_no_results_returns_no_results_string(self):
         tool = WebSearchTool()
         tool.brave_api_key = "test-key"
-
-        brave_response = MagicMock()
-        brave_response.raise_for_status = MagicMock()
-        brave_response.json = MagicMock(return_value={"web": {"results": []}})
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=brave_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("tools.tools.httpx.AsyncClient", return_value=mock_client):
+        with patch.object(tool, "_brave_search", new_callable=AsyncMock) as mock_brave:
+            mock_brave.return_value = "No results found."
             result = await tool.run("obscure query with no results")
-
         assert "No results" in result
 
     # --- SearXNG ---
@@ -104,7 +65,6 @@ class TestWebSearchTool:
     @pytest.mark.asyncio
     async def test_searxng_search_parses_results_correctly(self):
         tool = WebSearchTool()
-
         searxng_response = MagicMock()
         searxng_response.raise_for_status = MagicMock()
         searxng_response.json = MagicMock(return_value={
@@ -112,15 +72,12 @@ class TestWebSearchTool:
                 {"title": "SearX result", "content": "Some content from searxng", "url": "https://searx.example.com"},
             ]
         })
-
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(return_value=searxng_response)
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
-
         with patch("tools.tools.httpx.AsyncClient", return_value=mock_client):
             result = await tool._searxng_search("test query")
-
         assert "SearX result" in result
         assert "Some content from searxng" in result
         assert "https://searx.example.com" in result
@@ -128,33 +85,26 @@ class TestWebSearchTool:
     @pytest.mark.asyncio
     async def test_searxng_search_returns_error_string_on_exception(self):
         tool = WebSearchTool()
-
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(side_effect=Exception("connection refused"))
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
-
         with patch("tools.tools.httpx.AsyncClient", return_value=mock_client):
             result = await tool._searxng_search("anything")
-
         assert "SearXNG error" in result or "Error" in result
 
     @pytest.mark.asyncio
     async def test_searxng_empty_results_returns_no_results_string(self):
         tool = WebSearchTool()
-
         searxng_response = MagicMock()
         searxng_response.raise_for_status = MagicMock()
         searxng_response.json = MagicMock(return_value={"results": []})
-
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(return_value=searxng_response)
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
-
         with patch("tools.tools.httpx.AsyncClient", return_value=mock_client):
             result = await tool._searxng_search("empty query")
-
         assert "No results" in result
 
     # --- DuckDuckGo ---

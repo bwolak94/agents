@@ -1,7 +1,8 @@
 import type { Stats, Costs } from '@/types/chat';
 import type { WsStatus } from '@/hooks/useWebSocket';
+import type { Theme } from '@/hooks/useTheme';
 
-export type ViewId = 'chat' | 'analytics';
+export type ViewId = 'chat' | 'analytics' | 'memory';
 
 interface HeaderProps {
   wsStatus: WsStatus;
@@ -9,6 +10,8 @@ interface HeaderProps {
   costs: Costs | null;
   view: ViewId;
   onViewChange: (view: ViewId) => void;
+  theme?: Theme;
+  onToggleTheme?: () => void;
 }
 
 const WS_STATUS_CONFIG: Record<WsStatus, { color: string; label: string }> = {
@@ -20,6 +23,7 @@ const WS_STATUS_CONFIG: Record<WsStatus, { color: string; label: string }> = {
 const NAV_TABS: { id: ViewId; icon: string; label: string }[] = [
   { id: 'chat', icon: '💬', label: 'Chat' },
   { id: 'analytics', icon: '📊', label: 'Analytics' },
+  { id: 'memory', icon: '🧠', label: 'Memory' },
 ];
 
 interface StatPillProps {
@@ -37,7 +41,7 @@ function StatPill({ label, value, color }: StatPillProps) {
   );
 }
 
-export function Header({ wsStatus, stats, costs, view, onViewChange }: HeaderProps) {
+export function Header({ wsStatus, stats, costs, view, onViewChange, theme = 'dark', onToggleTheme }: HeaderProps) {
   const { color: dotColor, label: wsLabel } = WS_STATUS_CONFIG[wsStatus];
 
   return (
@@ -108,6 +112,31 @@ export function Header({ wsStatus, stats, costs, view, onViewChange }: HeaderPro
 
       {/* Spacer */}
       <div style={{ flex: 1 }} />
+
+      {/* Cmd+K hint */}
+      <div style={{ fontSize: 10, color: '#334155', border: '1px solid #1e293b', borderRadius: 4, padding: '2px 6px' }}>
+        ⌘K
+      </div>
+
+      {/* Theme toggle */}
+      {onToggleTheme && (
+        <button
+          onClick={onToggleTheme}
+          title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+          style={{
+            background: 'none',
+            border: '1px solid #334155',
+            borderRadius: 6,
+            color: '#64748b',
+            cursor: 'pointer',
+            fontSize: 13,
+            padding: '3px 8px',
+            lineHeight: 1,
+          }}
+        >
+          {theme === 'dark' ? '☀' : '☽'}
+        </button>
+      )}
 
       {/* WS Status */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>

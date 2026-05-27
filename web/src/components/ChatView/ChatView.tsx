@@ -9,13 +9,14 @@ import { useChat } from '@/hooks/useChat';
 import { FileUpload } from '@/components/FileUpload/FileUpload';
 import { VoiceInput } from '@/components/VoiceInput/VoiceInput';
 import { PromptLibrary } from '@/components/PromptLibrary/PromptLibrary';
+import { API_URL } from '@/constants/api';
 
 interface ChatViewProps {
   sessionId: string | null;
   messages: ChatMessage[];
   setMessages: Dispatch<SetStateAction<ChatMessage[]>>;
-  historyLoading?: boolean;  // #17
-  onClearChat?: () => void;  // #24
+  historyLoading?: boolean;
+  onClearChat?: () => void;
 }
 
 const THINKING_DOTS = [0, 1, 2];
@@ -23,13 +24,25 @@ const THINKING_DOTS = [0, 1, 2];
 export function ChatView({ sessionId, messages, setMessages, historyLoading, onClearChat }: ChatViewProps) {
   const [input, setInput] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
-  const { loading, send } = useChat(sessionId);
+  const { loading, send, streamingContent } = useChat(sessionId);
+
+  const handleExport = useCallback(async (format: 'json' | 'md') => {
+    if (!sessionId) return;
+    const resp = await fetch(`${API_URL}/history/${sessionId}/export?format=${format}`);
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${sessionId}.${format}`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [sessionId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const handleSend = async () => {
+  const handleSend = useCallback(async () => {
     const text = input.trim();
     if (!text || loading) return;
 
@@ -38,7 +51,7 @@ export function ChatView({ sessionId, messages, setMessages, historyLoading, onC
 
     const response = await send(text);
     setMessages((prev) => [...prev, response]);
-  };
+  }, [input, loading, send, setMessages]);
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -64,30 +77,41 @@ export function ChatView({ sessionId, messages, setMessages, historyLoading, onC
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-      {/* #24 — chat header with clear button */}
+      {/* Chat header with clear + export buttons */}
       {(messages.length > 0 || onClearChat) && (
         <div
           style={{
             display: 'flex',
             justifyContent: 'flex-end',
+            gap: 6,
             padding: '6px 16px',
             borderBottom: '1px solid #1a1a2e',
             flexShrink: 0,
           }}
         >
+          {messages.length > 0 && (
+            <>
+              <button
+                onClick={() => handleExport('md')}
+                title="Export as Markdown"
+                style={{ background: 'none', border: '1px solid #334155', borderRadius: 6, color: '#475569', cursor: 'pointer', fontSize: 11, padding: '3px 10px' }}
+              >
+                Export .md
+              </button>
+              <button
+                onClick={() => handleExport('json')}
+                title="Export as JSON"
+                style={{ background: 'none', border: '1px solid #334155', borderRadius: 6, color: '#475569', cursor: 'pointer', fontSize: 11, padding: '3px 10px' }}
+              >
+                Export .json
+              </button>
+            </>
+          )}
           {messages.length > 0 && onClearChat && (
             <button
               onClick={onClearChat}
               title="Clear chat history"
-              style={{
-                background: 'none',
-                border: '1px solid #334155',
-                borderRadius: 6,
-                color: '#475569',
-                cursor: 'pointer',
-                fontSize: 11,
-                padding: '3px 10px',
-              }}
+              style={{ background: 'none', border: '1px solid #334155', borderRadius: 6, color: '#475569', cursor: 'pointer', fontSize: 11, padding: '3px 10px' }}
             >
               Clear chat
             </button>
@@ -128,12 +152,6 @@ export function ChatView({ sessionId, messages, setMessages, historyLoading, onC
                 />
               </div>
             ))}
-            <style>{`
-              @keyframes shimmer {
-                0% { background-position: 200% 0; }
-                100% { background-position: -200% 0; }
-              }
-            `}</style>
           </div>
         )}
 
@@ -145,10 +163,29 @@ export function ChatView({ sessionId, messages, setMessages, historyLoading, onC
         )}
 
         {!historyLoading && messages.map((msg, i) => (
-          <MessageBubble key={i} message={msg} />
+          <MessageBubble
+            key={`${msg.role}-${i}-${msg.content.slice(0, 20)}`}
+            message={msg}
+            messageIdx={i}
+            sessionId={sessionId}
+            onRetry={msg.role === 'assistant' ? async () => {
+              // Find the preceding user message and resend it
+              const userMsg = messages.slice(0, i).reverse().find(m => m.role === 'user');
+              if (!userMsg || loading) return;
+              const response = await send(userMsg.content);
+              setMessages((prev) => [...prev, response]);
+            } : undefined}
+          />
         ))}
 
-        {loading && <ThinkingIndicator />}
+        {loading && !streamingContent && <ThinkingIndicator />}
+        {loading && streamingContent && (
+          <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
+            <div style={{ maxWidth: '75%', background: '#1e1e2e', borderRadius: 14, borderBottomLeftRadius: 4, padding: '10px 14px', fontSize: 13, color: '#e2e8f0', lineHeight: 1.6 }}>
+              <div style={{ fontFamily: 'inherit', whiteSpace: 'pre-wrap' }}>{streamingContent}<span style={{ display: 'inline-block', width: 8, height: 14, background: '#475569', borderRadius: 2, marginLeft: 2, animation: 'dotBounce 1s ease-in-out infinite', verticalAlign: 'middle' }} /></div>
+            </div>
+          </div>
+        )}
         <div ref={bottomRef} />
       </div>
 
@@ -241,13 +278,34 @@ const mdComponents: Components = {
   h3({ children }) { return <h3 style={{ fontSize: 14, margin: '8px 0 4px', color: '#e2e8f0' }}>{children}</h3>; },
 };
 
-function MessageBubble({ message: msg }: { message: ChatMessage }) {
+interface MessageBubbleProps {
+  message: ChatMessage;
+  messageIdx: number;
+  sessionId: string | null;
+  onRetry?: () => void;
+}
+
+function MessageBubble({ message: msg, messageIdx, sessionId, onRetry }: MessageBubbleProps) {
   const agentCfg = (name?: string) => (name ? (AGENT_CFG[name] ?? DEFAULT_AGENT_CFG) : DEFAULT_AGENT_CFG);
   const isUser = msg.role === 'user';
   const isError = msg.role === 'error';
+  const [rating, setRating] = useState<1 | -1 | null>(null);
 
   const bubbleBg = isUser ? '#1d4ed8' : isError ? '#450a0a' : '#1e1e2e';
   const bubbleColor = isError ? '#fca5a5' : '#e2e8f0';
+
+  const handleFeedback = useCallback(async (r: 1 | -1) => {
+    if (!sessionId) return;
+    const next = rating === r ? null : r;
+    setRating(next);
+    if (next !== null) {
+      await fetch(`${API_URL}/feedback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId, message_idx: messageIdx, rating: next }),
+      }).catch(() => {});
+    }
+  }, [sessionId, messageIdx, rating]);
 
   return (
     <div style={{ display: 'flex', justifyContent: isUser ? 'flex-end' : 'flex-start' }}>
@@ -284,7 +342,6 @@ function MessageBubble({ message: msg }: { message: ChatMessage }) {
             borderBottomLeftRadius: isUser ? 14 : 4,
           }}
         >
-          {/* #21 — markdown rendering for assistant messages */}
           {isUser || isError ? (
             <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'inherit' }}>
               {msg.content}
@@ -297,10 +354,51 @@ function MessageBubble({ message: msg }: { message: ChatMessage }) {
             </div>
           )}
         </div>
+        {/* Feedback + Retry + TTS controls for assistant messages */}
+        {msg.role === 'assistant' && (
+          <div style={{ display: 'flex', gap: 6, marginTop: 4, alignItems: 'center' }}>
+            <button onClick={() => handleFeedback(1)} title="Helpful" style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 14, opacity: rating === 1 ? 1 : 0.35, padding: '2px 4px', transition: 'opacity 0.15s' }}>👍</button>
+            <button onClick={() => handleFeedback(-1)} title="Not helpful" style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 14, opacity: rating === -1 ? 1 : 0.35, padding: '2px 4px', transition: 'opacity 0.15s' }}>👎</button>
+            <TtsButton text={msg.content} />
+            {onRetry && (
+              <button onClick={onRetry} title="Retry" style={{ background: 'none', border: '1px solid #334155', borderRadius: 4, color: '#64748b', cursor: 'pointer', fontSize: 10, padding: '2px 6px', marginLeft: 4 }}>↺ retry</button>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
 }
+
+// ─── TTS Button ───────────────────────────────────────────────────────────────
+function TtsButton({ text }: { text: string }) {
+  const [speaking, setSpeaking] = useState(false);
+
+  const toggle = useCallback(() => {
+    if (!window.speechSynthesis) return;
+    if (speaking) {
+      window.speechSynthesis.cancel();
+      setSpeaking(false);
+      return;
+    }
+    // Strip markdown/XML for cleaner speech
+    const clean = text.replace(/[#*`_\[\]<>]/g, '').slice(0, 3000);
+    const utt = new SpeechSynthesisUtterance(clean);
+    utt.onend = () => setSpeaking(false);
+    utt.onerror = () => setSpeaking(false);
+    window.speechSynthesis.speak(utt);
+    setSpeaking(true);
+  }, [text, speaking]);
+
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return null;
+
+  return (
+    <button onClick={toggle} title={speaking ? 'Stop reading' : 'Read aloud'} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 13, opacity: 0.5, padding: '2px 4px', transition: 'opacity 0.15s' }}>
+      {speaking ? '⏹' : '🔊'}
+    </button>
+  );
+}
+
 
 function ThinkingIndicator() {
   return (
@@ -409,6 +507,7 @@ function ChatInput({
           <button
             onClick={onSend}
             disabled={isDisabled}
+            aria-label="Send message"
             style={{
               background: isDisabled ? '#1e293b' : '#2563eb',
               color: '#e2e8f0',

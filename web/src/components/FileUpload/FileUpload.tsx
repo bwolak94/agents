@@ -21,9 +21,17 @@ export function FileUpload({ sessionId, onUploaded }: FileUploadProps) {
     if (!uploading) inputRef.current?.click();
   };
 
+  const MAX_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB — matches server limit
+
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+
+    if (file.size > MAX_SIZE_BYTES) {
+      showToast('File too large. Maximum size is 10 MB.');
+      if (inputRef.current) inputRef.current.value = '';
+      return;
+    }
 
     setUploading(true);
     try {
@@ -57,12 +65,14 @@ export function FileUpload({ sessionId, onUploaded }: FileUploadProps) {
       <input
         ref={inputRef}
         type="file"
+        accept=".txt,.md,.py,.js,.ts,.tsx,.jsx,.json,.csv,.yaml,.yml,.pdf,.html,.css"
         style={{ display: 'none' }}
         onChange={handleFileChange}
       />
       <button
         onClick={handleClick}
         title="Attach file"
+        aria-label="Attach file"
         disabled={uploading}
         style={{
           background: 'none',

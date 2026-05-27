@@ -10,6 +10,10 @@ export function VoiceInput({ onTranscript, disabled = false }: VoiceInputProps) 
   const [listening, setListening] = useState(false);
   const [supported, setSupported] = useState(true);
   const recognitionRef = useRef<SpeechRecognition | null>(null);
+  // Keep a ref to onTranscript so the effect doesn't re-create the recognition
+  // object every time the prop reference changes (#16)
+  const onTranscriptRef = useRef(onTranscript);
+  useEffect(() => { onTranscriptRef.current = onTranscript; }, [onTranscript]);
 
   useEffect(() => {
     const SR = window.SpeechRecognition ?? window.webkitSpeechRecognition;
@@ -28,7 +32,7 @@ export function VoiceInput({ onTranscript, disabled = false }: VoiceInputProps) 
         .map((r: SpeechRecognitionResult) => r[0].transcript)
         .join(' ')
         .trim();
-      if (transcript) onTranscript(transcript);
+      if (transcript) onTranscriptRef.current(transcript);
     };
 
     recognition.onend = () => {
@@ -40,7 +44,8 @@ export function VoiceInput({ onTranscript, disabled = false }: VoiceInputProps) 
     };
 
     recognitionRef.current = recognition;
-  }, [onTranscript]);
+  // Empty dep array: create the recognition object once only (#16)
+  }, []);
 
   const handleClick = () => {
     if (!supported || disabled) return;
@@ -69,6 +74,7 @@ export function VoiceInput({ onTranscript, disabled = false }: VoiceInputProps) 
         <button
           onClick={handleClick}
           disabled={disabled || !supported}
+          aria-label={!supported ? 'Voice input not supported' : listening ? 'Stop listening' : 'Start voice input'}
           title={!supported ? 'Voice input not supported' : listening ? 'Stop listening' : 'Start voice input'}
           style={{
             background: 'none',
@@ -112,10 +118,7 @@ export function VoiceInput({ onTranscript, disabled = false }: VoiceInputProps) 
               whiteSpace: 'nowrap',
               zIndex: 100,
               pointerEvents: 'none',
-              opacity: 0,
-              transition: 'opacity 0.2s',
             }}
-            className="voice-tooltip"
           >
             Voice input not supported
           </div>

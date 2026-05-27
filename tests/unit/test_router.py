@@ -6,6 +6,20 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from core.router import RouterAgent, RouterDecision
+import core.router as _router_module
+
+
+@pytest.fixture(autouse=True)
+def clear_router_cache():
+    """Clear the LRU routing cache before every test to prevent order-dependent
+    results (#29 — tests must be fully isolated from each other)."""
+    _router_module._ROUTE_CACHE.clear()
+    _router_module._ROUTE_CACHE_ORDER.clear()
+    _router_module._ROUTE_CACHE_LOCK = None
+    yield
+    _router_module._ROUTE_CACHE.clear()
+    _router_module._ROUTE_CACHE_ORDER.clear()
+    _router_module._ROUTE_CACHE_LOCK = None
 
 
 # ---------------------------------------------------------------------------

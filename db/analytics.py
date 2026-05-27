@@ -25,6 +25,7 @@ async def record_request(
     """Append one request record to the analytics collection."""
     if _db is None:
         return
+    now = datetime.now(timezone.utc)
     await _db["analytics"].insert_one({
         "session_id": session_id,
         "agent": agent,
@@ -34,8 +35,9 @@ async def record_request(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost_usd": cost_usd,
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        # Store as datetime so the TTL index can expire old records (#20)
+        "ts": now,
+        "date": now.strftime("%Y-%m-%d"),
     })
 
 

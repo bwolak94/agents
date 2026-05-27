@@ -2,10 +2,6 @@
 import { useAnalytics } from '@/hooks/useAnalytics';
 import type { AgentStat, ModelStat, DailyStat } from '@/types/analytics';
 
-interface AnalyticsDashboardProps {
-  sessionId: string | null;
-}
-
 const BAR_COLORS = ['#60a5fa', '#f97316', '#22c55e', '#a855f7', '#eab308', '#ec4899'];
 
 function CssBar({
@@ -43,10 +39,8 @@ function CssBar({
   );
 }
 
-export function AnalyticsDashboard({ sessionId: _sessionId }: AnalyticsDashboardProps) {
-  const { data, loading, refetch } = useAnalytics();
-
-  const sectionHeader = (label: string) => (
+function SectionHeader({ label }: { label: string }) {
+  return (
     <div
       style={{
         fontSize: 10,
@@ -60,6 +54,10 @@ export function AnalyticsDashboard({ sessionId: _sessionId }: AnalyticsDashboard
       {label}
     </div>
   );
+}
+
+export function AnalyticsDashboard() {
+  const { data, loading, refetch } = useAnalytics();
 
   if (loading) {
     return (
@@ -140,20 +138,38 @@ export function AnalyticsDashboard({ sessionId: _sessionId }: AnalyticsDashboard
         <h2 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: '#e2e8f0' }}>
           Analytics
         </h2>
-        <button
-          onClick={refetch}
-          style={{
-            background: '#1a1a2e',
-            color: '#94a3b8',
-            border: '1px solid #334155',
-            borderRadius: 8,
-            padding: '4px 12px',
-            cursor: 'pointer',
-            fontSize: 11,
-          }}
-        >
-          ↻ Refresh
-        </button>
+        <div style={{ display: 'flex', gap: 6 }}>
+          <button
+            onClick={async () => {
+              const resp = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/analytics/export?format=csv`);
+              const blob = await resp.blob();
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a'); a.href = url; a.download = 'analytics.csv'; a.click();
+              URL.revokeObjectURL(url);
+            }}
+            style={{ background: '#1a1a2e', color: '#94a3b8', border: '1px solid #334155', borderRadius: 8, padding: '4px 12px', cursor: 'pointer', fontSize: 11 }}
+          >
+            ↓ CSV
+          </button>
+          <button
+            onClick={async () => {
+              const resp = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/analytics/export?format=json`);
+              const blob = await resp.blob();
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a'); a.href = url; a.download = 'analytics.json'; a.click();
+              URL.revokeObjectURL(url);
+            }}
+            style={{ background: '#1a1a2e', color: '#94a3b8', border: '1px solid #334155', borderRadius: 8, padding: '4px 12px', cursor: 'pointer', fontSize: 11 }}
+          >
+            ↓ JSON
+          </button>
+          <button
+            onClick={refetch}
+            style={{ background: '#1a1a2e', color: '#94a3b8', border: '1px solid #334155', borderRadius: 8, padding: '4px 12px', cursor: 'pointer', fontSize: 11 }}
+          >
+            ↻ Refresh
+          </button>
+        </div>
       </div>
 
       {/* Totals row */}
@@ -216,7 +232,7 @@ export function AnalyticsDashboard({ sessionId: _sessionId }: AnalyticsDashboard
             padding: 16,
           }}
         >
-          {sectionHeader('By Agent')}
+          <SectionHeader label="By Agent" />
           {by_agent.length === 0 && (
             <div style={{ fontSize: 12, color: '#475569' }}>No data</div>
           )}
@@ -252,7 +268,7 @@ export function AnalyticsDashboard({ sessionId: _sessionId }: AnalyticsDashboard
             padding: 16,
           }}
         >
-          {sectionHeader('By Model')}
+          <SectionHeader label="By Model" />
           {by_model.length === 0 && (
             <div style={{ fontSize: 12, color: '#475569' }}>No data</div>
           )}
@@ -287,7 +303,7 @@ export function AnalyticsDashboard({ sessionId: _sessionId }: AnalyticsDashboard
           padding: 16,
         }}
       >
-        {sectionHeader('Daily Activity')}
+        <SectionHeader label="Daily Activity" />
         {daily.length === 0 && (
           <div style={{ fontSize: 12, color: '#475569' }}>No data</div>
         )}
