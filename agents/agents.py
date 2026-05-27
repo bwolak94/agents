@@ -5,11 +5,16 @@ All agents share a ReAct loop: LLM decides which tool to call, sees result, repe
 import json
 import re
 import asyncio
+import logging
 from abc import ABC, abstractmethod
 
 from core.events import event_bus
 
+logger = logging.getLogger(__name__)
+
 MAX_REACT_ITERATIONS = 6
+# #14 — maximum seconds per LLM call inside the ReAct loop
+REACT_ITERATION_TIMEOUT = 60
 TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 
 TOOL_DESCRIPTIONS = {
@@ -96,13 +101,24 @@ class BaseAgent(ABC):
         messages = list(conversation_history) + [{"role": "user", "content": message}]
 
         for iteration in range(MAX_REACT_ITERATIONS):
-            response = await self.llm.call(
-                model=model,
-                messages=messages,
-                system_prompt=system,
-                stream=False,  # streaming handled at API level
-                max_tokens=max_tokens,
-            )
+            # #14 — per-iteration timeout so a hung LLM call doesn't block forever
+            try:
+                response = await asyncio.wait_for(
+                    self.llm.call(
+                        model=model,
+                        messages=messages,
+                        system_prompt=system,
+                        stream=False,  # streaming handled at API/CLI level
+                        max_tokens=max_tokens,
+                    ),
+                    timeout=REACT_ITERATION_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Agent %s iteration %d timed out after %ds",
+                    agent_id, iteration, REACT_ITERATION_TIMEOUT,
+                )
+                return "I'm sorry, the response timed out. Please try again."
 
             tool_call = _parse_tool_call(response)
             if tool_call is None:
@@ -140,13 +156,20 @@ class BaseAgent(ABC):
             "role": "user",
             "content": "Please provide your final answer now based on everything above.",
         })
-        return await self.llm.call(
-            model=model,
-            messages=messages,
-            system_prompt=system,
-            stream=False,
-            max_tokens=max_tokens,
-        )
+        try:
+            return await asyncio.wait_for(
+                self.llm.call(
+                    model=model,
+                    messages=messages,
+                    system_prompt=system,
+                    stream=False,
+                    max_tokens=max_tokens,
+                ),
+                timeout=REACT_ITERATION_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Agent %s final synthesis timed out", agent_id)
+            return "I'm sorry, the response timed out. Please try again."
 
 
 # ─────────────────────────────────────────
@@ -209,7 +232,7 @@ source evaluation, and fact-checking.
 1. PRIORITISE <tool_result>: When search results are provided, use them as your primary evidence.
 2. Always state the DATE of information when known.
 3. Cite sources inline using [Source: URL or title] notation.
-4. Label each claim: ✅ VERIFIED / ⚠️ CONTESTED / 📰 REPORTED / 💭 OPINION.
+4. Label each claim: VERIFIED / CONTESTED / REPORTED / OPINION.
 5. When results are insufficient, say what is missing and why.
 6. Do not fill gaps with hallucinated details.
 </instructions>

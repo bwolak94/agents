@@ -19,9 +19,13 @@ interface UseWebSocketResult {
 
 const AGENT_FADE_DELAY_MS = 2000;
 const AGENT_REMOVE_DELAY_MS = 600;
-const WS_RETRY_DELAY_MS = 3000;
 const STATS_FLASH_DURATION_MS = 400;
 const MAX_EVENTS = 100;
+
+// #26 — exponential backoff parameters for reconnection
+const WS_RETRY_BASE_MS = 1000;
+const WS_RETRY_MAX_MS = 30_000;
+const WS_RETRY_MULTIPLIER = 2;
 
 const INITIAL_STATS: Stats = {
   active: 0,
@@ -38,6 +42,8 @@ export function useWebSocket(sessionId: string | null): UseWebSocketResult {
   const [costs, setCosts] = useState<Costs | null>(null);
   const [stats, setStats] = useState<Stats>(INITIAL_STATS);
   const eventIdRef = useRef(0);
+  // #26 — track current backoff delay across reconnect attempts
+  const retryDelayRef = useRef(WS_RETRY_BASE_MS);
 
   const addEvent = useCallback((ev: Omit<AppEvent, 'id' | 'time'>) => {
     const time = new Date().toTimeString().slice(0, 8);
@@ -47,7 +53,6 @@ export function useWebSocket(sessionId: string | null): UseWebSocketResult {
     ]);
   }, []);
 
-  // #14 — debounced cost fetch: with parallel agents, agent_done fires multiple times
   const fetchCostsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetchCosts = useCallback(() => {
     if (!sessionId) return;
@@ -174,18 +179,32 @@ export function useWebSocket(sessionId: string | null): UseWebSocketResult {
   useEffect(() => {
     let ws: WebSocket;
     let retryTimer: ReturnType<typeof setTimeout>;
+    let cancelled = false;
 
     const connect = () => {
+      if (cancelled) return;
       setWsStatus('connecting');
       const wsUrl = sessionId ? `${WS_URL}?session_id=${sessionId}` : WS_URL;
       ws = new WebSocket(wsUrl);
 
-      ws.onopen = () => setWsStatus('connected');
-      ws.onclose = () => {
-        setWsStatus('offline');
-        retryTimer = setTimeout(connect, WS_RETRY_DELAY_MS);
+      ws.onopen = () => {
+        if (cancelled) { ws.close(); return; }
+        setWsStatus('connected');
+        // #26 — reset backoff on successful connection
+        retryDelayRef.current = WS_RETRY_BASE_MS;
       };
+
+      ws.onclose = () => {
+        if (cancelled) return;
+        setWsStatus('offline');
+        // #26 — exponential backoff: double the delay up to the max
+        const delay = retryDelayRef.current;
+        retryDelayRef.current = Math.min(delay * WS_RETRY_MULTIPLIER, WS_RETRY_MAX_MS);
+        retryTimer = setTimeout(connect, delay);
+      };
+
       ws.onerror = () => ws.close();
+
       ws.onmessage = (e: MessageEvent<string>) => {
         handleMessage(JSON.parse(e.data) as WsEvent);
       };
@@ -193,6 +212,7 @@ export function useWebSocket(sessionId: string | null): UseWebSocketResult {
 
     connect();
     return () => {
+      cancelled = true;
       clearTimeout(retryTimer);
       ws?.close();
     };

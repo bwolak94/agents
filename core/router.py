@@ -4,7 +4,11 @@ Now context-aware (uses recent history) and returns a fallback model chain.
 """
 import json
 import re
+import hashlib
+import logging
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 ROUTER_SYSTEM_PROMPT = """You are the routing agent of a multi-LLM system. Analyse the request and return ONLY valid JSON.
 
@@ -81,6 +85,32 @@ _FILE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# #16 — simple LRU-style routing cache (maxsize=128 entries)
+_ROUTE_CACHE: dict[str, "RouterDecision"] = {}
+_ROUTE_CACHE_ORDER: list[str] = []
+_ROUTE_CACHE_MAX = 128
+
+
+def _cache_put(key: str, decision: "RouterDecision") -> None:
+    if key in _ROUTE_CACHE:
+        _ROUTE_CACHE_ORDER.remove(key)
+    elif len(_ROUTE_CACHE) >= _ROUTE_CACHE_MAX:
+        oldest = _ROUTE_CACHE_ORDER.pop(0)
+        del _ROUTE_CACHE[oldest]
+    _ROUTE_CACHE[key] = decision
+    _ROUTE_CACHE_ORDER.append(key)
+
+
+def _routing_cache_key(message: str, context: list | None) -> str:
+    ctx_digest = ""
+    if context:
+        ctx_digest = "".join(
+            f"{m.get('role','')}:{str(m.get('content',''))[:50]}"
+            for m in context[-4:]
+        )
+    raw = f"{message}|{ctx_digest}"
+    return hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()
+
 
 @dataclass
 class RouterDecision:
@@ -99,8 +129,11 @@ class RouterAgent:
     def __init__(self, llm_manager):
         self.llm = llm_manager
 
-    def _heuristic_route(self, message: str) -> RouterDecision:
-        """Keyword-based fallback routing when LLM returns invalid JSON."""
+    def _heuristic_route(self, message: str, context: list | None = None) -> RouterDecision:
+        """Keyword-based fallback routing when LLM returns invalid JSON.
+        #17 — accepts context for consistency with the LLM path (unused here but
+        keeps the signature symmetric so callers don't need to branch).
+        """
         if _SEARCH_RE.search(message):
             return RouterDecision(
                 model="claude", fallback_models=["gemini", "ollama/llama3"],
@@ -137,7 +170,7 @@ class RouterAgent:
         )
 
     def _build_router_prompt(self, user_message: str, context: list | None) -> str:
-        """Build the routing prompt, including last 4 turns of context (#29)."""
+        """Build the routing prompt, including last 4 turns of context."""
         parts = []
         if context:
             recent = context[-8:]  # last 4 turns (user+assistant pairs)
@@ -153,6 +186,12 @@ class RouterAgent:
 
     async def route(self, user_message: str, context: list | None = None) -> RouterDecision:
         """Analyse the message and return a routing decision."""
+        # #16 — check cache before calling LLM
+        cache_key = _routing_cache_key(user_message, context)
+        if cache_key in _ROUTE_CACHE:
+            logger.debug("Router cache hit for key %s", cache_key[:8])
+            return _ROUTE_CACHE[cache_key]
+
         prompt = self._build_router_prompt(user_message, context)
         messages = [{"role": "user", "content": prompt}]
 
@@ -165,7 +204,8 @@ class RouterAgent:
                 temperature=0.1,
             )
         except Exception:
-            return self._heuristic_route(user_message)
+            # #17 — pass context to heuristic fallback
+            return self._heuristic_route(user_message, context)
 
         try:
             text = response.strip()
@@ -178,7 +218,7 @@ class RouterAgent:
             model = data.get("model", "claude")
             fallbacks = data.get("fallback_models") or MODEL_FALLBACKS.get(model, [])
 
-            return RouterDecision(
+            decision = RouterDecision(
                 model=model,
                 fallback_models=fallbacks,
                 agent=data.get("agent", "general_agent"),
@@ -189,5 +229,8 @@ class RouterAgent:
                 needs_internet=data.get("needs_internet", False),
                 parallel_tasks=data.get("parallel_tasks"),
             )
+            # #16 — store in cache
+            _cache_put(cache_key, decision)
+            return decision
         except (json.JSONDecodeError, KeyError):
-            return self._heuristic_route(user_message)
+            return self._heuristic_route(user_message, context)

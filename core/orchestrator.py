@@ -1,5 +1,5 @@
 """
-Orchestrator — Router → Agent → LLM → Tools pipeline.
+Orchestrator — Router -> Agent -> LLM -> Tools pipeline.
 Supports: parallel agents, model fallback chain, history summarization, agent collaboration.
 """
 import asyncio
@@ -12,7 +12,7 @@ from rich.panel import Panel
 
 from llm.manager import LLMManager
 from core.router import RouterAgent, RouterDecision
-from agents.agents import get_agent
+from agents.agents import get_agent, BaseAgent
 from tools.tools import ToolsManager
 from core.events import event_bus
 from db.history import append_message
@@ -40,6 +40,9 @@ class AgentOrchestrator:
         self.last_decision: Optional[RouterDecision] = None
         self._current_session_id: str = "default"
 
+        # #15 — reuse stateless agent instances within this orchestrator
+        self._agent_cache: dict[str, BaseAgent] = {}
+
         # Register agent_call tool with self as parent
         from tools.tools import AgentCallTool
         self.tools.register("agent_call", AgentCallTool(self))
@@ -62,7 +65,6 @@ class AgentOrchestrator:
 
         # STEP 1: Route (with conversation context)
         if decision is None:
-            # #11 — fire-and-forget: don't block the response pipeline on event delivery
             asyncio.create_task(event_bus.emit({
                 "type": "routing",
                 "agent_id": agent_id,
@@ -166,7 +168,12 @@ class AgentOrchestrator:
             "session_id": session_id,
         }))
 
-        agent = get_agent(agent_name, self.llm, self.tools)
+        # #15 — reuse cached agent instances (agents are stateless)
+        agent = self._agent_cache.get(agent_name)
+        if agent is None:
+            agent = get_agent(agent_name, self.llm, self.tools)
+            self._agent_cache[agent_name] = agent
+
         response = await agent.run(
             message=message,
             model=model,
@@ -189,7 +196,6 @@ class AgentOrchestrator:
         parent_agent_id: str,
         t_start: float,
     ) -> str:
-        # #28 — warn if subtasks are truncated
         if len(subtasks) > MAX_PARALLEL_SUBTASKS:
             logger.warning(
                 "Router requested %d parallel subtasks; truncating to %d",
@@ -301,8 +307,9 @@ class AgentOrchestrator:
                 tools=self.last_decision.tools if self.last_decision else [],
                 cost_usd=cost_stats.get("total_cost_usd", 0) if cost_stats else 0,
             )
-        except Exception:
-            pass  # MongoDB unavailable — don't interrupt execution
+        except Exception as exc:
+            # #12 — log MongoDB failures instead of silently swallowing them
+            logger.warning("Failed to persist message to MongoDB: %s", exc)
 
     async def _summarize_history(self) -> None:
         """Replace oldest messages with a compact summary, preserving recent context."""
@@ -328,8 +335,9 @@ class AgentOrchestrator:
                 {"role": "user", "content": f"<conversation_summary>\n{summary}\n</conversation_summary>"},
                 {"role": "assistant", "content": "Understood. I'll keep this context in mind."},
             ] + recent
-        except Exception:
-            # Summarization failed — just truncate
+        except Exception as exc:
+            # #13 — log summarization failures, then fall back to window truncation
+            logger.warning("History summarization failed, truncating instead: %s", exc)
             self.conversation_history = self.conversation_history[-HISTORY_WINDOW:]
 
     # ─────────────────────────────────────────
@@ -337,7 +345,7 @@ class AgentOrchestrator:
     # ─────────────────────────────────────────
     def clear_history(self) -> None:
         self.conversation_history = []
-        console.print("[green]✓ History cleared[/green]")
+        console.print("[green]History cleared[/green]")
 
     def get_stats(self) -> dict:
         stats = {
@@ -352,7 +360,7 @@ class AgentOrchestrator:
 
     def _display_routing_info(self, decision: RouterDecision) -> None:
         tools_str = ", ".join(decision.tools) if decision.tools else "none"
-        fallback_str = " → ".join(decision.fallback_models) if decision.fallback_models else "none"
+        fallback_str = " -> ".join(decision.fallback_models) if decision.fallback_models else "none"
         info = (
             f"[magenta]Model:[/magenta] {decision.model}  "
             f"[dim]fallback:[/dim] {fallback_str}\n"
@@ -361,4 +369,4 @@ class AgentOrchestrator:
             f"[green]Complexity:[/green] {decision.complexity}\n"
             f"[dim]Reasoning: {decision.reasoning}[/dim]"
         )
-        console.print(Panel(info, title="[bold]🧭 Routing Decision[/bold]", border_style="dim"))
+        console.print(Panel(info, title="[bold]Routing Decision[/bold]", border_style="dim"))

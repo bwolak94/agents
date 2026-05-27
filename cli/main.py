@@ -131,10 +131,9 @@ async def main():
                 show_routing=show_routing,
             )
 
-            # If stream=True, response was already printed during streaming
-            # If stream=False, print now
-            if not config.get("stream", True):
-                console.print(f"\n[bold]Response:[/bold]\n{response}")
+            # stream=False is currently hardcoded in the agent ReAct loop;
+            # always print the collected response.
+            console.print(f"\n[bold]Response:[/bold]\n{response}")
 
         except KeyboardInterrupt:
             console.print("\n[cyan]Ctrl+C — type /exit to quit[/cyan]")

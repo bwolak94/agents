@@ -2,8 +2,11 @@
 Chat history stored in MongoDB.
 Stores full messages (with metadata) per session_id.
 """
+import logging
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
+
+logger = logging.getLogger(__name__)
 
 _client = None
 _db = None
@@ -13,11 +16,17 @@ _SYSTEM_SESSIONS = {"default"}
 
 
 async def init_db(mongo_url: str):
+    """Initialize the MongoDB connection. Safe to call multiple times — only initializes once.
+    #23 — guard against duplicate initialization that would leak the old connection.
+    """
     global _client, _db
+    if _db is not None:
+        return _db
+
     _client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
     _db = _client["agent_system"]
 
-    # #9 — verify MongoDB is actually reachable at startup
+    # Verify MongoDB is actually reachable at startup
     await _client.admin.command("ping")
 
     await _db["conversations"].create_index("session_id", unique=True)
@@ -58,7 +67,7 @@ async def append_message(session_id: str, role: str, content: str, **meta):
         "$setOnInsert": {"created_at": now},
     }
 
-    # #13 — store preview (first user message, XML tags stripped) for the sidebar
+    # Store preview (first user message, XML tags stripped) for the sidebar
     if role == "user":
         existing = await _db["conversations"].find_one(
             {"session_id": session_id}, {"_id": 0, "preview": 1}
@@ -86,18 +95,18 @@ async def clear_history(session_id: str):
     await _db["conversations"].delete_one({"session_id": session_id})
 
 
-async def list_sessions() -> list:
-    """Return recent sessions for the chat history sidebar, excluding system sessions."""
+async def list_sessions(limit: int = 50, skip: int = 0) -> list:
+    """Return recent sessions for the chat history sidebar, excluding system sessions.
+    #24 — supports cursor-based pagination via limit/skip.
+    """
     cursor = _db["conversations"].find(
-        # #8 — exclude system sessions (prompt library, etc.)
         {"session_id": {"$nin": list(_SYSTEM_SESSIONS)}},
         {"_id": 0, "session_id": 1, "updated_at": 1, "created_at": 1, "preview": 1, "messages": {"$slice": 1}}
-    ).sort("updated_at", -1).limit(100)
-    docs = await cursor.to_list(length=100)
+    ).sort("updated_at", -1).skip(skip).limit(limit)
+    docs = await cursor.to_list(length=limit)
 
     result = []
     for doc in docs:
-        # Use stored preview field if available (#13), else fall back to first message
         preview = doc.get("preview", "")
         if not preview:
             messages = doc.get("messages", [])

@@ -4,6 +4,7 @@ Unit tests for core/orchestrator.py (AgentOrchestrator).
 All external dependencies (LLM, router, tools, DB) are mocked so the tests
 run entirely in-process with no real I/O.
 """
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
@@ -65,6 +66,12 @@ def _make_orchestrator(config=None):
         return orch, mock_llm, mock_tools, mock_router
 
 
+async def _flush_tasks():
+    """#30 — yield control so fire-and-forget asyncio tasks can execute."""
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+
 # ─────────────────────────────────────────
 # Initialization
 # ─────────────────────────────────────────
@@ -108,6 +115,7 @@ class TestProcess:
             mock_get_agent.return_value = mock_agent
 
             await orch.process("hello world", stream=False, show_routing=False)
+            await _flush_tasks()  # #30 — flush fire-and-forget tasks
 
         mock_router.route.assert_awaited_once()
 
@@ -123,6 +131,7 @@ class TestProcess:
             mock_get_agent.return_value = mock_agent
 
             result = await orch.process("do something", stream=False, show_routing=False)
+            await _flush_tasks()
 
         mock_agent.run.assert_awaited_once()
         assert result == "the final answer"
@@ -144,6 +153,8 @@ class TestProcess:
             mock_get_agent.return_value = mock_agent
 
             await orch.process("test task", stream=False, show_routing=False)
+            # #30 — flush pending tasks so all fire-and-forget emits have run
+            await _flush_tasks()
 
         assert "routing" in emitted_types
         assert "agent_start" in emitted_types
@@ -168,6 +179,7 @@ class TestProcess:
             mock_get_agent.return_value = mock_agent
 
             await orch.process("test", stream=False, show_routing=False)
+            await _flush_tasks()  # #30
 
         assert "agent_done" in emitted_types
 
@@ -183,6 +195,7 @@ class TestProcess:
             mock_get_agent.return_value = mock_agent
 
             await orch.process("user input text", stream=False, show_routing=False)
+            await _flush_tasks()
 
         user_msgs = [m for m in orch.conversation_history if m["role"] == "user"]
         assert any("user input text" in m["content"] for m in user_msgs)
@@ -199,6 +212,7 @@ class TestProcess:
             mock_get_agent.return_value = mock_agent
 
             await orch.process("hi", stream=False, show_routing=False)
+            await _flush_tasks()
 
         assistant_msgs = [m for m in orch.conversation_history if m["role"] == "assistant"]
         assert any("assistant reply here" in m["content"] for m in assistant_msgs)
@@ -220,6 +234,7 @@ class TestProcess:
             mock_get_agent.return_value = mock_agent
 
             await orch.process("trigger truncation", stream=False, show_routing=False)
+            await _flush_tasks()
 
         # After adding 2 more items (user + assistant), truncation kicks in
         assert len(orch.conversation_history) <= 20
@@ -239,6 +254,7 @@ class TestProcess:
             mock_get_agent.return_value = mock_agent
 
             await orch.process("write some code", stream=False, show_routing=False)
+            await _flush_tasks()
 
         assert orch.last_decision is expected_decision
 
@@ -256,6 +272,7 @@ class TestProcess:
             mock_get_agent.return_value = mock_agent
 
             await orch.process("read a file", decision=pre_decision, stream=False, show_routing=False)
+            await _flush_tasks()
 
         # Router should NOT have been called when a decision was passed in
         mock_router.route.assert_not_awaited()
@@ -274,6 +291,7 @@ class TestProcess:
             mock_append.side_effect = Exception("MongoDB down")
 
             result = await orch.process("test", stream=False, show_routing=False)
+            await _flush_tasks()
 
         assert result == "ok"
 
@@ -291,6 +309,7 @@ class TestProcess:
             mock_get_agent.return_value = mock_agent
 
             result = await orch.process("give me a long answer", stream=False, show_routing=False)
+            await _flush_tasks()
 
         # Full response is returned to caller
         assert result == long_response

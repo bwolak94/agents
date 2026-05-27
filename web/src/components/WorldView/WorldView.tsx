@@ -7,6 +7,7 @@ import { GAME_CSS } from '@/constants/gameStyles';
 import { StatsBar } from '@/components/StatsBar/StatsBar';
 import { ZoneCell } from '@/components/ZoneCell/ZoneCell';
 import { EventLog } from '@/components/EventLog/EventLog';
+import styles from './WorldView.module.css';
 
 interface WorldViewProps {
   agents: Record<string, Agent>;
@@ -27,43 +28,18 @@ export function WorldView({ agents, stats, costs, events, wsStatus }: WorldViewP
   const { color: statusColor, label: statusLabel } = WS_STATUS_CONFIG[wsStatus];
 
   return (
-    <div
-      style={{
-        flex: 1,
-        display: 'flex',
-        flexDirection: 'column',
-        overflow: 'hidden',
-        background: '#050509',
-        position: 'relative',
-      }}
-    >
+    <div className={styles.root}>
       <div className="crt-overlay" />
       <style>{GAME_CSS}</style>
 
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          padding: '6px 12px',
-          background: '#0a0a1a',
-          borderBottom: '1px solid #1a1a2e',
-        }}
-      >
-        <div style={{ fontFamily: "'Press Start 2P', monospace", fontSize: 10, color: '#7c3aed' }}>
-          AGENT WORLD
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+      <div className={styles.header}>
+        <div className={styles.title}>AGENT WORLD</div>
+        <div className={styles.statusRow}>
           <div
-            style={{
-              width: 7,
-              height: 7,
-              borderRadius: '50%',
-              background: statusColor,
-              boxShadow: `0 0 6px ${statusColor}`,
-            }}
+            className={styles.statusDot}
+            style={{ background: statusColor, boxShadow: `0 0 6px ${statusColor}` }}
           />
-          <span style={{ fontFamily: "'Press Start 2P', monospace", fontSize: 6, color: statusColor }}>
+          <span className={styles.statusLabel} style={{ color: statusColor }}>
             {statusLabel}
           </span>
         </div>
@@ -71,16 +47,8 @@ export function WorldView({ agents, stats, costs, events, wsStatus }: WorldViewP
 
       <StatsBar stats={stats} costs={costs} />
 
-      <div style={{ flex: 1, overflow: 'auto', padding: 10 }}>
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(3, 1fr)',
-            gridTemplateRows: 'auto auto auto',
-            gap: 8,
-            minHeight: '100%',
-          }}
-        >
+      <div className={styles.grid}>
+        <div className={styles.gridInner}>
           {ZONES.map((zone) => (
             <ZoneCell key={zone.id} zone={zone} agents={agentList} />
           ))}

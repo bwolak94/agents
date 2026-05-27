@@ -1,14 +1,15 @@
 """
 Tools for agents:
-- WebSearch  (SearXNG → Brave → DuckDuckGo fallback chain)
-- CodeExecutor (Python subprocess sandbox)
+- WebSearch  (SearXNG -> Brave -> DuckDuckGo fallback chain)
+- CodeExecutor (Python subprocess sandbox with resource limits)
 - FileReader / FileWriter
-- Shell (allowlist-protected)
+- Shell (allowlist-protected, exec not shell)
 - MemoryRead / MemoryWrite (persistent agent memory)
 - AgentCall (delegate to a specialist agent)
 """
 import asyncio
 import json
+import shlex
 import subprocess
 import tempfile
 import os
@@ -111,7 +112,7 @@ class WebSearchTool:
 
 
 # ─────────────────────────────────────────
-# CODE EXECUTOR  (#1 — sandboxed subprocess)
+# CODE EXECUTOR (sandboxed subprocess with resource limits)
 # ─────────────────────────────────────────
 class CodeExecutorTool:
     TIMEOUT = 30
@@ -140,14 +141,33 @@ class CodeExecutorTool:
                 "TMPDIR": exec_dir,
             }
 
+            # #19 — wrap execution with ulimit to cap CPU time and address space
+            # ulimit -t (CPU seconds), ulimit -v (virtual memory KB), ulimit -f (file size KB)
+            ulimit_prefix = []
+            if sys.platform != "win32":
+                ulimit_prefix = [
+                    "bash", "-c",
+                    f"ulimit -t {self.TIMEOUT} -v 524288 -f 102400 2>/dev/null; "
+                    f"exec {shlex.quote(sys.executable)} {shlex.quote(str(tmp_path))}",
+                ]
+
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    sys.executable, str(tmp_path),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=exec_dir,
-                    env=safe_env,
-                )
+                if ulimit_prefix:
+                    proc = await asyncio.create_subprocess_exec(
+                        *ulimit_prefix,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=exec_dir,
+                        env=safe_env,
+                    )
+                else:
+                    proc = await asyncio.create_subprocess_exec(
+                        sys.executable, str(tmp_path),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=exec_dir,
+                        env=safe_env,
+                    )
                 try:
                     stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.TIMEOUT)
                 except asyncio.TimeoutError:
@@ -167,7 +187,7 @@ class CodeExecutorTool:
 
 
 # ─────────────────────────────────────────
-# FILE READER  (#4 — path traversal protection)
+# FILE READER  (path traversal protection)
 # ─────────────────────────────────────────
 class FileReaderTool:
     MAX_SIZE = 100_000  # ~100KB
@@ -211,7 +231,7 @@ class FileReaderTool:
 
 
 # ─────────────────────────────────────────
-# FILE WRITER  (#3 — restricted to workspace)
+# FILE WRITER  (restricted to workspace)
 # ─────────────────────────────────────────
 class FileWriterTool:
     async def run(self, message: str) -> str:
@@ -226,7 +246,7 @@ class FileWriterTool:
             p = (WORKSPACE_DIR / path).resolve()
             # Ensure write stays inside workspace
             if not str(p).startswith(str(WORKSPACE_DIR.resolve())):
-                return f"Access denied: writes are restricted to the workspace directory."
+                return "Access denied: writes are restricted to the workspace directory."
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
             return f"Saved: {p} ({len(content)} characters)"
@@ -235,16 +255,15 @@ class FileWriterTool:
 
 
 # ─────────────────────────────────────────
-# SHELL TOOL  (#2 — allowlist instead of blocklist)
+# SHELL TOOL  (allowlist-protected, exec not shell)
 # ─────────────────────────────────────────
 class ShellTool:
     TIMEOUT = 30
     # Allowlist: only commands starting with these prefixes are permitted
     ALLOWED_PREFIXES = (
         "ls", "cat", "echo", "grep", "find", "pwd", "wc", "head", "tail",
-        "date", "env", "which", "python", "pip", "git status", "git log",
-        "git diff", "git branch", "git show", "curl", "wget", "jq",
-        "sort", "uniq", "cut", "awk", "sed", "tr", "xargs",
+        "date", "env", "which", "python", "pip", "git",
+        "sort", "uniq", "cut", "awk", "sed", "tr", "xargs", "curl", "wget", "jq",
     )
 
     async def run(self, message: str) -> str:
@@ -263,9 +282,19 @@ class ShellTool:
         cmd_lower = command.strip().lower()
         if not any(cmd_lower.startswith(prefix) for prefix in self.ALLOWED_PREFIXES):
             return f"BLOCKED: '{command}' is not in the allowed command list."
+
+        # #18 — use shlex.split + create_subprocess_exec to prevent shell injection
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
+            args = shlex.split(command)
+        except ValueError as e:
+            return f"ShellTool: Invalid command syntax: {e}"
+
+        if not args:
+            return "ShellTool: Empty command."
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(WORKSPACE_DIR),
@@ -279,6 +308,8 @@ class ShellTool:
             return result or f"Command executed (exit code: {proc.returncode})"
         except asyncio.TimeoutError:
             return f"TIMEOUT after {self.TIMEOUT}s"
+        except FileNotFoundError:
+            return f"Command not found: {args[0]}"
         except Exception as e:
             return f"Error: {e}"
 

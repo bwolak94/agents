@@ -1,0 +1,56 @@
+/* #27 — CSS module replacing inline styles in WorldView */
+
+.root {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #050509;
+  position: relative;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: #0a0a1a;
+  border-bottom: 1px solid #1a1a2e;
+}
+
+.title {
+  font-family: "'Press Start 2P', monospace";
+  font-size: 10px;
+  color: #7c3aed;
+}
+
+.statusRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.statusDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.statusLabel {
+  font-family: "'Press Start 2P', monospace";
+  font-size: 6px;
+}
+
+.grid {
+  flex: 1;
+  overflow: auto;
+  padding: 10px;
+}
+
+.gridInner {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: auto auto auto;
+  gap: 8px;
+  min-height: 100%;
+}

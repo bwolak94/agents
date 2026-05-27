@@ -1,5 +1,5 @@
-import type { CSSProperties } from 'react';
 import type { Stats, Costs } from '@/types/chat';
+import styles from './StatsBar.module.css';
 
 interface StatBoxProps {
   label: string;
@@ -9,23 +9,15 @@ interface StatBoxProps {
 }
 
 function StatBox({ label, value, color, flash = false }: StatBoxProps) {
-  const containerStyle: CSSProperties = {
-    background: '#0d0d1a',
-    border: `1px solid ${color}44`,
-    borderRadius: 4,
-    padding: '8px 14px',
-    textAlign: 'center',
-  };
-
   return (
-    <div style={containerStyle}>
+    <div className={styles.box} style={{ border: `1px solid ${color}44` }}>
       <div
-        className={flash ? 'counter-pop' : ''}
-        style={{ fontFamily: "'Press Start 2P', monospace", fontSize: 16, color, marginBottom: 4 }}
+        className={`${styles.value}${flash ? ' counter-pop' : ''}`}
+        style={{ color }}
       >
         {value}
       </div>
-      <div style={{ fontFamily: "'Press Start 2P', monospace", fontSize: 6, color: color + '88' }}>
+      <div className={styles.label} style={{ color: color + '88' }}>
         {label}
       </div>
     </div>
@@ -39,16 +31,7 @@ interface StatsBarProps {
 
 export function StatsBar({ stats, costs }: StatsBarProps) {
   return (
-    <div
-      style={{
-        display: 'flex',
-        gap: 8,
-        padding: '8px 12px',
-        background: '#050509',
-        borderBottom: '1px solid #1a1a2e',
-        flexWrap: 'wrap',
-      }}
-    >
+    <div className={styles.bar}>
       <StatBox label="ACTIVE" value={stats.active} color="#f97316" />
       <StatBox label="COMPLETED" value={stats.completed} color="#22c55e" flash={stats.completedFlash} />
       <StatBox label="TOTAL" value={stats.total} color="#60a5fa" />

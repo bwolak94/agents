@@ -5,16 +5,21 @@ Run: uvicorn api.server:app --reload --port 8000
 import sys
 import time
 import os
+import re
 import shutil
 import hashlib
+import uuid
+import logging
+from collections import defaultdict
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Query
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Query, Request
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 import asyncio
 import json
 
@@ -27,13 +32,41 @@ from db import analytics as analytics_db
 from db import prompts as prompts_db
 from config.settings import load_config
 
+logger = logging.getLogger(__name__)
+
 UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", "/tmp/agent_uploads"))
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+config = load_config()
+
+# ─── Rate limiter (#7) ────────────────────────────────────────────────────────
+_RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_RPM", "60"))  # requests per minute per IP
+_rate_windows: dict[str, list[float]] = defaultdict(list)
+
+
+# ─── Lifespan (#3 — replaces deprecated @app.on_event("startup")) ─────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    mongo_url = config.get("mongo_url", "mongodb://mongo:27017")
+    db = await init_db(mongo_url)
+    memory_db.set_db(db)
+    analytics_db.set_db(db)
+    prompts_db.set_db(db)
+
+    # Wire scheduler to the default orchestrator
+    default_orch = await get_session("default")
+    scheduler.set_handler(
+        lambda sid, msg: default_orch.process(message=msg, session_id=sid)
+    )
+    yield
+    # Cleanup on shutdown (connection pools, etc.) can be added here
+
 
 app = FastAPI(
     title="Agent System API",
     description="Multi-LLM Agent System — Claude, Gemini, Ollama",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 # ─── CORS — restrict to configured origins ────────────────────────────────────
@@ -49,27 +82,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-config = load_config()
 
-# ─── Startup ──────────────────────────────────────────────────────────────────
-@app.on_event("startup")
-async def startup():
-    mongo_url = config.get("mongo_url", "mongodb://mongo:27017")
-    db = await init_db(mongo_url)
-    memory_db.set_db(db)
-    analytics_db.set_db(db)
-    prompts_db.set_db(db)
+# ─── Rate limiting middleware (#7) ────────────────────────────────────────────
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    window = _rate_windows[client_ip]
+    # Slide the window: drop entries older than 60 seconds
+    _rate_windows[client_ip] = [t for t in window if now - t < 60]
+    if len(_rate_windows[client_ip]) >= _RATE_LIMIT_REQUESTS:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded. Please slow down."},
+        )
+    _rate_windows[client_ip].append(now)
+    return await call_next(request)
 
-    # Wire scheduler to the default orchestrator
-    default_orch = await get_session("default")
-    scheduler.set_handler(
-        lambda sid, msg: default_orch.process(message=msg, session_id=sid)
-    )
+
+# ─── Session ID validation helper (#6) ───────────────────────────────────────
+_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
+
+
+def _validate_session_id(session_id: str) -> str:
+    if not _SESSION_ID_RE.match(session_id):
+        raise HTTPException(
+            status_code=400,
+            detail="session_id must be 1-64 alphanumeric characters, hyphens, or underscores.",
+        )
+    return session_id
 
 
 # ─── Sessions ─────────────────────────────────────────────────────────────────
 _sessions: dict[str, tuple[AgentOrchestrator, float]] = {}
-_session_locks: dict[str, asyncio.Lock] = {}  # #6 — per-session lock
+_session_locks: dict[str, asyncio.Lock] = {}
 _request_ids: dict[str, float] = {}  # deduplication: request_id → timestamp
 SESSION_TTL = 3600
 REQUEST_ID_TTL = 60  # seconds
@@ -83,10 +129,11 @@ def _get_session_lock(session_id: str) -> asyncio.Lock:
 
 async def get_session(session_id: str) -> AgentOrchestrator:
     now = time.time()
-    # Evict expired sessions
+    # Evict expired sessions and their locks (#4)
     expired = [k for k, (_, t) in _sessions.items() if now - t > SESSION_TTL]
     for k in expired:
         del _sessions[k]
+        _session_locks.pop(k, None)  # #4 — also evict the lock
 
     # Evict old request IDs
     old_rids = [k for k, t in _request_ids.items() if now - t > REQUEST_ID_TTL]
@@ -115,6 +162,14 @@ class ChatRequest(BaseModel):
     show_routing: bool = False
     request_id: str | None = Field(default=None, description="Idempotency key — prevents duplicate sends")
 
+    # #6 — validate session_id format in the model itself
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not _SESSION_ID_RE.match(v):
+            raise ValueError("session_id must be 1-64 alphanumeric characters, hyphens, or underscores.")
+        return v
+
 
 class ChatResponse(BaseModel):
     response: str
@@ -122,6 +177,7 @@ class ChatResponse(BaseModel):
     agent_used: str
     tools_used: list[str]
     reasoning: str
+    duration_ms: int = 0
 
 
 class PromptSaveRequest(BaseModel):
@@ -159,18 +215,22 @@ async def chat(req: ChatRequest):
         _request_ids[req.request_id] = time.time()
 
     try:
-        # #6 — serialize requests within the same session to prevent race conditions
+        # Serialize requests within the same session to prevent race conditions
         async with _get_session_lock(req.session_id):
             orch = await get_session(req.session_id)
+            t_start = time.time()
             response = await orch.process(
                 message=req.message,
                 stream=False,
                 show_routing=False,
                 session_id=req.session_id,
             )
+            # #5 — measure actual duration and pass to analytics
+            duration_ms = int((time.time() - t_start) * 1000)
+
         d = orch.last_decision
 
-        # Record analytics
+        # Record analytics with real duration (#5)
         cost_stats = orch.llm.get_cost_stats()
         try:
             await analytics_db.record_request(
@@ -178,11 +238,11 @@ async def chat(req: ChatRequest):
                 agent=d.agent if d else "unknown",
                 model=d.model if d else "unknown",
                 tools=d.tools if d else [],
-                duration_ms=0,
+                duration_ms=duration_ms,
                 cost_usd=cost_stats.get("total_cost_usd", 0) if cost_stats else 0,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to record analytics: %s", exc)
 
         return ChatResponse(
             response=response,
@@ -190,6 +250,7 @@ async def chat(req: ChatRequest):
             agent_used=d.agent if d else "unknown",
             tools_used=d.tools if d else [],
             reasoning=d.reasoning if d else "",
+            duration_ms=duration_ms,
         )
     except HTTPException:
         raise
@@ -202,10 +263,12 @@ async def chat(req: ChatRequest):
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
     async def generate():
-        orch = await get_session(req.session_id)
-        decision = await orch.router.route(req.message, orch.conversation_history)
-        yield f"data: {json.dumps({'type': 'routing', 'model': decision.model, 'agent': decision.agent, 'tools': decision.tools})}\n\n"
-        response = await orch.process(req.message, stream=False, show_routing=False, decision=decision)
+        # #2 — acquire session lock before processing, same as /chat
+        async with _get_session_lock(req.session_id):
+            orch = await get_session(req.session_id)
+            decision = await orch.router.route(req.message, orch.conversation_history)
+            yield f"data: {json.dumps({'type': 'routing', 'model': decision.model, 'agent': decision.agent, 'tools': decision.tools})}\n\n"
+            response = await orch.process(req.message, stream=False, show_routing=False, decision=decision, session_id=req.session_id)
         yield f"data: {json.dumps({'type': 'response', 'content': response})}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -215,12 +278,14 @@ async def chat_stream(req: ChatRequest):
 # ─── History ──────────────────────────────────────────────────────────────────
 @app.get("/history/{session_id}")
 async def get_history(session_id: str):
+    _validate_session_id(session_id)
     messages = await load_history(session_id)
     return {"session_id": session_id, "messages": messages}
 
 
 @app.delete("/history/{session_id}")
 async def clear_session_history(session_id: str):
+    _validate_session_id(session_id)
     await db_clear_history(session_id)
     if session_id in _sessions:
         orch, _ = _sessions[session_id]
@@ -229,14 +294,20 @@ async def clear_session_history(session_id: str):
 
 
 @app.get("/sessions")
-async def list_sessions():
-    return {"sessions": await db_list_sessions()}
+async def list_sessions(
+    limit: int = Query(default=50, ge=1, le=200),
+    skip: int = Query(default=0, ge=0),
+):
+    """#24 — paginated session listing."""
+    return {"sessions": await db_list_sessions(limit=limit, skip=skip)}
 
 
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
+    _validate_session_id(session_id)
     if session_id in _sessions:
         del _sessions[session_id]
+        _session_locks.pop(session_id, None)
         return {"status": "deleted", "session_id": session_id}
     return {"status": "not_found", "session_id": session_id}
 
@@ -263,11 +334,14 @@ async def list_models():
 # ─── File Upload ──────────────────────────────────────────────────────────────
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...), session_id: str = "default"):
+    _validate_session_id(session_id)
     if file.size and file.size > 10 * 1024 * 1024:  # 10MB limit
         raise HTTPException(status_code=413, detail="File too large (max 10MB)")
 
-    # Stable ID = hash of session + filename
-    file_id = hashlib.sha256(f"{session_id}{file.filename}".encode()).hexdigest()[:16]
+    # #20 — include uuid to prevent silent overwrites of same filename
+    file_id = hashlib.sha256(
+        f"{session_id}{file.filename}{uuid.uuid4()}".encode()
+    ).hexdigest()[:16]
     session_dir = UPLOADS_DIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
@@ -288,6 +362,7 @@ async def upload_file(file: UploadFile = File(...), session_id: str = "default")
 
 @app.get("/uploads/{session_id}")
 async def list_uploads(session_id: str):
+    _validate_session_id(session_id)
     session_dir = UPLOADS_DIR / session_id
     if not session_dir.exists():
         return {"uploads": []}
@@ -301,12 +376,14 @@ async def list_uploads(session_id: str):
 # ─── Agent Memory ─────────────────────────────────────────────────────────────
 @app.get("/memory/{session_id}/{agent_type}")
 async def get_memory(session_id: str, agent_type: str):
+    _validate_session_id(session_id)
     memory = await memory_db.memory_read(session_id, agent_type)
     return {"session_id": session_id, "agent_type": agent_type, "memory": memory}
 
 
 @app.delete("/memory/{session_id}/{agent_type}")
 async def clear_memory(session_id: str, agent_type: str):
+    _validate_session_id(session_id)
     await memory_db.memory_write(session_id, agent_type, "")
     return {"status": "cleared"}
 
@@ -314,6 +391,7 @@ async def clear_memory(session_id: str, agent_type: str):
 # ─── Prompt Library ───────────────────────────────────────────────────────────
 @app.get("/prompts/{session_id}")
 async def get_prompts(session_id: str):
+    _validate_session_id(session_id)
     return {"prompts": await prompts_db.list_prompts(session_id)}
 
 
@@ -325,6 +403,7 @@ async def save_prompt(req: PromptSaveRequest):
 
 @app.delete("/prompts/{session_id}/{prompt_id}")
 async def delete_prompt(session_id: str, prompt_id: str):
+    _validate_session_id(session_id)
     deleted = await prompts_db.delete_prompt(session_id, prompt_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Prompt not found")
@@ -345,10 +424,15 @@ async def list_scheduled(session_id: str | None = None):
 
 @app.get("/schedule/{task_id}")
 async def get_scheduled_task(task_id: str):
+    # #1 — return the specific task, not the first item in the list
     task = scheduler.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    return scheduler.list_tasks()[0] if scheduler.list_tasks() else {}
+    tasks = scheduler.list_tasks()
+    match = next((t for t in tasks if t["task_id"] == task_id), None)
+    if not match:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return match
 
 
 # ─── WebSocket — session-filtered events ──────────────────────────────────────
