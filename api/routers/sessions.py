@@ -9,7 +9,7 @@ import api.db as _db
 import api.state as _state
 from api.models import (
     SessionFindRequest, ImportContextRequest, IncrementalContextRequest,
-    SessionTitleRequest, BroadcastRequest,
+    SessionTitleRequest, BroadcastRequest, SessionForkRequest,
 )
 from api.validators import validate_session_id
 
@@ -57,6 +57,58 @@ async def export_session(
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{session_id}.json"'},
     )
+
+
+@router.get("/history/{session_id}/export/jsonl")
+async def export_session_jsonl(session_id: str):
+    """#21 — Export session as JSONL (one message object per line)."""
+    validate_session_id(session_id)
+    messages = await _db.load_history(session_id)
+    lines = [json.dumps(m, ensure_ascii=False) for m in messages]
+    return Response(
+        content="\n".join(lines) + "\n",
+        media_type="application/x-ndjson",
+        headers={"Content-Disposition": f'attachment; filename="{session_id}.jsonl"'},
+    )
+
+
+# ── #13 Session forking ───────────────────────────────────────────────────────
+
+@router.post("/sessions/{session_id}/fork")
+async def fork_session(session_id: str, req: SessionForkRequest):
+    """Create a new session pre-loaded with history from session_id up to at_message_index."""
+    validate_session_id(session_id)
+    messages = await _db.load_history(session_id)
+    if not messages:
+        raise HTTPException(status_code=404, detail="Source session has no history")
+
+    # Slice history
+    if req.at_message_index >= 0:
+        messages = messages[:req.at_message_index]
+    if not messages:
+        raise HTTPException(status_code=400, detail="No messages to fork (index too small)")
+
+    # Write messages to new session
+    from db.history import append_message
+    for msg in messages:
+        await append_message(
+            req.new_session_id,
+            msg.get("role", "user"),
+            msg.get("content", ""),
+        )
+
+    # Preload the in-process orchestrator
+    new_orch = await _state.get_session(req.new_session_id)
+    new_orch.conversation_history = [
+        {"role": m["role"], "content": m["content"]} for m in messages
+    ]
+
+    return {
+        "status": "forked",
+        "source_session_id": session_id,
+        "new_session_id": req.new_session_id,
+        "messages_copied": len(messages),
+    }
 
 
 @router.post("/history/{session_id}/replay")

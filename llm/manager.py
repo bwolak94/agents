@@ -63,6 +63,21 @@ class CostTracker:
         }
 
 
+# ── Circuit Breaker ───────────────────────────────────────────────────────────
+import enum
+import logging as _logging
+
+_cb_logger = _logging.getLogger("llm.circuit_breaker")
+
+class _CBState(enum.Enum):
+    CLOSED    = "closed"     # normal operation — calls pass through
+    OPEN      = "open"       # circuit tripped — all calls blocked
+    HALF_OPEN = "half_open"  # test phase — one call allowed
+
+_CB_FAILURE_THRESHOLD = int(os.getenv("CB_FAILURE_THRESHOLD", "3"))
+_CB_RESET_TIMEOUT     = int(os.getenv("CB_RESET_TIMEOUT", "60"))   # secs before HALF_OPEN
+
+
 class LLMManager:
     # Model health tracking (Imp 6): unhealthy models are skipped for _HEALTH_COOLDOWN seconds
     _HEALTH_COOLDOWN = 300  # 5 minutes
@@ -71,6 +86,10 @@ class LLMManager:
         self.config = config
         self.clients = {}
         self._unhealthy: dict[str, float] = {}  # model -> timestamp marked unhealthy
+        # Circuit breaker state per model
+        self._cb_failures: dict[str, int] = {}
+        self._cb_open_at: dict[str, float] = {}
+        self._cb_state: dict[str, _CBState] = {}
         self._init_clients()
 
     def _init_clients(self):
@@ -170,17 +189,46 @@ class LLMManager:
         return models
 
     def is_model_healthy(self, model: str) -> bool:
-        """Return True if the model is not currently marked as unhealthy (Imp 6)."""
-        if model not in self._unhealthy:
+        """Return True if the circuit is CLOSED or HALF_OPEN for this model."""
+        now = time.time()
+        # Legacy health-cooldown check
+        if model in self._unhealthy and now - self._unhealthy[model] < self._HEALTH_COOLDOWN:
+            pass  # may still be overridden by CB logic below
+
+        state = self._cb_state.get(model, _CBState.CLOSED)
+        if state == _CBState.CLOSED:
             return True
-        if time.time() - self._unhealthy[model] > self._HEALTH_COOLDOWN:
-            del self._unhealthy[model]
-            return True
-        return False
+        if state == _CBState.OPEN:
+            elapsed = now - self._cb_open_at.get(model, now)
+            if elapsed >= _CB_RESET_TIMEOUT:
+                self._cb_state[model] = _CBState.HALF_OPEN
+                _cb_logger.info("Circuit HALF_OPEN for %s — testing one call", model)
+                return True  # allow single probe
+            return False
+        # HALF_OPEN: allow the one probe call
+        return True
+
+    def record_cb_success(self, model: str) -> None:
+        """Reset circuit after a successful call — transitions to CLOSED."""
+        prev = self._cb_state.get(model, _CBState.CLOSED)
+        self._cb_failures.pop(model, None)
+        self._cb_open_at.pop(model, None)
+        self._cb_state.pop(model, None)
+        self._unhealthy.pop(model, None)
+        if prev != _CBState.CLOSED:
+            _cb_logger.info("Circuit CLOSED for %s (recovered)", model)
 
     def mark_model_unhealthy(self, model: str) -> None:
-        """Mark a model as temporarily unavailable (Imp 6)."""
+        """Record a failure; open the circuit when threshold is exceeded."""
         self._unhealthy[model] = time.time()
+        self._cb_failures[model] = self._cb_failures.get(model, 0) + 1
+        failures = self._cb_failures[model]
+        if failures >= _CB_FAILURE_THRESHOLD:
+            self._cb_state[model] = _CBState.OPEN
+            self._cb_open_at[model] = time.time()
+            _cb_logger.warning(
+                "Circuit OPEN for %s after %d consecutive failures", model, failures
+            )
 
     def get_health_status(self) -> dict:
         """Return health status for all models."""

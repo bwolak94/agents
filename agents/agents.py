@@ -269,6 +269,13 @@ class BaseAgent(ABC):
                         "tools": [tool_name],
                     }))
 
+                # Cross-request cache for idempotent tools (web_search, file_read)
+                from tools.tools import _cache_get, _cache_put
+                cached_result = _cache_get(tool_name, tool_args)
+                if cached_result is not None:
+                    tool_dedup_cache[dedup_key] = cached_result
+                    return tool_name, cached_result
+
                 # Error auto-retry (Imp 4)
                 last_error = None
                 for attempt in range(TOOL_ERROR_MAX_RETRIES + 1):
@@ -277,6 +284,7 @@ class BaseAgent(ABC):
                         # Summarize if too large (Imp 2)
                         if len(str(result)) > TOOL_RESULT_MAX_CHARS:
                             result = await self._summarize_tool_result(str(result), model)
+                        _cache_put(tool_name, tool_args, str(result))
                         tool_dedup_cache[dedup_key] = str(result)
                         return tool_name, result
                     except Exception as e:

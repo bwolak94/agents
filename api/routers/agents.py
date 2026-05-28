@@ -6,6 +6,7 @@ import api.state as _state
 from api.models import (
     AgentSystemPromptRequest, PersonaRequest,
     MacroRequest, WebhookToolRequest, PromptVersionRequest,
+    MemoryFactRequest,
 )
 
 router = APIRouter()
@@ -145,3 +146,50 @@ async def register_webhook_tool(req: WebhookToolRequest):
     orch = await _state.get_session("default")
     orch.tools.register(req.name, WebhookTool(req.url, req.method))
     return {"status": "registered", "tool_name": req.name}
+
+
+# ── #1 Memory graph ───────────────────────────────────────────────────────────
+
+@router.post("/memory-graph/{session_id}/facts")
+async def upsert_memory_fact(session_id: str, req: MemoryFactRequest):
+    fact = await _db.memory_graph_db.upsert_fact(
+        session_id, req.entity, req.relation, req.value, req.confidence
+    )
+    return {"status": "upserted", "fact": fact}
+
+
+@router.get("/memory-graph/{session_id}/facts")
+async def get_memory_facts(session_id: str, entity: str | None = None, relation: str | None = None):
+    facts = await _db.memory_graph_db.get_facts(session_id, entity=entity, relation=relation)
+    return {"session_id": session_id, "facts": facts}
+
+
+@router.get("/memory-graph/{session_id}/search")
+async def search_memory_facts(session_id: str, q: str, limit: int = 20):
+    facts = await _db.memory_graph_db.search_facts(session_id, q, limit=limit)
+    return {"session_id": session_id, "query": q, "facts": facts}
+
+
+@router.delete("/memory-graph/{session_id}/facts")
+async def delete_memory_fact(session_id: str, entity: str, relation: str):
+    deleted = await _db.memory_graph_db.delete_fact(session_id, entity, relation)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Fact not found")
+    return {"status": "deleted", "entity": entity, "relation": relation}
+
+
+@router.delete("/memory-graph/{session_id}")
+async def clear_memory_graph(session_id: str):
+    count = await _db.memory_graph_db.clear_graph(session_id)
+    return {"status": "cleared", "session_id": session_id, "deleted": count}
+
+
+@router.post("/memory-graph/{session_id}/extract")
+async def extract_memory_facts(session_id: str, body: dict):
+    """Extract entity/relation/value triples from text via LLM."""
+    text = body.get("text", "")
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    orch = await _state.get_session(session_id)
+    facts = await _db.memory_graph_db.extract_and_store(session_id, text, orch.llm)
+    return {"session_id": session_id, "extracted": len(facts), "facts": facts}

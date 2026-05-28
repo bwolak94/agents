@@ -4,56 +4,31 @@ import type { AgentStat, ModelStat, DailyStat } from '@/types/analytics';
 
 const BAR_COLORS = ['#60a5fa', '#f97316', '#22c55e', '#a855f7', '#eab308', '#ec4899'];
 
-function CssBar({
-  value,
-  max,
-  colorIndex = 0,
-}: {
-  value: number;
-  max: number;
-  colorIndex?: number;
-}) {
-  const pct = max > 0 ? Math.round((value / max) * 100) : 0;
+function CssBar({ value, max, colorIndex = 0 }: { value: number; max: number; colorIndex?: number }) {
+  const pct   = max > 0 ? Math.round((value / max) * 100) : 0;
   const color = BAR_COLORS[colorIndex % BAR_COLORS.length];
   return (
-    <div
-      style={{
-        height: 8,
-        borderRadius: 4,
-        background: '#1a1a2e',
-        overflow: 'hidden',
-        flex: 1,
-        minWidth: 60,
-      }}
-    >
-      <div
-        style={{
-          height: '100%',
-          width: `${pct}%`,
-          background: color,
-          borderRadius: 4,
-          transition: 'width 0.4s ease',
-        }}
-      />
+    <div className="h-2 rounded-full bg-border-dim overflow-hidden flex-1 min-w-[60px]">
+      <div className="h-full rounded-full transition-[width] duration-300" style={{ width: `${pct}%`, background: color }} />
     </div>
   );
 }
 
 function SectionHeader({ label }: { label: string }) {
-  return (
-    <div
-      style={{
-        fontSize: 10,
-        fontWeight: 700,
-        letterSpacing: '0.1em',
-        color: '#475569',
-        textTransform: 'uppercase',
-        marginBottom: 10,
-      }}
-    >
-      {label}
-    </div>
-  );
+  return <div className="text-[10px] font-bold tracking-widest text-text-faint uppercase mb-2.5">{label}</div>;
+}
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
+async function downloadBlob(url: string, filename: string) {
+  const resp = await fetch(url);
+  const blob = await resp.blob();
+  const link = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = link;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(link);
 }
 
 export function AnalyticsDashboard() {
@@ -61,16 +36,7 @@ export function AnalyticsDashboard() {
 
   if (loading) {
     return (
-      <div
-        style={{
-          flex: 1,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          color: '#475569',
-          fontSize: 13,
-        }}
-      >
+      <div className="flex-1 flex items-center justify-center text-text-faint text-sm">
         Loading analytics…
       </div>
     );
@@ -78,31 +44,11 @@ export function AnalyticsDashboard() {
 
   if (!data) {
     return (
-      <div
-        style={{
-          flex: 1,
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          justifyContent: 'center',
-          gap: 12,
-          color: '#475569',
-        }}
-      >
-        <div style={{ fontSize: 36 }}>📊</div>
-        <p style={{ fontSize: 13, margin: 0 }}>No analytics data available.</p>
-        <button
-          onClick={refetch}
-          style={{
-            background: '#1e1e2e',
-            color: '#e2e8f0',
-            border: '1px solid #334155',
-            borderRadius: 8,
-            padding: '6px 14px',
-            cursor: 'pointer',
-            fontSize: 12,
-          }}
-        >
+      <div className="flex-1 flex flex-col items-center justify-center gap-3 text-text-faint">
+        <div className="text-4xl">📊</div>
+        <p className="text-sm m-0">No analytics data available.</p>
+        <button onClick={refetch}
+          className="border border-border-strong rounded-lg px-3.5 py-1.5 text-xs text-text-secondary hover:text-text-primary hover:border-border-strong transition-colors">
           Retry
         </button>
       </div>
@@ -114,217 +60,77 @@ export function AnalyticsDashboard() {
   const maxModelCount = Math.max(...by_model.map((m) => m.count), 1);
   const maxDailyCount = Math.max(...daily.map((d) => d.count), 1);
 
+  const totalsCards = [
+    { label: 'Total Requests', value: totals.total_requests.toString(),          color: 'text-accent-blue-light' },
+    { label: 'Total Cost',     value: `$${totals.total_cost_usd.toFixed(4)}`,   color: 'text-accent-purple' },
+    { label: 'Avg Duration',   value: `${(totals.avg_duration_ms / 1000).toFixed(1)}s`, color: 'text-accent-green' },
+    { label: 'Input Tokens',   value: totals.total_input_tokens.toLocaleString(), color: 'text-accent-orange' },
+    { label: 'Output Tokens',  value: totals.total_output_tokens.toLocaleString(), color: 'text-accent-yellow' },
+  ];
+
   return (
-    <div
-      style={{
-        flex: 1,
-        overflowY: 'auto',
-        padding: 24,
-        background: '#050509',
-        color: '#e2e8f0',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 24,
-      }}
-    >
-      {/* Header row */}
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-        }}
-      >
-        <h2 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: '#e2e8f0' }}>
-          Analytics
-        </h2>
-        <div style={{ display: 'flex', gap: 6 }}>
-          <button
-            onClick={async () => {
-              const resp = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/analytics/export?format=csv`);
-              const blob = await resp.blob();
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement('a'); a.href = url; a.download = 'analytics.csv'; a.click();
-              URL.revokeObjectURL(url);
-            }}
-            style={{ background: '#1a1a2e', color: '#94a3b8', border: '1px solid #334155', borderRadius: 8, padding: '4px 12px', cursor: 'pointer', fontSize: 11 }}
-          >
-            ↓ CSV
-          </button>
-          <button
-            onClick={async () => {
-              const resp = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/analytics/export?format=json`);
-              const blob = await resp.blob();
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement('a'); a.href = url; a.download = 'analytics.json'; a.click();
-              URL.revokeObjectURL(url);
-            }}
-            style={{ background: '#1a1a2e', color: '#94a3b8', border: '1px solid #334155', borderRadius: 8, padding: '4px 12px', cursor: 'pointer', fontSize: 11 }}
-          >
-            ↓ JSON
-          </button>
-          <button
-            onClick={refetch}
-            style={{ background: '#1a1a2e', color: '#94a3b8', border: '1px solid #334155', borderRadius: 8, padding: '4px 12px', cursor: 'pointer', fontSize: 11 }}
-          >
+    <div className="flex-1 overflow-y-auto p-6 bg-surface-panel text-text-primary flex flex-col gap-6">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <h2 className="m-0 text-base font-bold">Analytics</h2>
+        <div className="flex gap-1.5">
+          {['csv', 'json'].map(fmt => (
+            <button key={fmt} onClick={() => downloadBlob(`${API_BASE}/analytics/export?format=${fmt}`, `analytics.${fmt}`)}
+              className="bg-surface-card border border-border-strong rounded-lg px-3 py-1 text-[11px] text-text-secondary hover:text-text-primary transition-colors">
+              ↓ {fmt.toUpperCase()}
+            </button>
+          ))}
+          <button onClick={refetch}
+            className="bg-surface-card border border-border-strong rounded-lg px-3 py-1 text-[11px] text-text-secondary hover:text-text-primary transition-colors">
             ↻ Refresh
           </button>
         </div>
       </div>
 
       {/* Totals row */}
-      <div
-        style={{
-          display: 'flex',
-          gap: 16,
-          flexWrap: 'wrap',
-        }}
-      >
-        {[
-          { label: 'Total Requests', value: totals.total_requests.toString(), color: '#60a5fa' },
-          {
-            label: 'Total Cost',
-            value: `$${totals.total_cost_usd.toFixed(4)}`,
-            color: '#a855f7',
-          },
-          {
-            label: 'Avg Duration',
-            value: `${(totals.avg_duration_ms / 1000).toFixed(1)}s`,
-            color: '#22c55e',
-          },
-          {
-            label: 'Input Tokens',
-            value: totals.total_input_tokens.toLocaleString(),
-            color: '#f97316',
-          },
-          {
-            label: 'Output Tokens',
-            value: totals.total_output_tokens.toLocaleString(),
-            color: '#eab308',
-          },
-        ].map(({ label, value, color }) => (
-          <div
-            key={label}
-            style={{
-              background: '#0d0d1a',
-              border: '1px solid #1a1a2e',
-              borderRadius: 10,
-              padding: '12px 18px',
-              minWidth: 120,
-            }}
-          >
-            <div style={{ fontSize: 20, fontWeight: 700, color }}>{value}</div>
-            <div style={{ fontSize: 11, color: '#475569', marginTop: 3 }}>{label}</div>
+      <div className="flex gap-4 flex-wrap">
+        {totalsCards.map(({ label, value, color }) => (
+          <div key={label} className="bg-surface-card border border-border-dim rounded-xl px-4 py-3 min-w-[120px]">
+            <div className={`text-xl font-bold ${color}`}>{value}</div>
+            <div className="text-[11px] text-text-faint mt-0.5">{label}</div>
           </div>
         ))}
       </div>
 
       {/* By Agent + By Model */}
-      <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-        {/* By Agent */}
-        <div
-          style={{
-            flex: 1,
-            minWidth: 220,
-            background: '#0d0d1a',
-            border: '1px solid #1a1a2e',
-            borderRadius: 10,
-            padding: 16,
-          }}
-        >
-          <SectionHeader label="By Agent" />
-          {by_agent.length === 0 && (
-            <div style={{ fontSize: 12, color: '#475569' }}>No data</div>
-          )}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {by_agent.map((a: AgentStat, i: number) => (
-              <div key={a.agent}>
-                <div
-                  style={{
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    fontSize: 12,
-                    marginBottom: 4,
-                    color: '#e2e8f0',
-                  }}
-                >
-                  <span>{a.agent}</span>
-                  <span style={{ color: '#64748b' }}>{a.count}</span>
+      <div className="flex gap-4 flex-wrap">
+        {[
+          { title: 'By Agent', items: by_agent, keyF: (a: AgentStat) => a.agent,  countF: (a: AgentStat) => a.count,  max: maxAgentCount, offset: 0 },
+          { title: 'By Model', items: by_model, keyF: (m: ModelStat) => m.model,  countF: (m: ModelStat) => m.count,  max: maxModelCount, offset: 2 },
+        ].map(({ title, items, keyF, countF, max, offset }) => (
+          <div key={title} className="flex-1 min-w-[220px] bg-surface-card border border-border-dim rounded-xl p-4">
+            <SectionHeader label={title} />
+            {items.length === 0 && <div className="text-xs text-text-faint">No data</div>}
+            <div className="flex flex-col gap-2.5">
+              {(items as (AgentStat | ModelStat)[]).map((item, i) => (
+                <div key={keyF(item as never)}>
+                  <div className="flex justify-between text-xs mb-1">
+                    <span className="text-text-primary">{keyF(item as never)}</span>
+                    <span className="text-text-muted">{countF(item as never)}</span>
+                  </div>
+                  <CssBar value={countF(item as never)} max={max} colorIndex={i + offset} />
                 </div>
-                <CssBar value={a.count} max={maxAgentCount} colorIndex={i} />
-              </div>
-            ))}
+              ))}
+            </div>
           </div>
-        </div>
-
-        {/* By Model */}
-        <div
-          style={{
-            flex: 1,
-            minWidth: 220,
-            background: '#0d0d1a',
-            border: '1px solid #1a1a2e',
-            borderRadius: 10,
-            padding: 16,
-          }}
-        >
-          <SectionHeader label="By Model" />
-          {by_model.length === 0 && (
-            <div style={{ fontSize: 12, color: '#475569' }}>No data</div>
-          )}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {by_model.map((m: ModelStat, i: number) => (
-              <div key={m.model}>
-                <div
-                  style={{
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    fontSize: 12,
-                    marginBottom: 4,
-                    color: '#e2e8f0',
-                  }}
-                >
-                  <span>{m.model}</span>
-                  <span style={{ color: '#64748b' }}>{m.count}</span>
-                </div>
-                <CssBar value={m.count} max={maxModelCount} colorIndex={i + 2} />
-              </div>
-            ))}
-          </div>
-        </div>
+        ))}
       </div>
 
       {/* Daily Activity */}
-      <div
-        style={{
-          background: '#0d0d1a',
-          border: '1px solid #1a1a2e',
-          borderRadius: 10,
-          padding: 16,
-        }}
-      >
+      <div className="bg-surface-card border border-border-dim rounded-xl p-4">
         <SectionHeader label="Daily Activity" />
-        {daily.length === 0 && (
-          <div style={{ fontSize: 12, color: '#475569' }}>No data</div>
-        )}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {daily.length === 0 && <div className="text-xs text-text-faint">No data</div>}
+        <div className="flex flex-col gap-2">
           {daily.map((d: DailyStat, i: number) => (
-            <div key={d.date} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <span
-                style={{
-                  fontSize: 11,
-                  color: '#64748b',
-                  width: 80,
-                  flexShrink: 0,
-                  fontFamily: 'monospace',
-                }}
-              >
-                {d.date}
-              </span>
+            <div key={d.date} className="flex items-center gap-2.5">
+              <span className="text-[11px] text-text-muted w-20 flex-shrink-0 font-mono">{d.date}</span>
               <CssBar value={d.count} max={maxDailyCount} colorIndex={i} />
-              <span style={{ fontSize: 11, color: '#64748b', width: 30, textAlign: 'right' }}>
-                {d.count}
-              </span>
+              <span className="text-[11px] text-text-muted w-7 text-right">{d.count}</span>
             </div>
           ))}
         </div>

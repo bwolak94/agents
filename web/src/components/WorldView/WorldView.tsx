@@ -55,7 +55,7 @@ export function WorldView({ agents, stats, costs, events, wsStatus }: WorldViewP
         </div>
       </div>
 
-      <EventLog events={events} />
+      <EventLog events={events} collapsed={false} onToggle={() => {}} />
     </div>
   );
 }

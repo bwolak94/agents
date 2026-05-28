@@ -96,12 +96,41 @@ async def chat(req: ChatRequest):
                         logger.warning("Vision call failed: %s — falling through to text", e)
 
             t_start = time.time()
+
+            # #3 — Chain-of-thought scratchpad (when requested)
+            scratchpad = ""
+            if req.show_scratchpad:
+                scratchpad, message = await orch.get_scratchpad(message, model=req.preferred_model or "claude")
+
+            # #14 — Smart context compression when history is large
+            if len(orch.conversation_history) > 20:
+                orch.conversation_history = await orch.smart_compress_history(message)
+
             response = await orch.process(
                 message=message, stream=False, show_routing=False,
                 session_id=req.session_id, preferred_model=req.preferred_model,
                 enable_reflection=req.enable_reflection, checkpoint_id=req.checkpoint_id,
             )
             duration_ms = int((time.time() - t_start) * 1000)
+
+            # #2 — Self-evaluation loop (retry once if score below threshold)
+            self_eval_score = -1.0
+            if req.enable_self_eval:
+                self_eval_score = await orch.self_evaluate(message, response)
+                import os as _os
+                threshold = float(_os.getenv("SELF_EVAL_THRESHOLD", "0.6"))
+                if 0 <= self_eval_score < threshold:
+                    response = await orch.process(
+                        message=f"[Please improve this response — previous score was low]\n\n{message}",
+                        stream=False, show_routing=False,
+                        session_id=req.session_id, preferred_model=req.preferred_model,
+                    )
+
+            # #6 — Confidence scoring (when self-eval is also on, reuse result)
+            confidence = -1.0
+            if req.enable_self_eval:
+                confidence = self_eval_score  # self-eval IS the confidence proxy
+
         finally:
             lock.release()
 
@@ -139,6 +168,9 @@ async def chat(req: ChatRequest):
             tools_used=d.tools if d else [],
             reasoning=d.reasoning if d else "",
             duration_ms=duration_ms,
+            scratchpad=scratchpad,
+            confidence=confidence,
+            self_eval_score=self_eval_score,
         )
     except HTTPException:
         raise

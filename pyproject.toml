@@ -1,11 +1,16 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-asyncio_mode = "auto"
+asyncio_mode = "strict"
 pythonpath = ["."]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short --no-header"
+
+[tool.mutmut]
+paths_to_mutate = "api/,core/,agents/,tools/,db/"
+runner = "python3 -m pytest tests/unit/ -x -q"
+tests_dir = "tests/"
 
 [tool.coverage.run]
 source = ["."]
@@ -14,3 +19,13 @@ omit = ["tests/*", "*/migrations/*", ".venv/*"]
 [tool.coverage.report]
 show_missing = true
 skip_covered = false
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_return_any = false
+disallow_untyped_defs = false
+check_untyped_defs = true
+files = ["api", "core", "db", "config", "agents", "tools"]

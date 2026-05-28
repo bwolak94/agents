@@ -149,14 +149,25 @@ async def clear_history(session_id: str):
     await _db["conversations"].delete_one({"session_id": session_id})
 
 
-async def list_sessions(limit: int = 50, skip: int = 0) -> list:
+async def list_sessions(limit: int = 50, skip: int = 0, after: str | None = None) -> list:
     """Return recent sessions for the chat history sidebar, excluding system sessions.
-    #24 — supports cursor-based pagination via limit/skip.
+
+    Supports two pagination modes:
+    - ``skip`` (legacy): offset-based, fine for small collections.
+    - ``after`` (cursor-based): pass the ``updated_at`` value of the last item seen
+      for efficient keyset pagination — avoids full-collection scans on large datasets.
     """
+    base_filter: dict = {"session_id": {"$nin": list(_SYSTEM_SESSIONS)}}
+    if after:
+        base_filter["updated_at"] = {"$lt": after}
+
     cursor = _db["conversations"].find(
-        {"session_id": {"$nin": list(_SYSTEM_SESSIONS)}},
+        base_filter,
         {"_id": 0, "session_id": 1, "updated_at": 1, "created_at": 1, "preview": 1, "title": 1, "auto_tags": 1, "messages": {"$slice": 1}}
-    ).sort("updated_at", -1).skip(skip).limit(limit)
+    ).sort("updated_at", -1)
+    if not after:
+        cursor = cursor.skip(skip)
+    cursor = cursor.limit(limit)
     docs = await cursor.to_list(length=limit)
 
     result = []

@@ -15,15 +15,22 @@ interface HeaderProps {
 }
 
 const WS_STATUS_CONFIG: Record<WsStatus, { color: string; label: string }> = {
-  connected: { color: '#22c55e', label: 'Live' },
-  connecting: { color: '#eab308', label: 'Connecting' },
-  offline: { color: '#dc2626', label: 'Offline' },
+  connected: { color: 'text-accent-green', label: 'Live' },
+  connecting: { color: 'text-accent-yellow', label: 'Connecting' },
+  offline:    { color: 'text-accent-red',   label: 'Offline' },
 };
 
-const NAV_TABS: { id: ViewId; icon: string; label: string }[] = [
-  { id: 'chat', icon: '💬', label: 'Chat' },
-  { id: 'analytics', icon: '📊', label: 'Analytics' },
-  { id: 'memory', icon: '🧠', label: 'Memory' },
+const WS_DOT_COLOR: Record<WsStatus, string> = {
+  connected: 'bg-accent-green shadow-[0_0_6px_#22c55e]',
+  connecting:'bg-accent-yellow shadow-[0_0_6px_#eab308]',
+  offline:   'bg-accent-red   shadow-[0_0_6px_#dc2626]',
+};
+
+// #28 — NAV_TABS with full ARIA support
+const NAV_TABS: { id: ViewId; label: string }[] = [
+  { id: 'chat',      label: 'Chat'      },
+  { id: 'analytics', label: 'Analytics' },
+  { id: 'memory',    label: 'Memory'    },
 ];
 
 interface StatPillProps {
@@ -34,9 +41,9 @@ interface StatPillProps {
 
 function StatPill({ label, value, color }: StatPillProps) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-      <span style={{ fontSize: 12, color, fontWeight: 700 }}>{value}</span>
-      <span style={{ fontSize: 11, color: '#475569' }}>{label}</span>
+    <div className="flex items-center gap-1.5">
+      <span className={`text-xs font-bold ${color}`}>{value}</span>
+      <span className="text-[11px] text-text-faint">{label}</span>
     </div>
   );
 }
@@ -44,77 +51,72 @@ function StatPill({ label, value, color }: StatPillProps) {
 export function Header({ wsStatus, stats, costs, view, onViewChange, theme = 'dark', onToggleTheme }: HeaderProps) {
   const { color: dotColor, label: wsLabel } = WS_STATUS_CONFIG[wsStatus];
 
+  // #28 — keyboard handler for arrow-key nav between tabs
+  const handleTabKeyDown = (e: React.KeyboardEvent, currentIdx: number) => {
+    let nextIdx = currentIdx;
+    if (e.key === 'ArrowRight') nextIdx = (currentIdx + 1) % NAV_TABS.length;
+    if (e.key === 'ArrowLeft')  nextIdx = (currentIdx - 1 + NAV_TABS.length) % NAV_TABS.length;
+    if (nextIdx !== currentIdx) {
+      e.preventDefault();
+      onViewChange(NAV_TABS[nextIdx].id);
+    }
+  };
+
   return (
-    <header
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        padding: '0 20px',
-        height: 48,
-        background: '#050509',
-        borderBottom: '1px solid #1a1a2e',
-        flexShrink: 0,
-        gap: 24,
-      }}
-    >
+    <header className="flex items-center px-5 h-12 bg-surface-panel border-b border-border-dim flex-shrink-0 gap-6">
+
       {/* Brand */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-        <span style={{ fontSize: 18 }}>🤖</span>
-        <span style={{ fontWeight: 700, fontSize: 14, color: '#e2e8f0' }}>Agent System</span>
-        <span style={{ fontSize: 11, color: '#334155' }}>Claude · Gemini · Ollama</span>
+      <div className="flex items-center gap-2.5">
+        <span className="font-bold text-sm text-text-primary">Agent System</span>
+        <span className="text-[11px] text-border-strong hidden sm:block">Claude · Gemini · Ollama</span>
       </div>
 
-      {/* Divider */}
-      <div style={{ width: 1, height: 20, background: '#1a1a2e' }} />
+      <div className="w-px h-5 bg-border-dim" />
 
-      {/* Nav tabs */}
-      <nav style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-        {NAV_TABS.map((tab) => {
+      {/* #28 — Nav tabs with full ARIA */}
+      <nav role="tablist" aria-label="Main navigation" className="flex items-center gap-1">
+        {NAV_TABS.map((tab, idx) => {
           const isActive = view === tab.id;
           return (
             <button
               key={tab.id}
+              role="tab"
+              aria-selected={isActive}
+              aria-controls={`panel-${tab.id}`}
+              id={`tab-${tab.id}`}
+              tabIndex={isActive ? 0 : -1}
               onClick={() => onViewChange(tab.id)}
-              style={{
-                background: isActive ? '#1a1a2e' : 'none',
-                border: isActive ? '1px solid #334155' : '1px solid transparent',
-                borderRadius: 8,
-                color: isActive ? '#e2e8f0' : '#64748b',
-                cursor: 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 5,
-                fontSize: 12,
-                fontWeight: isActive ? 600 : 400,
-                padding: '4px 10px',
-                transition: 'all 0.15s',
-              }}
+              onKeyDown={(e) => handleTabKeyDown(e, idx)}
+              className={`px-2.5 py-1 rounded-lg text-xs transition-all outline-none
+                focus-visible:ring-2 focus-visible:ring-accent-blue
+                ${isActive
+                  ? 'bg-surface-active border border-border-strong text-text-primary font-semibold'
+                  : 'border border-transparent text-text-muted hover:text-text-secondary'
+                }`}
             >
-              <span>{tab.icon}</span>
-              <span>{tab.label}</span>
+              {tab.label}
             </button>
           );
         })}
       </nav>
 
-      {/* Divider */}
-      <div style={{ width: 1, height: 20, background: '#1a1a2e' }} />
+      <div className="w-px h-5 bg-border-dim" />
 
       {/* Stats */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-        <StatPill label="active" value={stats.active} color="#f97316" />
-        <StatPill label="done" value={stats.completed} color="#22c55e" />
-        <StatPill label="total" value={stats.total} color="#60a5fa" />
+      <div className="flex items-center gap-4">
+        <StatPill label="active"    value={stats.active}    color="text-accent-orange" />
+        <StatPill label="done"      value={stats.completed} color="text-accent-green"  />
+        <StatPill label="total"     value={stats.total}     color="text-accent-blue-light" />
         {costs?.total_cost_usd !== undefined && (
-          <StatPill label="cost" value={`$${costs.total_cost_usd.toFixed(4)}`} color="#a855f7" />
+          <StatPill label="cost" value={`$${costs.total_cost_usd.toFixed(4)}`} color="text-accent-purple" />
         )}
       </div>
 
       {/* Spacer */}
-      <div style={{ flex: 1 }} />
+      <div className="flex-1" />
 
       {/* Cmd+K hint */}
-      <div style={{ fontSize: 10, color: '#334155', border: '1px solid #1e293b', borderRadius: 4, padding: '2px 6px' }}>
+      <div className="text-[10px] text-border-strong border border-border-base rounded px-1.5 py-0.5 hidden md:block">
         ⌘K
       </div>
 
@@ -123,33 +125,17 @@ export function Header({ wsStatus, stats, costs, view, onViewChange, theme = 'da
         <button
           onClick={onToggleTheme}
           title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
-          style={{
-            background: 'none',
-            border: '1px solid #334155',
-            borderRadius: 6,
-            color: '#64748b',
-            cursor: 'pointer',
-            fontSize: 13,
-            padding: '3px 8px',
-            lineHeight: 1,
-          }}
+          aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+          className="border border-border-strong rounded-md text-text-muted hover:text-text-secondary px-2 py-1 text-sm transition-colors"
         >
           {theme === 'dark' ? '☀' : '☽'}
         </button>
       )}
 
-      {/* WS Status */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <div
-          style={{
-            width: 7,
-            height: 7,
-            borderRadius: '50%',
-            background: dotColor,
-            boxShadow: `0 0 6px ${dotColor}`,
-          }}
-        />
-        <span style={{ fontSize: 11, color: dotColor }}>{wsLabel}</span>
+      {/* WS status */}
+      <div className="flex items-center gap-1.5">
+        <div className={`w-[7px] h-[7px] rounded-full ${WS_DOT_COLOR[wsStatus]}`} />
+        <span className={`text-[11px] ${dotColor}`}>{wsLabel}</span>
       </div>
     </header>
   );

@@ -2,81 +2,65 @@
 REST API entry-point — FastAPI application factory.
 Run: uvicorn api.server:app --reload --port 8000
 
-This module is intentionally thin: lifespan, middleware, and router registration.
-Business logic lives in api/routers/*.  Session state lives in api/state.
-DB module references live in api/db (patched by tests at api.db.*).
+Intentionally thin: lifespan, middleware, router registration.
+Business logic lives in api/routers/*.  Session state in api/state.
+DB module references in api/db (patched by tests at api.db.*).
 """
+import asyncio
 import logging
 import os
-import sys
 import time
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
+import sys
 
+_active_tasks: set[asyncio.Task] = set()
+
+
+def _track_task(coro):
+    """Create a tracked background task that cancels cleanly on shutdown."""
+    task = asyncio.create_task(coro)
+    _active_tasks.add(task)
+    task.add_done_callback(_active_tasks.discard)
+    return task
+
+# Ensure project root is importable in all execution contexts
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from config.logging import setup_logging
+from config.settings import load_config
 
-# ── #13 Structured JSON logging ───────────────────────────────────────────────
-
-def _setup_logging() -> None:
-    log_format = os.getenv("LOG_FORMAT", "text")
-    level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
-
-    if log_format == "json":
-        try:
-            import json as _json
-
-            class _JsonFormatter(logging.Formatter):
-                def format(self, record: logging.LogRecord) -> str:
-                    payload = {
-                        "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
-                        "level": record.levelname,
-                        "logger": record.name,
-                        "msg": record.getMessage(),
-                    }
-                    if record.exc_info:
-                        payload["exc"] = self.formatException(record.exc_info)
-                    return _json.dumps(payload)
-
-            handler = logging.StreamHandler()
-            handler.setFormatter(_JsonFormatter())
-            logging.root.handlers = [handler]
-        except Exception:
-            pass
-
-    logging.basicConfig(level=level)
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-
-
-_setup_logging()
+setup_logging()
 logger = logging.getLogger(__name__)
 
-# Keep these module-level imports so tests can patch api.server.init_db / api.server.scheduler
+# Keep these module-level imports so tests can patch api.server.init_db / scheduler
 from db.history import init_db
 from core import scheduler as _sched_mod
 from core.scheduler import scheduler  # noqa: F401  — re-exported for test patches
-from core.events import event_bus  # noqa: F401
-from config.settings import load_config
+from core.events import event_bus      # noqa: F401
+from core.rbac import rbac_middleware
 
 import api.db as _db
 import api.state as _state
 
 from api.routers import chat, sessions, knowledge, agents, ops, workflows, ws
+from api.routers import multimodal, platform, intelligence
+from core import sse as _sse_mod
 
 config = load_config()
 
-# ── Rate limiter state (kept here so tests can access api.server._rate_windows) ──
+# ── Rate limiter ──────────────────────────────────────────────────────────────
 _RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_RPM", "60"))
 _RATE_WINDOW_MAX_IPS = 10_000
 _rate_windows: dict[str, list[float]] = defaultdict(list)
 
-# ── #1 API key auth (opt-in via API_KEY env var) ──────────────────────────────
+# ── API key auth ──────────────────────────────────────────────────────────────
 _API_KEY = os.getenv("API_KEY", "")
 _AUTH_SKIP_PREFIXES = ("/docs", "/openapi", "/redoc", "/health")
 
@@ -85,27 +69,19 @@ _AUTH_SKIP_PREFIXES = ("/docs", "/openapi", "/redoc", "/health")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    mongo_url = config.get("mongo_url", "mongodb://mongo:27017")
+    mongo_url = config["mongo_url"]
     db = await init_db(mongo_url)
 
-    # Wire all DB modules to the same Motor database
-    for mod in (
-        _db.memory_db, _db.analytics_db, _db.prompts_db, _db.feedback_db,
-        _db.rag_db, _db.file_versions_db, _db.cache_db, _db.personas_db,
-        _db.tags_db, _db.agent_checkpoints_db, _db.collab_graph_db,
-        _db.macros_db, _db.batch_db, _db.workflows_db, _db.experiments_db,
-        _db.prompt_versions_db, _db.tenants_db,
-    ):
+    # Wire all DB modules to the shared Motor database (#1 — single loop)
+    for mod in _db.ALL_DB_MODULES:
         mod.set_db(db)
 
-    # Ensure indexes (best-effort)
-    for mod in (
-        _db.workflows_db, _db.experiments_db, _db.prompt_versions_db, _db.tenants_db,
-        _db.feedback_db, _db.rag_db, _db.file_versions_db, _db.cache_db,
-        _db.personas_db, _db.tags_db, _db.agent_checkpoints_db,
-        _db.collab_graph_db, _db.macros_db, _db.batch_db,
-    ):
-        await mod.ensure_indexes()
+    # Ensure indexes best-effort (#1 — single loop from registry)
+    for mod in _db.INDEXABLE_DB_MODULES:
+        try:
+            await mod.ensure_indexes()
+        except Exception:
+            logger.exception("ensure_indexes failed for %s", mod.__name__ if hasattr(mod, '__name__') else mod)
 
     # Wire scheduler and warm up Ollama models
     default_orch = await _state.get_session("default")
@@ -115,9 +91,18 @@ async def lifespan(app: FastAPI):
     try:
         await default_orch.llm.refresh_ollama_models()
     except Exception:
-        pass
+        logger.debug("Ollama warm-up skipped (not available)")
 
     yield
+
+    # ── Graceful shutdown: cancel tracked background tasks ────────────────────
+    pending = list(_active_tasks)
+    if pending:
+        logger.info("Cancelling %d active background tasks on shutdown…", len(pending))
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        logger.info("Shutdown complete.")
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -145,7 +130,18 @@ app.add_middleware(
 )
 
 
-# ── #14 X-Request-ID middleware ───────────────────────────────────────────────
+# ── #8 Structured error handler ───────────────────────────────────────────────
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "type": type(exc).__name__},
+    )
+
+
+# ── Middleware stack ───────────────────────────────────────────────────────────
 
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
@@ -155,13 +151,11 @@ async def request_id_middleware(request: Request, call_next):
     return response
 
 
-# ── #1 API key authentication middleware ──────────────────────────────────────
-
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     if not _API_KEY:
         return await call_next(request)
-    if request.url.path.startswith(_AUTH_SKIP_PREFIXES):
+    if any(request.url.path.startswith(p) for p in _AUTH_SKIP_PREFIXES):
         return await call_next(request)
     auth = request.headers.get("Authorization", "")
     token = auth.removeprefix("Bearer ").strip()
@@ -170,19 +164,46 @@ async def auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-# ── Rate limiting middleware ───────────────────────────────────────────────────
+app.middleware("http")(rbac_middleware)
+
+
+_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com; "
+    "img-src 'self' data:; "
+    "connect-src 'self' ws: wss:;"
+)
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Content-Security-Policy"] = _CSP
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
+
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     client_ip = request.client.host if request.client else "unknown"
     now = time.time()
-    _rate_windows[client_ip] = [t for t in _rate_windows[client_ip] if now - t < 60]
-    if len(_rate_windows[client_ip]) >= _RATE_LIMIT_REQUESTS:
+    window = _rate_windows[client_ip]
+    # Slide window: drop timestamps older than 60s
+    cutoff = now - 60
+    while window and window[0] < cutoff:
+        window.pop(0)
+    if len(window) >= _RATE_LIMIT_REQUESTS:
         return JSONResponse(
             status_code=429,
             content={"detail": "Rate limit exceeded. Please slow down."},
         )
-    _rate_windows[client_ip].append(now)
+    window.append(now)
+    # Evict stale IPs to bound memory
     if len(_rate_windows) > _RATE_WINDOW_MAX_IPS:
         stale = [ip for ip, ts in list(_rate_windows.items()) if not ts]
         for ip in stale:
@@ -192,15 +213,33 @@ async def rate_limit_middleware(request: Request, call_next):
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 
-app.include_router(ops.router)                           # includes GET /
-app.include_router(chat.router,      tags=["Chat"])
-app.include_router(sessions.router,  tags=["Sessions"])
-app.include_router(knowledge.router, tags=["Knowledge"])
-app.include_router(agents.router,    tags=["Agents"])
-app.include_router(workflows.router, tags=["Workflows"])
-app.include_router(ws.router,        tags=["WebSocket"])
+app.include_router(ops.router)
+app.include_router(chat.router,         tags=["Chat"])
+app.include_router(sessions.router,     tags=["Sessions"])
+app.include_router(knowledge.router,    tags=["Knowledge"])
+app.include_router(agents.router,       tags=["Agents"])
+app.include_router(workflows.router,    tags=["Workflows"])
+app.include_router(ws.router,           tags=["WebSocket"])
+app.include_router(multimodal.router,   tags=["Multimodal"])
+app.include_router(platform.router,     tags=["Platform"])
+app.include_router(intelligence.router, tags=["Intelligence"])
+app.include_router(_sse_mod.router,     tags=["Events"])
+
+# ── /api/v1/* aliases (versioned access) ─────────────────────────────────────
+from fastapi import APIRouter as _APIRouter  # noqa: E402
+_v1 = _APIRouter(prefix="/api/v1")
+_v1.include_router(ops.router)
+_v1.include_router(chat.router,         tags=["Chat"])
+_v1.include_router(sessions.router,     tags=["Sessions"])
+_v1.include_router(knowledge.router,    tags=["Knowledge"])
+_v1.include_router(agents.router,       tags=["Agents"])
+_v1.include_router(workflows.router,    tags=["Workflows"])
+_v1.include_router(multimodal.router,   tags=["Multimodal"])
+_v1.include_router(platform.router,     tags=["Platform"])
+_v1.include_router(intelligence.router, tags=["Intelligence"])
+app.include_router(_v1)
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host=config["api_host"], port=config["api_port"], reload=True)

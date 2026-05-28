@@ -28,6 +28,8 @@ class ChatRequest(BaseModel):
     image_base64: str | None = None
     image_url: str | None = None
     persona: str = ""
+    show_scratchpad: bool = False      # #3 chain-of-thought
+    enable_self_eval: bool = False     # #2 self-evaluation loop
 
     @field_validator("session_id")
     @classmethod
@@ -42,6 +44,9 @@ class ChatResponse(BaseModel):
     tools_used: list[str]
     reasoning: str
     duration_ms: int = 0
+    scratchpad: str = ""               # #3 chain-of-thought
+    confidence: float = -1.0          # #6 confidence score (-1 = not computed)
+    self_eval_score: float = -1.0     # #2 self-eval score (-1 = not run)
 
 
 class CompareRequest(BaseModel):
@@ -292,3 +297,92 @@ class PromptVersionRequest(BaseModel):
     bump: str = Field(default="patch", pattern="^(major|minor|patch)$")
     author: str = "api"
     changelog: str = ""
+
+
+# ── New feature models ────────────────────────────────────────────────────────
+
+class MemoryFactRequest(BaseModel):
+    """#1 — Memory graph fact upsert."""
+    entity: str = Field(..., min_length=1, max_length=200)
+    relation: str = Field(..., min_length=1, max_length=100)
+    value: str = Field(..., min_length=1, max_length=2000)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class AsyncChatRequest(BaseModel):
+    """#27 — Async chat queue."""
+    message: _Message
+    session_id: str = "default"
+    preferred_model: str = ""
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        return _check_session_id(v)
+
+
+class WebhookRegisterRequest(BaseModel):
+    """#29 — Outbound webhook registration."""
+    session_id: str = Field(..., min_length=1, max_length=64)
+    url: str = Field(..., min_length=8, max_length=500)
+    events: list[str] = Field(default_factory=lambda: ["agent_done"])
+    secret: str = ""
+
+
+class CanaryRequest(BaseModel):
+    """#30 — Canary deployment config."""
+    stable_prompt: str
+    canary_prompt: str
+    canary_pct: float = Field(default=10.0, ge=1.0, le=50.0)
+
+
+class DynamicToolRequest(BaseModel):
+    """#4 — Dynamic tool generation."""
+    name: str = Field(pattern=r"^[a-zA-Z0-9_]{1,32}$")
+    description: str = Field(..., min_length=10, max_length=500)
+
+
+class DelegateRequest(BaseModel):
+    """#5 — Agent delegation chain."""
+    message: _Message
+    from_agent: str
+    to_agent: str
+    session_id: str = "default"
+    model: str = ""
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        return _check_session_id(v)
+
+
+class PlaygroundRequest(BaseModel):
+    """#12 — Prompt playground: run across multiple agents/models."""
+    prompt: _Message
+    session_id: str = "default"
+    agents: list[str] = Field(default_factory=list)
+    models: list[str] = Field(default_factory=list)
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        return _check_session_id(v)
+
+
+class SessionForkRequest(BaseModel):
+    """#13 — Session forking."""
+    new_session_id: str = Field(pattern=r"^[a-zA-Z0-9_\-]{1,64}$")
+    at_message_index: int = Field(default=-1, description="Fork at this message index; -1 = full history")
+
+
+class DigestScheduleRequest(BaseModel):
+    """#11 — Scheduled digest."""
+    session_id: str = "default"
+    frequency: str = Field(default="daily", pattern="^(daily|weekly)$")
+    hour_utc: int = Field(default=9, ge=0, le=23)
+    email: str = ""  # optional delivery address (display only; email sending not implemented)
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        return _check_session_id(v)
