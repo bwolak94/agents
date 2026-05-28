@@ -6,9 +6,11 @@ This module is intentionally thin: lifespan, middleware, and router registration
 Business logic lives in api/routers/*.  Session state lives in api/state.
 DB module references live in api/db (patched by tests at api.db.*).
 """
+import logging
 import os
 import sys
 import time
+import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,6 +20,42 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+
+# ── #13 Structured JSON logging ───────────────────────────────────────────────
+
+def _setup_logging() -> None:
+    log_format = os.getenv("LOG_FORMAT", "text")
+    level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+
+    if log_format == "json":
+        try:
+            import json as _json
+
+            class _JsonFormatter(logging.Formatter):
+                def format(self, record: logging.LogRecord) -> str:
+                    payload = {
+                        "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+                        "level": record.levelname,
+                        "logger": record.name,
+                        "msg": record.getMessage(),
+                    }
+                    if record.exc_info:
+                        payload["exc"] = self.formatException(record.exc_info)
+                    return _json.dumps(payload)
+
+            handler = logging.StreamHandler()
+            handler.setFormatter(_JsonFormatter())
+            logging.root.handlers = [handler]
+        except Exception:
+            pass
+
+    logging.basicConfig(level=level)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+
+_setup_logging()
+logger = logging.getLogger(__name__)
 
 # Keep these module-level imports so tests can patch api.server.init_db / api.server.scheduler
 from db.history import init_db
@@ -37,6 +75,10 @@ config = load_config()
 _RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_RPM", "60"))
 _RATE_WINDOW_MAX_IPS = 10_000
 _rate_windows: dict[str, list[float]] = defaultdict(list)
+
+# ── #1 API key auth (opt-in via API_KEY env var) ──────────────────────────────
+_API_KEY = os.getenv("API_KEY", "")
+_AUTH_SKIP_PREFIXES = ("/docs", "/openapi", "/redoc", "/health")
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -103,6 +145,31 @@ app.add_middleware(
 )
 
 
+# ── #14 X-Request-ID middleware ───────────────────────────────────────────────
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = rid
+    return response
+
+
+# ── #1 API key authentication middleware ──────────────────────────────────────
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if not _API_KEY:
+        return await call_next(request)
+    if request.url.path.startswith(_AUTH_SKIP_PREFIXES):
+        return await call_next(request)
+    auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    if token != _API_KEY:
+        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
+    return await call_next(request)
+
+
 # ── Rate limiting middleware ───────────────────────────────────────────────────
 
 @app.middleware("http")
@@ -125,13 +192,13 @@ async def rate_limit_middleware(request: Request, call_next):
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 
-app.include_router(ops.router)       # includes GET /
-app.include_router(chat.router)
-app.include_router(sessions.router)
-app.include_router(knowledge.router)
-app.include_router(agents.router)
-app.include_router(workflows.router)
-app.include_router(ws.router)
+app.include_router(ops.router)                           # includes GET /
+app.include_router(chat.router,      tags=["Chat"])
+app.include_router(sessions.router,  tags=["Sessions"])
+app.include_router(knowledge.router, tags=["Knowledge"])
+app.include_router(agents.router,    tags=["Agents"])
+app.include_router(workflows.router, tags=["Workflows"])
+app.include_router(ws.router,        tags=["WebSocket"])
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ LangGraph-style DAG workflow engine.
 Supports:
 - Nodes (sync or async callables)
 - Conditional edges (router functions)
-- Human-in-the-loop (pause/resume via MongoDB)
+- Human-in-the-loop (pause/resume via asyncio.Event — #27)
 - Persistent state snapshots
 - WebSocket streaming of state transitions
 - Special START and END node names
@@ -19,6 +19,25 @@ logger = logging.getLogger(__name__)
 
 START = "__start__"
 END = "__end__"
+
+# #27 — asyncio.Event registry for human-in-loop; keyed by run_id
+# Maps run_id → (event, response_holder list)
+_human_events: dict[str, tuple[asyncio.Event, list[str]]] = {}
+
+
+def set_human_response(run_id: str, response: str) -> bool:
+    """Signal that a human response is available for a paused workflow run.
+
+    Returns True if the run was waiting, False if run_id not found.
+    """
+    entry = _human_events.get(run_id)
+    if entry is None:
+        return False
+    event, holder = entry
+    holder.clear()
+    holder.append(response)
+    event.set()
+    return True
 
 
 @dataclass
@@ -216,23 +235,18 @@ class StateGraph:
 
     async def _wait_for_human(self, run_id: str, state: GraphState,
                                timeout: float = 300.0) -> GraphState:
-        """Poll MongoDB until human_response is available (max 5 min)."""
-        elapsed = 0.0
-        interval = 1.0
-        while elapsed < timeout:
-            await asyncio.sleep(interval)
-            elapsed += interval
-            try:
-                from db.workflows import get_run
-                run = await get_run(run_id)
-                if run and not run.get("human_input_pending", True):
-                    resp = run["state"].get("human_response", "")
-                    state["human_response"] = resp
-                    return state
-            except Exception:
-                pass
-        logger.warning("Human-in-loop timed out for run %s", run_id)
-        state["human_response"] = ""
+        """#27 — Wait for human response via asyncio.Event (replaces MongoDB polling)."""
+        event = asyncio.Event()
+        holder: list[str] = []
+        _human_events[run_id] = (event, holder)
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            state["human_response"] = holder[0] if holder else ""
+        except asyncio.TimeoutError:
+            logger.warning("Human-in-loop timed out for run %s", run_id)
+            state["human_response"] = ""
+        finally:
+            _human_events.pop(run_id, None)
         return state
 
 

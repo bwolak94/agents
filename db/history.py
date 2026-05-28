@@ -55,6 +55,13 @@ async def init_db(mongo_url: str):
     return _db
 
 
+def reset_db() -> None:
+    """#11 — Reset module-level DB state. For use in tests only."""
+    global _client, _db
+    _client = None
+    _db = None
+
+
 async def load_history(session_id: str) -> list:
     """Return list of messages for display in the UI."""
     doc = await _db["conversations"].find_one(

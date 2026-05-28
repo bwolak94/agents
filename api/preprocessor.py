@@ -12,11 +12,15 @@ import os
 from pathlib import Path
 
 # ─── Allowed base dirs for @file injection (security) ─────────────────────────
-_ALLOWED_ROOTS = [
-    Path.home(),
-    Path("/tmp"),
-    Path("/var/tmp"),
-]
+# #3 — Use ALLOWED_FILE_ROOTS env var (colon-separated paths).
+# If unset, only /tmp and /var/tmp are permitted (no home-dir access by default).
+def _build_allowed_roots() -> list[Path]:
+    env = os.getenv("ALLOWED_FILE_ROOTS", "")
+    if env:
+        return [Path(p.strip()).expanduser().resolve() for p in env.split(":") if p.strip()]
+    return [Path("/tmp"), Path("/var/tmp")]
+
+_ALLOWED_ROOTS: list[Path] = _build_allowed_roots()
 _MAX_FILE_SIZE = 100_000  # 100KB cap per injected file
 
 # ─── Model prefix patterns ────────────────────────────────────────────────────

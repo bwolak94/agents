@@ -137,6 +137,9 @@ async def resume_workflow(run_id: str, req: HumanResumeRequest):
     state = await _db.workflows_db.resume_run(run_id, req.human_response)
     if state is None:
         raise HTTPException(status_code=400, detail="Run not paused or not found")
+    # #27 — signal asyncio.Event so the in-process workflow wakes up immediately
+    from core.graph import set_human_response
+    set_human_response(run_id, req.human_response)
     return {"status": "resumed", "run_id": run_id}
 
 

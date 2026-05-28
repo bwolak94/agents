@@ -139,7 +139,8 @@ def _configure_mocks(mocks: dict) -> None:
     mocks["scheduler"].set_handler = MagicMock()
 
 
-@pytest.fixture(scope="module")
+# #23 — Use function scope so each test class gets a clean client/session state.
+@pytest.fixture(scope="function")
 def client():
     from contextlib import ExitStack
     mock_orch = _make_mock_orchestrator()
@@ -422,3 +423,81 @@ class TestMarketplaceEndpoint:
         resp = client.post("/marketplace/code_agent/install")
         assert resp.status_code == 200
         assert resp.json()["status"] == "already_available"
+
+
+# ─── #22 Negative / edge-case tests ──────────────────────────────────────────
+
+class TestNegativeCases:
+    def test_chat_message_too_long_returns_422(self, client):
+        """#2 — 50,001-char message must be rejected before hitting the LLM."""
+        resp = client.post("/chat", json={"message": "x" * 50_001, "session_id": "default"})
+        assert resp.status_code == 422
+
+    def test_chat_empty_message_returns_422(self, client):
+        """#2 — Empty message (min_length=1) must be rejected."""
+        resp = client.post("/chat", json={"message": "", "session_id": "default"})
+        assert resp.status_code == 422
+
+    def test_chat_invalid_session_id_characters(self, client):
+        """Session IDs with spaces/special chars must be rejected."""
+        resp = client.post("/chat", json={"message": "hi", "session_id": "bad session!"})
+        assert resp.status_code == 422
+
+    def test_chat_session_id_too_long(self, client):
+        """Session IDs longer than 64 chars must be rejected."""
+        resp = client.post("/chat", json={"message": "hi", "session_id": "a" * 65})
+        assert resp.status_code == 422
+
+    def test_workflow_not_found_returns_404(self, client):
+        resp = client.get("/workflows/definitely-does-not-exist")
+        assert resp.status_code == 404
+
+    def test_workflow_run_not_found_returns_404(self, client):
+        resp = client.get("/workflows/runs/no-such-run")
+        assert resp.status_code == 404
+
+    def test_tenant_not_found_returns_404(self, client):
+        resp = client.get("/tenants/no-such-tenant")
+        assert resp.status_code == 404
+
+    def test_persona_delete_nonexistent_returns_404(self, client):
+        with patch("api.db.personas_db") as mock_p:
+            mock_p.delete_persona = AsyncMock(return_value=False)
+            resp = client.delete("/personas/no-such-persona")
+        assert resp.status_code == 404
+
+    def test_macro_delete_nonexistent_returns_404(self, client):
+        with patch("api.db.macros_db") as mock_m:
+            mock_m.delete_macro = AsyncMock(return_value=False)
+            resp = client.delete("/macros/no-such-macro")
+        assert resp.status_code == 404
+
+    def test_marketplace_install_unknown_agent_returns_404(self, client):
+        resp = client.post("/marketplace/no-such-agent/install")
+        assert resp.status_code == 404
+
+    def test_git_diff_empty_returns_400(self, client):
+        resp = client.post("/chat/git-diff", json={"diff": "   ", "session_id": "default"})
+        assert resp.status_code == 400
+
+    def test_debate_rounds_out_of_range(self, client):
+        resp = client.post("/chat/debate", json={
+            "topic": "AI safety", "session_id": "default", "rounds": 10
+        })
+        assert resp.status_code == 422
+
+    def test_variants_count_out_of_range(self, client):
+        resp = client.post("/chat/variants", json={
+            "message": "hello", "session_id": "default", "count": 10
+        })
+        assert resp.status_code == 422
+
+    def test_schedule_delay_exceeds_max(self, client):
+        resp = client.post("/schedule", json={
+            "session_id": "default", "prompt": "hello", "delay_seconds": 90000
+        })
+        assert resp.status_code == 422
+
+    def test_experiment_not_found_returns_404(self, client):
+        resp = client.get("/experiments/no-such-experiment")
+        assert resp.status_code == 404

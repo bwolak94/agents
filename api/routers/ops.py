@@ -44,6 +44,7 @@ async def get_stats(session_id: str = "default"):
 
 
 @router.get("/analytics")
+@router.get("/analytics/summary")
 async def get_analytics(days: int = Query(default=30, ge=1, le=365)):
     return await _db.analytics_db.get_summary(days)
 

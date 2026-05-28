@@ -2,7 +2,7 @@
 
 export const dynamic = "force-dynamic";
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import type { CSSProperties } from "react";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -56,6 +56,40 @@ export default function WorkflowBuilderPage() {
   const [dragging, setDragging] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
   const [selectedNode, setSelectedNode] = useState<NodeDef | null>(null);
   const svgRef = useRef<SVGSVGElement>(null);
+
+  // #26 — WebSocket: update run status in real-time
+  useEffect(() => {
+    const wsUrl = API.replace(/^http/, "ws") + "/ws?session_id=workflow-builder";
+    let ws: WebSocket | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    function connect() {
+      ws = new WebSocket(wsUrl);
+      ws.onmessage = (e) => {
+        try {
+          const ev = JSON.parse(e.data as string);
+          if (ev.type === "ping") return;
+          if (ev.run_id) {
+            const statusLabel =
+              ev.type === "workflow_done"          ? "done" :
+              ev.type === "workflow_node_error"     ? "error" :
+              ev.type === "waiting_for_human"       ? "waiting" :
+              ev.type.startsWith("workflow_node_") ? "running" : undefined;
+            if (statusLabel) {
+              setRuns(prev => prev.map(r => r.run_id === ev.run_id ? { ...r, status: statusLabel } : r));
+            }
+          }
+        } catch { /* ignore */ }
+      };
+      ws.onclose = () => { timer = setTimeout(connect, 3000); };
+    }
+
+    connect();
+    return () => {
+      if (timer) clearTimeout(timer);
+      ws?.close();
+    };
+  }, []);
 
   // ─── Drag ──────────────────────────────────────────────────────────────────
   const onMouseDown = (e: React.MouseEvent, node: NodeDef) => {

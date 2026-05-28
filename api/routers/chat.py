@@ -143,8 +143,7 @@ async def chat(req: ChatRequest):
     except HTTPException:
         raise
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logger.exception("Unhandled error in /chat")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -152,6 +151,7 @@ async def chat(req: ChatRequest):
 async def chat_stream(req: ChatRequest):
     async def generate():
         lock = await _state.session_manager.acquire_lock(req.session_id)
+        t_start = time.time()
         try:
             orch = await _state.get_session(req.session_id)
             decision = await orch.router.route(req.message, orch.conversation_history)
@@ -161,6 +161,15 @@ async def chat_stream(req: ChatRequest):
             )
         finally:
             lock.release()
+        duration_ms = int((time.time() - t_start) * 1000)
+        # #15 — record analytics for stream endpoint
+        try:
+            await _db.analytics_db.record_request(
+                session_id=req.session_id, agent=decision.agent, model=decision.model,
+                tools=decision.tools, duration_ms=duration_ms, cost_usd=0, context_pct=0,
+            )
+        except Exception as exc:
+            logger.warning("Analytics failed in /chat/stream: %s", exc)
         yield f"data: {json.dumps({'type': 'routing', 'model': decision.model, 'agent': decision.agent, 'tools': decision.tools})}\n\n"
         yield f"data: {json.dumps({'type': 'response', 'content': response})}\n\n"
         yield "data: [DONE]\n\n"
@@ -238,14 +247,33 @@ async def chat_fan_out(req: FanOutRequest):
     from agents.agents import AGENT_REGISTRY
     agents = req.agents or list(AGENT_REGISTRY.keys())[:4]
     orch = await _state.get_session(req.session_id)
-    return await orch.run_fan_out(message=req.message, agents=agents, session_id=req.session_id, model=req.model)
+    t_start = time.time()
+    result = await orch.run_fan_out(message=req.message, agents=agents, session_id=req.session_id, model=req.model)
+    # #15 — record analytics
+    try:
+        await _db.analytics_db.record_request(
+            session_id=req.session_id, agent="fan_out", model=req.model,
+            tools=[], duration_ms=int((time.time() - t_start) * 1000), cost_usd=0, context_pct=0,
+        )
+    except Exception as exc:
+        logger.warning("Analytics failed in /chat/fan-out: %s", exc)
+    return result
 
 
 @router.post("/chat/pipeline")
 async def chat_pipeline(req: HandoffPipelineRequest):
     validate_session_id(req.session_id)
     orch = await _state.get_session(req.session_id)
+    t_start = time.time()
     result = await orch.run_pipeline(message=req.message, pipeline=req.pipeline, session_id=req.session_id)
+    # #15 — record analytics
+    try:
+        await _db.analytics_db.record_request(
+            session_id=req.session_id, agent="pipeline", model="",
+            tools=[], duration_ms=int((time.time() - t_start) * 1000), cost_usd=0, context_pct=0,
+        )
+    except Exception as exc:
+        logger.warning("Analytics failed in /chat/pipeline: %s", exc)
     return {"response": result, "steps": len(req.pipeline)}
 
 
@@ -253,10 +281,19 @@ async def chat_pipeline(req: HandoffPipelineRequest):
 async def chat_debate(req: DebateRequest):
     validate_session_id(req.session_id)
     orch = await _state.get_session(req.session_id)
+    t_start = time.time()
     result = await orch.run_debate(
         topic=req.topic, session_id=req.session_id,
         rounds=req.rounds, model_a=req.model_a, model_b=req.model_b,
     )
+    # #15 — record analytics
+    try:
+        await _db.analytics_db.record_request(
+            session_id=req.session_id, agent="debate", model=f"{req.model_a}/{req.model_b}",
+            tools=[], duration_ms=int((time.time() - t_start) * 1000), cost_usd=0, context_pct=0,
+        )
+    except Exception as exc:
+        logger.warning("Analytics failed in /chat/debate: %s", exc)
     return {"response": result, "topic": req.topic, "rounds": req.rounds}
 
 

@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
 MAX_TOKENS_BY_COMPLEXITY = {"low": 1024, "medium": 2048, "high": 4096}
 MAX_RESPONSE_IN_HISTORY = 2000
 HISTORY_WINDOW = 20
-SUMMARIZE_THRESHOLD = 16
+# #10 — Make summarization threshold configurable via env var
+SUMMARIZE_THRESHOLD = int(__import__("os").getenv("SUMMARIZE_THRESHOLD", "16"))
 MAX_PARALLEL_SUBTASKS = 3
 
 SUMMARIZE_PROMPT = """Summarize the conversation so far in 3-5 concise bullet points.

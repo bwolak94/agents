@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 _SESSION_RATE_LIMIT = int(os.getenv("SESSION_RATE_LIMIT_RPM", "20"))
 _MAX_REQUEST_COST_USD = float(os.getenv("MAX_REQUEST_COST_USD", "0"))
+# #8 — LRU cap: evict oldest session when limit is hit
+_MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "200"))
 
 
 class SessionManager:
@@ -72,6 +74,13 @@ class SessionManager:
             del self._request_ids[k]
 
         if session_id not in self._sessions:
+            # #8 — LRU eviction when at capacity
+            if len(self._sessions) >= _MAX_SESSIONS:
+                lru_key = min(self._sessions, key=lambda k: self._sessions[k][1])
+                del self._sessions[lru_key]
+                self._session_locks.pop(lru_key, None)
+                logger.debug("LRU evicted session %s (capacity=%d)", lru_key, _MAX_SESSIONS)
+
             orch = AgentOrchestrator(self._config)
             try:
                 orch.conversation_history = await _db.load_context(session_id)
@@ -180,7 +189,7 @@ async def _auto_title_session(session_id: str, first_message: str, orch: AgentOr
         )
         await _db.set_session_title(session_id, title.strip()[:80])
     except Exception:
-        pass
+        logger.debug("_auto_title_session failed for %s", session_id, exc_info=True)
 
 
 async def _auto_tag_session(session_id: str, message: str, response: str, orch: AgentOrchestrator) -> None:
@@ -202,4 +211,4 @@ async def _auto_tag_session(session_id: str, message: str, response: str, orch: 
         if tags:
             await _db.add_auto_tags(session_id, tags)
     except Exception:
-        pass
+        logger.debug("_auto_tag_session failed for %s", session_id, exc_info=True)

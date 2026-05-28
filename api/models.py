@@ -1,7 +1,11 @@
 """All Pydantic request/response models — no business logic."""
+from typing import Annotated
 from pydantic import BaseModel, Field, field_validator
 
 from api.validators import SESSION_ID_RE
+
+# #2 — Limit message length to prevent runaway context / cost
+_Message = Annotated[str, Field(min_length=1, max_length=50_000)]
 
 
 def _check_session_id(v: str) -> str:
@@ -13,7 +17,7 @@ def _check_session_id(v: str) -> str:
 # ── Chat ──────────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    message: str
+    message: _Message
     session_id: str = "default"
     stream: bool = False
     show_routing: bool = False
@@ -41,7 +45,7 @@ class ChatResponse(BaseModel):
 
 
 class CompareRequest(BaseModel):
-    message: str
+    message: _Message
     session_id: str = "default"
     models: list[str] = Field(default_factory=list)
 
@@ -52,7 +56,7 @@ class CompareRequest(BaseModel):
 
 
 class StructuredChatRequest(BaseModel):
-    message: str
+    message: _Message
     session_id: str = "default"
     response_schema: dict = Field(default_factory=dict)
     model: str = ""
@@ -64,7 +68,7 @@ class StructuredChatRequest(BaseModel):
 
 
 class HandoffPipelineRequest(BaseModel):
-    message: str
+    message: _Message
     session_id: str = "default"
     pipeline: list[dict] = Field(..., description="List of {agent, model, task_template, tools} steps")
 
@@ -75,7 +79,7 @@ class HandoffPipelineRequest(BaseModel):
 
 
 class DebateRequest(BaseModel):
-    topic: str
+    topic: _Message
     session_id: str = "default"
     rounds: int = Field(default=2, ge=1, le=5)
     model_a: str = "claude"
@@ -88,7 +92,7 @@ class DebateRequest(BaseModel):
 
 
 class FanOutRequest(BaseModel):
-    message: str
+    message: _Message
     session_id: str = "default"
     agents: list[str] = Field(default_factory=list)
     model: str = "claude"
@@ -100,7 +104,7 @@ class FanOutRequest(BaseModel):
 
 
 class VariantsRequest(BaseModel):
-    message: str
+    message: _Message
     session_id: str = "default"
     count: int = Field(default=3, ge=2, le=5)
     temperature: float = Field(default=0.9, ge=0.0, le=2.0)
@@ -124,7 +128,7 @@ class GitDiffRequest(BaseModel):
 
 
 class SupervisorRequest(BaseModel):
-    message: str
+    message: _Message
     session_id: str = "default"
     model: str = ""
 

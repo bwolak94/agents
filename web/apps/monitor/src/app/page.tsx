@@ -28,6 +28,14 @@ interface CollabEdge {
   count: number;
 }
 
+interface AnalyticsTotals {
+  total_requests: number;
+  total_cost_usd: number;
+  avg_duration_ms: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+}
+
 const EVENT_COLORS: Record<string, string> = {
   react_step:             "#6366f1",
   tool_call:              "#f59e0b",
@@ -42,6 +50,7 @@ export default function MonitorPage() {
   const [events, setEvents]       = useState<AgentEvent[]>([]);
   const [health, setHealth]       = useState<ModelHealth>({});
   const [collab, setCollab]       = useState<CollabEdge[]>([]);
+  const [metrics, setMetrics]     = useState<AnalyticsTotals | null>(null);  // #16
   const [connected, setConnected] = useState(false);
   const [error, setError]         = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -100,9 +109,10 @@ export default function MonitorPage() {
 
     async function poll() {
       try {
-        const [hRes, cRes] = await Promise.all([
+        const [hRes, cRes, aRes] = await Promise.all([
           fetch(`${API_URL}/models/health`),
           fetch(`${API_URL}/agents/collab-graph`),
+          fetch(`${API_URL}/analytics/summary`),      // #16
         ]);
         if (cancelled) return;
         if (hRes.ok) {
@@ -112,6 +122,10 @@ export default function MonitorPage() {
         if (cRes.ok) {
           const c = await cRes.json() as { summary?: CollabEdge[] };
           setCollab(c.summary ?? []);
+        }
+        if (aRes.ok) {
+          const a = await aRes.json() as { totals?: AnalyticsTotals };
+          setMetrics(a.totals ?? null);
         }
         setError(null);
       } catch (e) {
@@ -153,6 +167,24 @@ export default function MonitorPage() {
       {error && (
         <div style={{ background: "#7f1d1d", color: "#fca5a5", padding: "0.75rem 1rem", borderRadius: "0.5rem", marginBottom: "1rem", fontSize: "0.875rem" }}>
           {error}
+        </div>
+      )}
+
+      {/* #16 Live Metrics Panel */}
+      {metrics && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "0.75rem", marginBottom: "1rem" }}>
+          {[
+            { label: "Total Requests", value: metrics.total_requests.toLocaleString() },
+            { label: "Total Cost",     value: `$${metrics.total_cost_usd.toFixed(4)}` },
+            { label: "Avg Latency",    value: `${Math.round(metrics.avg_duration_ms)}ms` },
+            { label: "Input Tokens",   value: metrics.total_input_tokens.toLocaleString() },
+            { label: "Output Tokens",  value: metrics.total_output_tokens.toLocaleString() },
+          ].map(({ label, value }) => (
+            <div key={label} style={{ background: "#1e293b", border: "1px solid #334155", borderRadius: "0.75rem", padding: "0.875rem 1rem" }}>
+              <p style={{ margin: 0, color: "#94a3b8", fontSize: "0.75rem", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em" }}>{label}</p>
+              <p style={{ margin: "0.25rem 0 0", fontSize: "1.25rem", fontWeight: 700, color: "#f1f5f9" }}>{value}</p>
+            </div>
+          ))}
         </div>
       )}
 
