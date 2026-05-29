@@ -44,6 +44,10 @@ class EventBus:
     def subscriber_count(self) -> int:
         return len(self._subscribers)
 
+    def subscriber_count_for(self, session_id: str) -> int:
+        """Count subscribers filtering on a specific session_id."""
+        return sum(1 for s in self._subscribers.values() if s == session_id)
+
 
 # Global singleton
 event_bus = EventBus()

@@ -3,6 +3,8 @@
 Agents can fire POSTs to registered URLs when they complete tasks.
 Schema: {webhook_id, session_id, url, events, secret, active, created_at}
 """
+
+__all__ = ["set_db", "ensure_indexes"]
 import hashlib
 import hmac
 import json

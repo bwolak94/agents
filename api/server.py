@@ -7,14 +7,20 @@ Business logic lives in api/routers/*.  Session state in api/state.
 DB module references in api/db (patched by tests at api.db.*).
 """
 import asyncio
+import contextvars
 import logging
 import os
+import re
 import time
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
 import sys
+import httpx
+
+# #21 Correlation-ID context variable — propagated through the async call chain
+correlation_id: contextvars.ContextVar[str] = contextvars.ContextVar("correlation_id", default="")
 
 _active_tasks: set[asyncio.Task] = set()
 
@@ -51,7 +57,7 @@ import api.db as _db
 import api.state as _state
 
 from api.routers import chat, sessions, knowledge, agents, ops, workflows, ws
-from api.routers import multimodal, platform, intelligence, webhook_triggers
+from api.routers import multimodal, platform, intelligence, webhook_triggers, comments, advanced
 from core import sse as _sse_mod
 
 config = load_config()
@@ -84,6 +90,15 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("ensure_indexes failed for %s", mod.__name__ if hasattr(mod, '__name__') else mod)
 
+    # #13 Structured startup log with config summary
+    logger.info(
+        "Agent System starting — mongo=%s max_sessions=%s rate_limit_rpm=%s cost_budget_usd=%s",
+        mongo_url.split("@")[-1] if "@" in mongo_url else mongo_url,
+        os.getenv("MAX_SESSIONS", "200"),
+        os.getenv("RATE_LIMIT_RPM", "60"),
+        os.getenv("COST_BUDGET_USD", "0"),
+    )
+
     # Wire scheduler and warm up Ollama models
     default_orch = await _state.get_session("default")
     _sched_mod.scheduler.set_handler(
@@ -94,8 +109,31 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.debug("Ollama warm-up skipped (not available)")
 
+    # Shared httpx client for all outbound HTTP (webhooks, Ollama, vision) — #1 / #9
+    app.state.http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0),
+        limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+    )
+
+    # #10 Background purge of expired session role tokens (hourly)
+    async def _purge_expired_tokens():
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                from db import session_roles as _sr
+                purged = await _sr.purge_expired()
+                if purged:
+                    logger.debug("Purged %d expired session role tokens", purged)
+            except Exception:
+                logger.debug("Token purge failed", exc_info=True)
+
+    _track_task(_purge_expired_tokens())
+
     yield
 
+    await app.state.http_client.aclose()
+
+    logger.info("Agent System shutting down cleanly.")
     # ── Graceful shutdown: cancel tracked background tasks ────────────────────
     pending = list(_active_tasks)
     if pending:
@@ -133,6 +171,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    max_age=86400,  # #9 Cache CORS preflight for 24h
 )
 
 
@@ -178,6 +217,8 @@ async def body_size_limit_middleware(request: Request, call_next):
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
     rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    # #21 — Set correlation_id in context so it propagates through async tasks
+    correlation_id.set(rid)
     response = await call_next(request)
     response.headers["X-Request-ID"] = rid
     return response
@@ -209,6 +250,8 @@ _CSP = (
 )
 
 
+_ADMIN_PATHS = {"/admin", "/debug", "/logs/client-errors"}
+
 @app.middleware("http")
 async def security_headers_middleware(request: Request, call_next):
     response = await call_next(request)
@@ -217,7 +260,116 @@ async def security_headers_middleware(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    # #26 Vary: Accept-Encoding for correct caching of compressed responses
+    response.headers["Vary"] = "Accept-Encoding"
+    # #10 Cache-Control: no-store on admin/auth endpoints
+    if any(request.url.path.startswith(p) for p in _ADMIN_PATHS):
+        response.headers["Cache-Control"] = "no-store"
     return response
+
+
+# ── #23 Server-Timing headers ─────────────────────────────────────────────────
+
+@app.middleware("http")
+async def server_timing_middleware(request: Request, call_next):
+    t0 = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    response.headers["Server-Timing"] = f"total;dur={elapsed_ms:.1f}"
+    response.headers["Timing-Allow-Origin"] = "*"
+    return response
+
+
+# ── #27 Expensive-endpoint rate limiter ───────────────────────────────────────
+
+from config.constants import EXPENSIVE_RATE_LIMIT_RPM as _EXP_RPM, COST_BUDGET_USD as _COST_BUDGET
+_EXPENSIVE_PATHS = {"/chat/plan", "/chat/red-team", "/chat/fan-out", "/chat/negotiate"}
+_exp_windows: dict[str, list[float]] = defaultdict(list)
+
+
+@app.middleware("http")
+async def expensive_rate_limit_middleware(request: Request, call_next):
+    if request.url.path not in _EXPENSIVE_PATHS or request.method != "POST":
+        return await call_next(request)
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    window = _exp_windows[client_ip]
+    cutoff = now - 60
+    while window and window[0] < cutoff:
+        window.pop(0)
+    if len(window) >= _EXP_RPM:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": f"Rate limit for compute-heavy endpoint ({_EXP_RPM} rpm)", "error_code": "EXPENSIVE_RATE_LIMIT"},
+        )
+    window.append(now)
+    return await call_next(request)
+
+
+# ── #F9 Cost budget guard ─────────────────────────────────────────────────────
+
+_daily_cost_cache: dict[str, float] = {}  # date -> total_cost
+_daily_cost_lock = asyncio.Lock()  # #12 prevent race on cache reads/writes
+
+
+@app.middleware("http")
+async def cost_budget_middleware(request: Request, call_next):
+    if _COST_BUDGET <= 0 or request.url.path not in {"/chat", "/chat/stream", "/chat/plan", "/chat/red-team"}:
+        return await call_next(request)
+    today = time.strftime("%Y-%m-%d")
+    # #12 asyncio.Lock prevents concurrent cache population races
+    async with _daily_cost_lock:
+        cached_cost = _daily_cost_cache.get(today, -1.0)
+        if cached_cost < 0:
+            try:
+                from db.analytics import _db as _adb
+                if _adb is not None:
+                    rows = await _adb["analytics"].aggregate([
+                        {"$match": {"date": today}},
+                        {"$group": {"_id": None, "total": {"$sum": "$cost_usd"}}},
+                    ]).to_list(1)
+                    cached_cost = rows[0]["total"] if rows else 0.0
+                else:
+                    cached_cost = 0.0
+            except Exception:
+                cached_cost = 0.0
+            _daily_cost_cache[today] = cached_cost
+
+    if cached_cost >= _COST_BUDGET:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": f"Daily cost budget ${_COST_BUDGET:.2f} exceeded", "error_code": "BUDGET_EXCEEDED"},
+        )
+    return await call_next(request)
+
+
+_PII_ENABLED = os.getenv("PII_REDACTION", "false").lower() == "true"
+_PII_PATTERNS = [
+    (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"), "[EMAIL]"),
+    (re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"), "[PHONE]"),
+    (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[SSN]"),
+    (re.compile(r"\b(?:4\d{12}(?:\d{3})?|5[1-5]\d{14}|3[47]\d{13}|6(?:011|5\d{2})\d{12})\b"), "[CARD]"),
+]
+_PII_REDACT_PATHS = {"/chat", "/chat/stream", "/chat/plan", "/chat/simulate"}
+
+
+@app.middleware("http")
+async def pii_redaction_middleware(request: Request, call_next):
+    """#20 — Redact PII from request bodies before they reach LLM endpoints."""
+    if _PII_ENABLED and request.url.path in _PII_REDACT_PATHS and request.method == "POST":
+        try:
+            body = await request.body()
+            body_text = body.decode("utf-8", errors="replace")
+            redacted = body_text
+            for pattern, replacement in _PII_PATTERNS:
+                redacted = pattern.sub(replacement, redacted)
+            if redacted != body_text:
+                async def _receive():
+                    return {"type": "http.request", "body": redacted.encode("utf-8"), "more_body": False}
+                request = Request(request.scope, receive=_receive)
+        except Exception:
+            pass
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -229,18 +381,32 @@ async def rate_limit_middleware(request: Request, call_next):
     cutoff = now - 60
     while window and window[0] < cutoff:
         window.pop(0)
+    remaining = max(0, _RATE_LIMIT_REQUESTS - len(window))
+    reset_at = int(window[0] + 60) if window else int(now + 60)
     if len(window) >= _RATE_LIMIT_REQUESTS:
+        # #4 Retry-After + #5 X-RateLimit headers on 429
         return JSONResponse(
             status_code=429,
             content={"detail": "Rate limit exceeded. Please slow down."},
+            headers={
+                "Retry-After": str(reset_at - int(now)),
+                "X-RateLimit-Limit": str(_RATE_LIMIT_REQUESTS),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(reset_at),
+            },
         )
     window.append(now)
-    # Evict stale IPs to bound memory
+    # Evict stale IPs to bound memory — #28 cap dict size
     if len(_rate_windows) > _RATE_WINDOW_MAX_IPS:
         stale = [ip for ip, ts in list(_rate_windows.items()) if not ts]
         for ip in stale:
             del _rate_windows[ip]
-    return await call_next(request)
+    response = await call_next(request)
+    # #5 Add X-RateLimit headers to all responses
+    response.headers["X-RateLimit-Limit"] = str(_RATE_LIMIT_REQUESTS)
+    response.headers["X-RateLimit-Remaining"] = str(remaining - 1)
+    response.headers["X-RateLimit-Reset"] = str(reset_at)
+    return response
 
 
 # ── Routers ───────────────────────────────────────────────────────────────────
@@ -256,6 +422,8 @@ app.include_router(multimodal.router,          tags=["Multimodal"])
 app.include_router(platform.router,            tags=["Platform"])
 app.include_router(intelligence.router,        tags=["Intelligence"])
 app.include_router(webhook_triggers.router,    tags=["Webhooks"])
+app.include_router(comments.router,            tags=["Comments"])
+app.include_router(advanced.router,            tags=["Advanced"])
 app.include_router(_sse_mod.router,            tags=["Events"])
 
 # ── /api/v1/* aliases (versioned access) ─────────────────────────────────────
@@ -271,6 +439,8 @@ _v1.include_router(multimodal.router,          tags=["Multimodal"])
 _v1.include_router(platform.router,            tags=["Platform"])
 _v1.include_router(intelligence.router,        tags=["Intelligence"])
 _v1.include_router(webhook_triggers.router,    tags=["Webhooks"])
+_v1.include_router(comments.router,            tags=["Comments"])
+_v1.include_router(advanced.router,            tags=["Advanced"])
 app.include_router(_v1)
 
 

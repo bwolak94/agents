@@ -2,7 +2,7 @@ import type { Stats, Costs } from '@/types/chat';
 import type { WsStatus } from '@/hooks/useWebSocket';
 import type { Theme } from '@/hooks/useTheme';
 
-export type ViewId = 'chat' | 'analytics' | 'memory';
+export type ViewId = 'chat' | 'analytics' | 'memory' | 'branch' | 'plugins' | 'ab-test';
 
 interface HeaderProps {
   wsStatus: WsStatus;
@@ -12,6 +12,7 @@ interface HeaderProps {
   onViewChange: (view: ViewId) => void;
   theme?: Theme;
   onToggleTheme?: () => void;
+  onVoice?: () => void;
 }
 
 const WS_STATUS_CONFIG: Record<WsStatus, { color: string; label: string }> = {
@@ -31,6 +32,9 @@ const NAV_TABS: { id: ViewId; label: string }[] = [
   { id: 'chat',      label: 'Chat'      },
   { id: 'analytics', label: 'Analytics' },
   { id: 'memory',    label: 'Memory'    },
+  { id: 'branch',    label: 'Branch'    },
+  { id: 'plugins',   label: 'Plugins'   },
+  { id: 'ab-test',   label: 'A/B Test'  },
 ];
 
 interface StatPillProps {
@@ -48,7 +52,7 @@ function StatPill({ label, value, color }: StatPillProps) {
   );
 }
 
-export function Header({ wsStatus, stats, costs, view, onViewChange, theme = 'dark', onToggleTheme }: HeaderProps) {
+export function Header({ wsStatus, stats, costs, view, onViewChange, theme = 'dark', onToggleTheme, onVoice }: HeaderProps) {
   const { color: dotColor, label: wsLabel } = WS_STATUS_CONFIG[wsStatus];
 
   // #28 — keyboard handler for arrow-key nav between tabs
@@ -119,6 +123,18 @@ export function Header({ wsStatus, stats, costs, view, onViewChange, theme = 'da
       <div className="text-[10px] text-border-strong border border-border-base rounded px-1.5 py-0.5 hidden md:block">
         ⌘K
       </div>
+
+      {/* Voice mode */}
+      {onVoice && (
+        <button
+          onClick={onVoice}
+          title="Voice conversation"
+          aria-label="Voice conversation"
+          className="border border-border-strong rounded-md text-text-muted hover:text-text-secondary px-2 py-1 text-sm transition-colors"
+        >
+          mic
+        </button>
+      )}
 
       {/* Theme toggle */}
       {onToggleTheme && (

@@ -1,7 +1,9 @@
 """Webhook triggers — CRUD + fire endpoint."""
+import hashlib
+import hmac
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 import api.db as _db
@@ -49,13 +51,25 @@ async def delete_trigger(trigger_id: str):
 
 
 @router.post("/{trigger_id}/fire")
-async def fire_trigger(trigger_id: str):
-    """Manually fire a trigger — resolves the task template and dispatches to the session agent."""
+async def fire_trigger(
+    trigger_id: str,
+    request: Request,
+    x_hub_signature_256: str = Header(default=""),
+):
+    """Fire a trigger. If the trigger has a secret, validates HMAC-SHA256 signature."""
     trigger = await _db.webhook_triggers_db.get_trigger(trigger_id)
     if not trigger:
         raise HTTPException(status_code=404, detail="Trigger not found")
     if not trigger.get("active"):
         raise HTTPException(status_code=409, detail="Trigger is inactive")
+
+    # #22 HMAC signature validation
+    secret = trigger.get("secret", "")
+    if secret:
+        body = await request.body()
+        expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, x_hub_signature_256):
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     session_id = trigger["session_id"]
     task_template = trigger["task_template"]

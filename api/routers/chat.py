@@ -1,9 +1,13 @@
 """Chat endpoints — /chat/*"""
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import re
 import time
+
+_CHAT_TIMEOUT = float(os.getenv("CHAT_TIMEOUT_SECONDS", "120"))  # #3 per-request timeout
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -106,11 +110,12 @@ async def chat(req: ChatRequest):
             if len(orch.conversation_history) > 20:
                 orch.conversation_history = await orch.smart_compress_history(message)
 
-            response = await orch.process(
-                message=message, stream=False, show_routing=False,
-                session_id=req.session_id, preferred_model=req.preferred_model,
-                enable_reflection=req.enable_reflection, checkpoint_id=req.checkpoint_id,
-            )
+            async with asyncio.timeout(_CHAT_TIMEOUT):  # #3 per-request timeout
+                response = await orch.process(
+                    message=message, stream=False, show_routing=False,
+                    session_id=req.session_id, preferred_model=req.preferred_model,
+                    enable_reflection=req.enable_reflection, checkpoint_id=req.checkpoint_id,
+                )
             duration_ms = int((time.time() - t_start) * 1000)
 
             # #2 — Self-evaluation + confidence-gated retry with different model
@@ -167,6 +172,18 @@ async def chat(req: ChatRequest):
         asyncio.create_task(_state._auto_title_session(req.session_id, message, orch))
         asyncio.create_task(_state._auto_tag_session(req.session_id, message, response, orch))
 
+        # Log request for replay/regression (#13)
+        try:
+            await _db.request_log_db.log_request(
+                session_id=req.session_id,
+                message=message[:500],
+                model=d.model if d else "unknown",
+                response=response[:500],
+                duration_ms=duration_ms,
+            )
+        except Exception as exc:
+            logger.debug("Request log failed: %s", exc)
+
         return ChatResponse(
             response=response,
             model_used=d.model if d else "unknown",
@@ -178,6 +195,8 @@ async def chat(req: ChatRequest):
             confidence=confidence,
             self_eval_score=self_eval_score,
         )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"Request timed out after {_CHAT_TIMEOUT:.0f}s")
     except HTTPException:
         raise
     except Exception as e:
@@ -293,6 +312,16 @@ async def chat_fan_out(req: FanOutRequest):
     orch = await _state.get_session(req.session_id)
     t_start = time.time()
     result = await orch.run_fan_out(message=req.message, agents=agents, session_id=req.session_id, model=req.model)
+    # #21 Deduplicate fan-out responses by content hash before returning
+    if isinstance(result, dict) and "responses" in result:
+        seen_hashes: set[str] = set()
+        deduped = []
+        for r in result["responses"]:
+            h = hashlib.md5(str(r.get("response", "")).encode()).hexdigest()
+            if h not in seen_hashes:
+                seen_hashes.add(h)
+                deduped.append(r)
+        result = {**result, "responses": deduped, "deduped": len(result["responses"]) - len(deduped)}
     # #15 — record analytics
     try:
         await _db.analytics_db.record_request(

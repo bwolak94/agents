@@ -2,9 +2,11 @@
 import asyncio
 import hashlib
 import json
+import time
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
+from pydantic import BaseModel, Field
 
 import api.db as _db
 import api.state as _state
@@ -27,10 +29,16 @@ async def get_history(session_id: str, request: Request):
     etag = f'"{hashlib.md5(body.encode()).hexdigest()}"'
     if request.headers.get("If-None-Match") == etag:
         return Response(status_code=304, headers={"ETag": etag})
+    # #19 Last-Modified header
+    last_modified = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
     return Response(
         content=body,
         media_type="application/json",
-        headers={"ETag": etag, "Cache-Control": "private, max-age=0, must-revalidate"},
+        headers={
+            "ETag": etag,
+            "Cache-Control": "private, max-age=0, must-revalidate",
+            "Last-Modified": last_modified,
+        },
     )
 
 
@@ -342,3 +350,179 @@ async def broadcast(req: BroadcastRequest):
 
     results = await asyncio.gather(*[_send(sid) for sid in req.session_ids])
     return {"message": req.message, "results": list(results)}
+
+
+# ── F2 Session summarization ──────────────────────────────────────────────────
+
+@router.post("/sessions/{session_id}/summarize")
+async def summarize_session(session_id: str, model: str = Query(default="claude")):
+    """Chunk conversation history and produce a rolling summary."""
+    validate_session_id(session_id)
+    messages = await _db.load_history(session_id)
+    if not messages:
+        raise HTTPException(status_code=404, detail="No history for session")
+
+    orch = await _state.get_session(session_id)
+    # Process in chunks of 20 messages
+    chunk_size = 20
+    summaries = []
+    for i in range(0, len(messages), chunk_size):
+        chunk = messages[i:i + chunk_size]
+        combined = "\n".join(
+            f"{m['role'].upper()}: {m.get('content', '')[:400]}" for m in chunk
+        )
+        try:
+            summary = await orch.llm.call(
+                model=model,
+                messages=[{"role": "user", "content": f"Summarize this conversation chunk in 2-3 sentences:\n\n{combined}"}],
+                max_tokens=200, temperature=0.3,
+            )
+            summaries.append({"chunk": i // chunk_size + 1, "summary": summary})
+        except Exception as exc:
+            summaries.append({"chunk": i // chunk_size + 1, "summary": f"[error: {exc}]"})
+
+    # Final rolling summary
+    all_summaries = "\n".join(s["summary"] for s in summaries)
+    try:
+        final = await orch.llm.call(
+            model=model,
+            messages=[{"role": "user", "content": f"Create a single coherent summary from these chunk summaries:\n\n{all_summaries}"}],
+            max_tokens=400, temperature=0.3,
+        )
+    except Exception:
+        final = all_summaries
+
+    return {
+        "session_id": session_id,
+        "total_messages": len(messages),
+        "chunks": len(summaries),
+        "chunk_summaries": summaries,
+        "final_summary": final,
+    }
+
+
+# ── F7 Conversation sentiment analysis ────────────────────────────────────────
+
+@router.get("/sessions/{session_id}/sentiment")
+async def session_sentiment(session_id: str, model: str = Query(default="claude")):
+    """Analyse rolling sentiment across the conversation (positive/neutral/negative per turn)."""
+    validate_session_id(session_id)
+    messages = await _db.load_history(session_id)
+    if not messages:
+        raise HTTPException(status_code=404, detail="No history for session")
+
+    orch = await _state.get_session(session_id)
+    # Sample up to 20 most recent user+assistant pairs
+    pairs = []
+    for i in range(0, len(messages) - 1, 2):
+        if len(pairs) >= 10:
+            break
+        u = messages[i]
+        a = messages[i + 1] if i + 1 < len(messages) else {}
+        pairs.append((u.get("content", "")[:200], a.get("content", "")[:200]))
+
+    results = []
+    for idx, (user_msg, asst_msg) in enumerate(pairs):
+        prompt = (
+            f"Rate the sentiment of this exchange as one of: positive, neutral, negative.\n"
+            f"User: {user_msg}\nAssistant: {asst_msg}\n"
+            "Output ONLY one word: positive, neutral, or negative."
+        )
+        try:
+            sentiment = await orch.llm.call(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=5, temperature=0.1,
+            )
+            sentiment = sentiment.strip().lower()
+            if sentiment not in ("positive", "neutral", "negative"):
+                sentiment = "neutral"
+        except Exception:
+            sentiment = "neutral"
+        results.append({"turn": idx + 1, "sentiment": sentiment})
+
+    counts = {"positive": 0, "neutral": 0, "negative": 0}
+    for r in results:
+        counts[r["sentiment"]] = counts.get(r["sentiment"], 0) + 1
+    dominant = max(counts, key=counts.__getitem__)
+
+    return {
+        "session_id": session_id,
+        "overall": dominant,
+        "breakdown": counts,
+        "turns": results,
+    }
+
+
+# ── F8 Auto-generated session card ────────────────────────────────────────────
+
+@router.get("/sessions/{session_id}/card")
+async def session_card(session_id: str):
+    """Return an auto-generated session summary card with title, tags, stats."""
+    validate_session_id(session_id)
+    messages = await _db.load_history(session_id)
+
+    # Gather metadata in parallel
+    title = await _db.get_session_title(session_id) or "Untitled"
+    tags = await _db.tags_db.get_tags(session_id)
+    stats: dict = {}
+    orch_loaded = False
+    try:
+        orch = await _state.get_session(session_id)
+        stats = orch.llm.get_cost_stats() or {}
+        orch_loaded = True
+    except Exception:
+        pass
+
+    user_msgs = [m for m in messages if m.get("role") == "user"]
+    asst_msgs = [m for m in messages if m.get("role") == "assistant"]
+    first_msg = user_msgs[0].get("content", "")[:100] if user_msgs else ""
+    last_msg = user_msgs[-1].get("content", "")[:100] if user_msgs else ""
+
+    return {
+        "session_id": session_id,
+        "title": title,
+        "tags": tags,
+        "message_count": len(messages),
+        "user_turns": len(user_msgs),
+        "assistant_turns": len(asst_msgs),
+        "first_message_preview": first_msg,
+        "last_message_preview": last_msg,
+        "cost_stats": stats,
+    }
+
+
+# ── F10 Session snapshot ───────────────────────────────────────────────────────
+
+class SnapshotRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    description: str = Field(default="", max_length=500)
+
+
+@router.post("/sessions/{session_id}/snapshot", status_code=201)
+async def create_session_snapshot(session_id: str, req: SnapshotRequest):
+    """Freeze current conversation state as a named snapshot (stored as checkpoint)."""
+    validate_session_id(session_id)
+    messages = await _db.load_history(session_id)
+    if not messages:
+        raise HTTPException(status_code=404, detail="No history to snapshot")
+
+    from db.agent_checkpoints import save_checkpoint
+    snapshot_id = await save_checkpoint(
+        session_id=session_id,
+        agent_type="snapshot",
+        data={
+            "name": req.name,
+            "description": req.description,
+            "messages": messages,
+            "message_count": len(messages),
+            "created_at": __import__("datetime").datetime.utcnow().isoformat(),
+        },
+    )
+    return {
+        "session_id": session_id,
+        "snapshot_id": snapshot_id,
+        "name": req.name,
+        "messages_captured": len(messages),
+        "status": "created",
+    }

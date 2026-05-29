@@ -3,6 +3,9 @@ Webhook triggers — users register external event sources that auto-dispatch ag
 Each trigger: { url_pattern, event_type, session_id, agent_task_template, active }
 """
 import uuid
+
+__all__ = ["set_db", "ensure_indexes", "create_trigger", "list_triggers",
+           "get_trigger", "delete_trigger", "record_fire"]
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorDatabase
 

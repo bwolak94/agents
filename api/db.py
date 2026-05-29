@@ -27,6 +27,12 @@ from db import tenants as tenants_db
 from db import memory_graph as memory_graph_db
 from db import webhooks as webhooks_db
 from db import webhook_triggers as webhook_triggers_db
+from db import comments as comments_db
+from db import session_roles as session_roles_db
+from db import request_log as request_log_db
+from db import insights as insights_db
+from db import plugins as plugins_db
+from db import scheduled_reports as scheduled_reports_db
 
 from db.history import (
     init_db,
@@ -47,7 +53,8 @@ ALL_DB_MODULES = (
     tags_db, agent_checkpoints_db, collab_graph_db,
     macros_db, batch_db, workflows_db, experiments_db,
     prompt_versions_db, tenants_db, memory_graph_db, webhooks_db,
-    webhook_triggers_db,
+    webhook_triggers_db, comments_db, session_roles_db,
+    request_log_db, insights_db, plugins_db, scheduled_reports_db,
 )
 
 # Subset that also implement ensure_indexes():
@@ -55,5 +62,7 @@ INDEXABLE_DB_MODULES = (
     feedback_db, rag_db, file_versions_db, cache_db, personas_db,
     tags_db, agent_checkpoints_db, collab_graph_db, macros_db, batch_db,
     workflows_db, experiments_db, prompt_versions_db, tenants_db,
-    memory_graph_db, webhooks_db, webhook_triggers_db,
+    memory_graph_db, webhooks_db, webhook_triggers_db, comments_db,
+    session_roles_db, request_log_db, insights_db, plugins_db,
+    scheduled_reports_db,
 )

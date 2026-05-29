@@ -1,11 +1,21 @@
 """All Pydantic request/response models — no business logic."""
 from typing import Annotated
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from api.validators import SESSION_ID_RE
 
 # #2 — Limit message length to prevent runaway context / cost
 _Message = Annotated[str, Field(min_length=1, max_length=50_000)]
+
+# #7 Reusable ValidatedSessionId — avoids repeating field_validator in every model
+_ValidatedSessionId = Annotated[
+    str,
+    Field(
+        default="default",
+        pattern=r"^[a-zA-Z0-9_\-]{1,64}$",
+        description="Session identifier (1-64 alphanumeric, hyphens, underscores)",
+    ),
+]
 
 
 def _check_session_id(v: str) -> str:
@@ -17,8 +27,10 @@ def _check_session_id(v: str) -> str:
 # ── Chat ──────────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     message: _Message
-    session_id: str = "default"
+    session_id: _ValidatedSessionId = "default"
     stream: bool = False
     show_routing: bool = False
     request_id: str | None = Field(default=None, description="Idempotency key")
@@ -30,12 +42,6 @@ class ChatRequest(BaseModel):
     persona: str = ""
     show_scratchpad: bool = False      # #3 chain-of-thought
     enable_self_eval: bool = False     # #2 self-evaluation loop
-
-    @field_validator("session_id")
-    @classmethod
-    def validate_session_id(cls, v: str) -> str:
-        return _check_session_id(v)
-
 
 class ChatResponse(BaseModel):
     response: str
@@ -408,3 +414,106 @@ class SimulateRequest(BaseModel):
     @classmethod
     def validate_session_id(cls, v: str) -> str:
         return _check_session_id(v)
+
+
+# ── Round 7 feature models ────────────────────────────────────────────────────
+
+class PlanRequest(BaseModel):
+    """Multi-step planning mode: produce plan, optionally execute."""
+    message: _Message
+    session_id: str = "default"
+    model: str = "claude"
+    execute: bool = Field(default=True, description="If true, execute plan steps after approval")
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        return _check_session_id(v)
+
+
+class RedTeamRequest(BaseModel):
+    """Adversarial red-team: answer vs critic, confidence-adjusted result."""
+    message: _Message
+    session_id: str = "default"
+    model_answerer: str = "claude"
+    model_critic: str = "gemini"
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        return _check_session_id(v)
+
+
+class HandoffRequest(BaseModel):
+    """Structured agent handoff with briefing document."""
+    message: _Message
+    session_id: str = "default"
+    from_agent: str
+    to_agent: str
+    model: str = "claude"
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        return _check_session_id(v)
+
+
+class TestGenRequest(BaseModel):
+    """Auto-generate pytest tests from session history / code snippet."""
+    session_id: str = "default"
+    code: str = Field(default="", max_length=20_000)
+    framework: str = Field(default="pytest", pattern="^(pytest|unittest)$")
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        return _check_session_id(v)
+
+
+class MockGenRequest(BaseModel):
+    """Generate a FastAPI mock router from an OpenAPI spec."""
+    spec: str = Field(..., min_length=10, max_length=50_000, description="OpenAPI JSON or YAML spec")
+    session_id: str = "default"
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        return _check_session_id(v)
+
+
+class DepScanRequest(BaseModel):
+    """Scan requirements.txt or package.json for known vulnerabilities."""
+    content: str = Field(..., min_length=1, max_length=50_000)
+    file_type: str = Field(default="requirements.txt", pattern="^(requirements\\.txt|package\\.json)$")
+
+
+class CommentRequest(BaseModel):
+    author: str = Field(default="user", max_length=64)
+    text: str = Field(..., min_length=1, max_length=2000)
+
+
+class RoleGrantRequest(BaseModel):
+    session_id: str = Field(pattern=r"^[a-zA-Z0-9_\-]{1,64}$")
+    role: str = Field(default="read", pattern="^(read|write|admin)$")
+    ttl_hours: int = Field(default=0, ge=0, le=8760, description="Hours until token expires (0 = never)")
+
+
+class PluginInstallRequest(BaseModel):
+    name: str = Field(pattern=r"^[a-zA-Z0-9_\-]{1,64}$")
+    description: str = Field(..., min_length=10, max_length=500)
+    tool_definition: dict = Field(default_factory=dict)
+    author: str = Field(default="community", max_length=64)
+
+
+class InsightExtractRequest(BaseModel):
+    """Extract cross-session insights from recent sessions."""
+    session_ids: list[str] = Field(default_factory=list, description="Empty = all recent sessions")
+    max_sessions: int = Field(default=20, ge=1, le=100)
+
+    @field_validator("session_ids")
+    @classmethod
+    def validate_ids(cls, ids: list[str]) -> list[str]:
+        for sid in ids:
+            if not SESSION_ID_RE.match(sid):
+                raise ValueError(f"Invalid session_id: {sid}")
+        return ids

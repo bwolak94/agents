@@ -4,11 +4,14 @@ Supports: Claude (Anthropic), Gemini (Google), Ollama (local models)
 """
 import os
 import asyncio
+import logging
 import random
 import sys
 import time
 from typing import Optional
 import httpx
+
+_mgr_logger = logging.getLogger("llm.manager")
 
 
 # ─────────────────────────────────────────
@@ -135,27 +138,65 @@ class LLMManager:
                 cached = None
                 cache_get = cache_put = None  # type: ignore
 
-        result: str
-        if model in ("claude", "claude-haiku"):
-            if "claude" not in self.clients:
-                raise ValueError("Anthropic API key not set. Configure ANTHROPIC_API_KEY.")
-            variant = "haiku" if model == "claude-haiku" else "sonnet"
-            result = await self.clients["claude"].call(
-                messages, system_prompt, max_tokens, temperature, stream, variant,
-                stream_callback=stream_callback,
-            )
+        from config.constants import LLM_TIMEOUT_SECONDS, LLM_FALLBACK_CHAIN
+        timeout = LLM_TIMEOUT_SECONDS
+        t_start = time.perf_counter()
 
-        elif model == "gemini":
-            if "gemini" not in self.clients:
-                raise ValueError("Google API key not set. Configure GEMINI_API_KEY.")
-            result = await self.clients["gemini"].call(messages, system_prompt, max_tokens, temperature, stream)
+        async def _call_model(m: str) -> str:
+            async with asyncio.timeout(timeout):
+                if m in ("claude", "claude-haiku"):
+                    if "claude" not in self.clients:
+                        raise ValueError("Anthropic API key not configured")
+                    variant = "haiku" if m == "claude-haiku" else "sonnet"
+                    return await self.clients["claude"].call(
+                        messages, system_prompt, max_tokens, temperature, stream, variant,
+                        stream_callback=stream_callback,
+                    )
+                elif m == "gemini":
+                    if "gemini" not in self.clients:
+                        raise ValueError("Google API key not configured")
+                    return await self.clients["gemini"].call(
+                        messages, system_prompt, max_tokens, temperature, stream
+                    )
+                elif m.startswith("ollama/"):
+                    ollama_model = m.split("/", 1)[1]
+                    return await self.clients["ollama"].call(
+                        ollama_model, messages, system_prompt, max_tokens, temperature, stream
+                    )
+                else:
+                    raise ValueError(f"Unknown model: {m}")
 
-        elif model.startswith("ollama/"):
-            ollama_model = model.split("/", 1)[1]
-            result = await self.clients["ollama"].call(ollama_model, messages, system_prompt, max_tokens, temperature, stream)
+        # 3-level fallback: try requested model, then fallback chain
+        fallback_chain = [model] + [m for m in LLM_FALLBACK_CHAIN if m != model]
+        last_exc: Exception = ValueError(f"No models available for fallback")
+        result: str = ""
 
+        for attempt_model in fallback_chain:
+            try:
+                result = await _call_model(attempt_model)
+                if attempt_model != model:
+                    _mgr_logger.warning("Fell back from %s → %s", model, attempt_model)
+                self.record_cb_success(attempt_model)
+                break
+            except (ValueError, asyncio.TimeoutError, TimeoutError) as exc:
+                last_exc = exc
+                self.mark_model_unhealthy(attempt_model)
+                _mgr_logger.warning("Model %s failed (%s), trying next in chain", attempt_model, exc)
+                continue
+            except Exception as exc:
+                last_exc = exc
+                self.mark_model_unhealthy(attempt_model)
+                _mgr_logger.exception("Model %s error, trying next in chain", attempt_model)
+                continue
         else:
-            raise ValueError(f"Unknown model: {model}")
+            raise last_exc
+
+        # Structured LLM call log (#18)
+        duration_ms = int((time.perf_counter() - t_start) * 1000)
+        _mgr_logger.info(
+            "llm.call model=%s duration_ms=%d tokens_est=%d",
+            model, duration_ms, len(result.split()) * 4 // 3,
+        )
 
         # Store in cache for future identical requests
         if not stream and not stream_callback:

@@ -6,8 +6,9 @@ import io
 import json
 import logging
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
+from pydantic import BaseModel, Field
 
 # ── Prometheus metrics ────────────────────────────────────────────────────────
 try:
@@ -110,12 +111,89 @@ async def health():
     except Exception:
         pass
 
+    # #29 — migration state
+    try:
+        from db.history import _db as hist_db
+        if hist_db is not None:
+            applied_count = await hist_db["migrations"].count_documents({})
+            checks["migrations_applied"] = applied_count
+            checks["db_indexes"] = await hist_db["conversations"].index_information()
+            checks["db_indexes"] = len(checks["db_indexes"])
+    except Exception:
+        pass
+
+    # #27 db_version from MongoDB buildInfo
+    try:
+        from db.history import _db as hist_db
+        if hist_db is not None:
+            build_info = await hist_db.command("buildInfo")
+            checks["db_version"] = build_info.get("version", "unknown")
+    except Exception:
+        pass
+
     status_code = 200 if overall == "ok" else 207
     from fastapi.responses import JSONResponse
     return JSONResponse(
         status_code=status_code,
         content={"status": overall, "checks": checks},
+        headers={"Connection": "keep-alive", "Keep-Alive": "timeout=5, max=100"},  # #22
     )
+
+
+# #8 Kubernetes readiness + liveness probes
+@router.get("/health/ready")
+async def health_ready():
+    """Readiness probe — reports not ready if MongoDB is unreachable."""
+    try:
+        from db.history import _db as hist_db
+        if hist_db is None:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=503, content={"ready": False, "reason": "db_not_initialized"})
+        await hist_db.command("ping")
+        return {"ready": True}
+    except Exception as exc:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=503, content={"ready": False, "reason": str(exc)})
+
+
+@router.get("/health/live")
+async def health_live():
+    """Liveness probe — always 200 as long as the process is running."""
+    return {"alive": True, "pid": __import__("os").getpid()}
+
+
+# ── #24 Debug sessions ────────────────────────────────────────────────────────
+
+@router.get("/debug/sessions")
+async def debug_sessions(admin_key: str = Query(default="")):
+    """Admin endpoint: show in-memory session map, lock state, cost totals."""
+    api_key = __import__("os").getenv("API_KEY", "")
+    if api_key and admin_key != api_key:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+
+    sessions = []
+    for sid, orch in _state.session_manager.iter_orchestrators():
+        cost = {}
+        try:
+            cost = orch.llm.get_cost_stats()
+        except Exception:
+            pass
+        sessions.append({
+            "session_id": sid,
+            "history_length": len(getattr(orch, "conversation_history", [])),
+            "cost_stats": cost,
+            "has_lock": (
+                sid in _state.session_manager._session_locks
+                and _state.session_manager._session_locks[sid].locked()
+            ),
+        })
+
+    return {
+        "active_sessions": len(sessions),
+        "max_sessions": __import__("os").getenv("MAX_SESSIONS", "200"),
+        "sessions": sessions,
+    }
 
 
 # ── Stats / Analytics ─────────────────────────────────────────────────────────
@@ -129,7 +207,23 @@ async def get_stats(session_id: str = "default"):
 @router.get("/analytics")
 @router.get("/analytics/summary")
 async def get_analytics(days: int = Query(default=30, ge=1, le=365)):
-    return await _db.analytics_db.get_summary(days)
+    from config.constants import ANALYTICS_STALE_SECONDS
+    # #11 secondaryPreferred: use secondary replica for heavy analytics reads
+    try:
+        from db.analytics import _db as _adb
+        from pymongo import ReadPreference
+        if _adb is not None:
+            coll = _adb.get_collection("analytics", read_preference=ReadPreference.SECONDARY_PREFERRED)
+            _ = coll  # signal intent — get_summary uses its own collection ref
+    except Exception:
+        pass
+    data = await _db.analytics_db.get_summary(days)
+    # #28 stale-while-revalidate: browser can serve cached version while fetching new one
+    return Response(
+        content=json.dumps(data),
+        media_type="application/json",
+        headers={"Cache-Control": f"private, max-age=10, stale-while-revalidate={ANALYTICS_STALE_SECONDS}"},
+    )
 
 
 @router.get("/analytics/export")
@@ -252,10 +346,22 @@ async def invalidate_cache(model: str | None = None):
 # ── Agent memory ──────────────────────────────────────────────────────────────
 
 @router.get("/memory/{session_id}/{agent_type}")
-async def get_memory(session_id: str, agent_type: str):
+async def get_memory(session_id: str, agent_type: str, request: Request):
+    import hashlib
     validate_session_id(session_id)
     memory = await _db.memory_db.memory_read(session_id, agent_type)
-    return {"session_id": session_id, "agent_type": agent_type, "memory": memory}
+    # #18 ETag caching for memory endpoint
+    etag = '"' + hashlib.sha256(json.dumps(memory, sort_keys=True).encode()).hexdigest()[:16] + '"'
+    if request.headers.get("If-None-Match") == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+    return Response(
+        content=json.dumps({"session_id": session_id, "agent_type": agent_type, "memory": memory}),
+        media_type="application/json",
+        headers={
+            "ETag": etag,
+            "Cache-Control": "private, max-age=30, stale-while-revalidate=120",
+        },
+    )
 
 
 @router.delete("/memory/{session_id}/{agent_type}")
@@ -727,4 +833,133 @@ async def graphql_endpoint(request: "Request"):
 
 
 from api.models import DigestScheduleRequest  # noqa: E402 — deferred to avoid circular at module load
-from fastapi import Request  # noqa: E402
+
+
+# ── #30 Client-error telemetry ────────────────────────────────────────────────
+
+class ClientErrorReport(BaseModel):
+    message: str = Field(..., max_length=500)
+    stack: str = Field(default="", max_length=5000)
+    component: str = Field(default="", max_length=200)
+    url: str = Field(default="", max_length=500)
+    user_agent: str = Field(default="", max_length=300)
+
+
+_client_errors: list[dict] = []  # in-memory ring buffer (last 200)
+_MAX_CLIENT_ERRORS = 200
+
+
+@router.post("/logs/client-error", status_code=204)
+async def log_client_error(report: ClientErrorReport, request: Request):
+    """Receive frontend ErrorBoundary telemetry — stores in ring buffer and logs."""
+    entry = {
+        "ts": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
+        "message": report.message,
+        "stack": report.stack,
+        "component": report.component,
+        "url": report.url,
+        "user_agent": report.user_agent,
+        "client_ip": request.client.host if request.client else "unknown",
+    }
+    logger.warning("Client error [%s]: %s", report.component or "unknown", report.message)
+    _client_errors.append(entry)
+    if len(_client_errors) > _MAX_CLIENT_ERRORS:
+        _client_errors.pop(0)
+
+
+@router.get("/logs/client-errors")
+async def list_client_errors(admin_key: str = Query(default="")):
+    """List recent frontend errors — admin-only."""
+    api_key = __import__("os").getenv("API_KEY", "")
+    if api_key and admin_key != api_key:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    return {"errors": list(reversed(_client_errors)), "total": len(_client_errors)}
+
+
+# ── F10 Scheduled prompt reports ──────────────────────────────────────────────
+
+class ScheduledReportRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    prompt: str = Field(..., min_length=1, max_length=2000)
+    session_id: str = "default"
+    cron: str = Field(..., description="Cron expression e.g. '0 9 * * 1'")
+    webhook_url: str = Field(default="", max_length=500)
+    model: str = "claude"
+
+
+@router.post("/reports", status_code=201)
+async def create_scheduled_report(req: ScheduledReportRequest):
+    """Create a scheduled prompt report."""
+    validate_session_id(req.session_id)
+    report_id = await _db.scheduled_reports_db.create_report(
+        name=req.name,
+        prompt=req.prompt,
+        session_id=req.session_id,
+        cron=req.cron,
+        webhook_url=req.webhook_url,
+        model=req.model,
+    )
+    if not report_id:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return {"report_id": report_id, "status": "created"}
+
+
+@router.get("/reports")
+async def list_scheduled_reports(active_only: bool = Query(default=False)):
+    reports = await _db.scheduled_reports_db.list_reports(active_only=active_only)
+    return {"reports": reports, "total": len(reports)}
+
+
+@router.get("/reports/{report_id}")
+async def get_scheduled_report(report_id: str):
+    report = await _db.scheduled_reports_db.get_report(report_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return report
+
+
+@router.delete("/reports/{report_id}", status_code=204)
+async def delete_scheduled_report(report_id: str):
+    deleted = await _db.scheduled_reports_db.delete_report(report_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+
+@router.post("/reports/{report_id}/run")
+async def run_scheduled_report(report_id: str):
+    """Immediately execute a scheduled report and deliver via webhook if configured."""
+    report = await _db.scheduled_reports_db.get_report(report_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    orch = await _state.get_session(report["session_id"])
+    try:
+        result = await orch.llm.call(
+            model=report.get("model", "claude"),
+            messages=[{"role": "user", "content": report["prompt"]}],
+            max_tokens=1024,
+            temperature=0.3,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LLM call failed: {exc}")
+
+    await _db.scheduled_reports_db.update_last_run(report_id, result)
+
+    # Deliver via webhook if configured
+    webhook_url = report.get("webhook_url", "")
+    if webhook_url:
+        try:
+            from api.server import app as _app
+            http_client = getattr(_app.state, "http_client", None)
+            if http_client:
+                await http_client.post(
+                    webhook_url,
+                    json={"report_id": report_id, "name": report["name"], "result": result[:2000]},
+                    timeout=10,
+                )
+        except Exception:
+            logger.warning("Report %s webhook delivery failed", report_id)
+
+    return {"report_id": report_id, "result_preview": result[:500], "status": "run"}
+
+

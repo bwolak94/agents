@@ -19,6 +19,11 @@ import { ConfirmModal } from '@/components/ConfirmModal/ConfirmModal';
 import { ToastContainer } from '@/components/ToastContainer/ToastContainer';
 import { KeyboardShortcuts } from '@/components/KeyboardShortcuts/KeyboardShortcuts';
 import { ErrorBoundary } from '@/components/ErrorBoundary/ErrorBoundary';
+import { ArtifactPanel } from '@/components/ArtifactPanel/ArtifactPanel';
+import { BranchView } from '@/components/BranchView/BranchView';
+import { PluginMarketplace } from '@/components/PluginMarketplace/PluginMarketplace';
+import { ABTestView } from '@/components/ABTestView/ABTestView';
+import { VoiceConversation } from '@/components/VoiceConversation/VoiceConversation';
 import { API_URL } from '@/constants/api';
 import type { ChatMessage } from '@/types/chat';
 import type { Dispatch, SetStateAction } from 'react';
@@ -29,6 +34,7 @@ interface UiPrefs {
   eventLogCollapsed: boolean;
   sidebarCollapsed: boolean;
   agentPanelCollapsed: boolean;
+  artifactPanelCollapsed: boolean;
 }
 
 const DEFAULT_PREFS: UiPrefs = {
@@ -36,6 +42,7 @@ const DEFAULT_PREFS: UiPrefs = {
   eventLogCollapsed: false,
   sidebarCollapsed: false,
   agentPanelCollapsed: false,
+  artifactPanelCollapsed: false,
 };
 
 function PanelError({ label }: { label: string }) {
@@ -76,6 +83,7 @@ export function AgentApp() {
   const [sidebarRefresh, setSidebarRefresh] = useState(0);
   const [confirmClear, setConfirmClear]     = useState(false);
   const [showShortcuts, setShowShortcuts]   = useState(false);
+  const [showVoice, setShowVoice]           = useState(false);
 
   // Ctrl+? to open shortcuts
   useEffect(() => {
@@ -90,6 +98,7 @@ export function AgentApp() {
   const toggleEventLog        = () => setPrefs(p => ({ ...p, eventLogCollapsed: !p.eventLogCollapsed }));
   const toggleSidebar         = () => setPrefs(p => ({ ...p, sidebarCollapsed: !p.sidebarCollapsed }));
   const toggleAgentPanel      = () => setPrefs(p => ({ ...p, agentPanelCollapsed: !p.agentPanelCollapsed }));
+  const toggleArtifactPanel   = () => setPrefs(p => ({ ...p, artifactPanelCollapsed: !p.artifactPanelCollapsed }));
 
   const handleNewSession = useCallback(() => {
     newSession();
@@ -152,6 +161,7 @@ export function AgentApp() {
       )}
 
       <CommandPalette onViewChange={setView} onNewSession={handleNewSession} sessionId={sessionId} />
+      {showVoice && <VoiceConversation sessionId={sessionId} onClose={() => setShowVoice(false)} />}
 
       <Header
         wsStatus={wsStatus}
@@ -161,6 +171,7 @@ export function AgentApp() {
         onViewChange={setView}
         theme={theme}
         onToggleTheme={toggleTheme}
+        onVoice={() => setShowVoice(true)}
       />
 
       {/* #18 — Main layout: three columns with collapsible sidebars */}
@@ -207,6 +218,25 @@ export function AgentApp() {
                 <MemoryInspector sessionId={sessionId} />
               </ErrorBoundary>
             )}
+            {prefs.view === 'branch' && (
+              <ErrorBoundary fallback={<PanelError label="Branch" />}>
+                <BranchView
+                  messages={messages}
+                  sessionId={sessionId}
+                  onNewSession={handleSelectSession}
+                />
+              </ErrorBoundary>
+            )}
+            {prefs.view === 'plugins' && (
+              <ErrorBoundary fallback={<PanelError label="Plugins" />}>
+                <PluginMarketplace />
+              </ErrorBoundary>
+            )}
+            {prefs.view === 'ab-test' && (
+              <ErrorBoundary fallback={<PanelError label="A/B Test" />}>
+                <ABTestView />
+              </ErrorBoundary>
+            )}
           </div>
 
           {/* #19 — EventLog as collapsible drawer */}
@@ -216,6 +246,17 @@ export function AgentApp() {
             onToggle={toggleEventLog}
           />
         </div>
+
+        {/* Artifact panel — only in chat view */}
+        {prefs.view === 'chat' && (
+          <ErrorBoundary fallback={null}>
+            <ArtifactPanel
+              messages={messages}
+              collapsed={prefs.artifactPanelCollapsed}
+              onToggle={toggleArtifactPanel}
+            />
+          </ErrorBoundary>
+        )}
       </div>
     </div>
   );
