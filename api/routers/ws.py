@@ -28,14 +28,29 @@ async def websocket_endpoint(websocket: WebSocket):
     session_id = websocket.query_params.get("session_id")
     await websocket.accept()
     q = event_bus.subscribe(session_id=session_id)
+    stop_event = asyncio.Event()
+
+    async def _reader():
+        """Drain incoming frames (pong / client messages); set stop_event on disconnect."""
+        try:
+            while not stop_event.is_set():
+                await websocket.receive_text()  # blocks until client sends or closes
+        except Exception:
+            stop_event.set()
+
+    reader_task = asyncio.create_task(_reader())
     try:
-        while True:
+        while not stop_event.is_set():
             try:
                 event = await asyncio.wait_for(q.get(), timeout=25.0)
                 await websocket.send_json(event)
             except asyncio.TimeoutError:
                 await websocket.send_json({"type": "ping"})
+            except Exception:
+                break
     except (WebSocketDisconnect, Exception):
         pass
     finally:
+        stop_event.set()
+        reader_task.cancel()
         event_bus.unsubscribe(q)

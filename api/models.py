@@ -386,3 +386,25 @@ class DigestScheduleRequest(BaseModel):
     @classmethod
     def validate_session_id(cls, v: str) -> str:
         return _check_session_id(v)
+
+
+class SessionMergeRequest(BaseModel):
+    """Merge source session history into target session."""
+    source_session_id: str = Field(pattern=r"^[a-zA-Z0-9_\-]{1,64}$")
+    target_session_id: str = Field(pattern=r"^[a-zA-Z0-9_\-]{1,64}$")
+    deduplicate: bool = Field(default=True, description="Skip messages already in target")
+
+
+class SimulateRequest(BaseModel):
+    """Sandboxed agent simulation — no history saved."""
+    message: _Message
+    system_prompt: str = Field(default="", max_length=10_000)
+    model: str = "claude"
+    agent: str = ""
+    session_id: str = "default"
+    turns: int = Field(default=1, ge=1, le=10)
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        return _check_session_id(v)

@@ -7,6 +7,21 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short --no-header"
 
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+  "E", "W",   # pycodestyle
+  "F",        # pyflakes
+  "B",        # flake8-bugbear
+  "SIM",      # flake8-simplify
+  "UP",       # pyupgrade
+  "I",        # isort
+]
+ignore = ["B008", "SIM117", "UP007"]
+
 [tool.mutmut]
 paths_to_mutate = "api/,core/,agents/,tools/,db/"
 runner = "python3 -m pytest tests/unit/ -x -q"

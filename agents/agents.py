@@ -23,11 +23,14 @@ from core.events import event_bus
 
 logger = logging.getLogger(__name__)
 
+import os as _os
+
 MAX_REACT_ITERATIONS = 6
 REACT_ITERATION_TIMEOUT = 60
 TOOL_RESULT_MAX_CHARS = 6_000   # summarize results larger than this (Imp 2)
 TOOL_ERROR_MAX_RETRIES = 2      # auto-retry tool errors (Imp 4)
 MEMORY_CONSOLIDATION_THRESHOLD = 2000  # chars before compressing memory (Feature 7)
+MAX_TOOL_CALLS_PER_TURN = int(_os.getenv("MAX_TOOL_CALLS_PER_TURN", "10"))  # tool budget
 
 TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 MULTI_TOOL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
@@ -190,6 +193,7 @@ class BaseAgent(ABC):
 
         # Checkpoint resume (Feature 6)
         tool_dedup_cache: dict[str, str] = {}
+        total_tool_calls = 0  # tool call budget tracking
         start_iteration = 0
         if checkpoint_id and rag_session:
             try:
@@ -276,6 +280,14 @@ class BaseAgent(ABC):
                     tool_dedup_cache[dedup_key] = cached_result
                     return tool_name, cached_result
 
+                # OpenTelemetry span for tool execution
+                try:
+                    from opentelemetry import trace as _otel_trace
+                    _tracer = _otel_trace.get_tracer("agent.tools")
+                    _span_ctx = _tracer.start_as_current_span(f"tool.{tool_name}")
+                except Exception:
+                    _span_ctx = None  # type: ignore
+
                 # Error auto-retry (Imp 4)
                 last_error = None
                 for attempt in range(TOOL_ERROR_MAX_RETRIES + 1):
@@ -293,7 +305,21 @@ class BaseAgent(ABC):
                             logger.warning("Tool %s attempt %d failed: %s — retrying", tool_name, attempt + 1, e)
                             await asyncio.sleep(0.5 * (attempt + 1))
 
+                if _span_ctx:
+                    try:
+                        _span_ctx.__exit__(None, None, None)
+                    except Exception:
+                        pass
                 return tool_name, f"Tool error [{tool_name}] after {TOOL_ERROR_MAX_RETRIES} retries: {last_error}"
+
+            # Tool call budget enforcement
+            total_tool_calls += len(tool_calls)
+            if total_tool_calls > MAX_TOOL_CALLS_PER_TURN:
+                logger.warning(
+                    "Agent %s exceeded tool call budget (%d > %d); stopping.",
+                    agent_id, total_tool_calls, MAX_TOOL_CALLS_PER_TURN,
+                )
+                break
 
             if len(tool_calls) == 1:
                 tool_name, tool_result = await _execute_single(tool_calls[0])

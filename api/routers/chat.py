@@ -14,7 +14,7 @@ from api.models import (
     ChatRequest, ChatResponse,
     CompareRequest, StructuredChatRequest,
     HandoffPipelineRequest, DebateRequest, FanOutRequest,
-    VariantsRequest, GitDiffRequest, SupervisorRequest,
+    VariantsRequest, GitDiffRequest, SupervisorRequest, SimulateRequest,
 )
 from api.validators import validate_session_id
 import api.preprocessor as _preprocessor
@@ -113,18 +113,24 @@ async def chat(req: ChatRequest):
             )
             duration_ms = int((time.time() - t_start) * 1000)
 
-            # #2 — Self-evaluation loop (retry once if score below threshold)
+            # #2 — Self-evaluation + confidence-gated retry with different model
             self_eval_score = -1.0
             if req.enable_self_eval:
                 self_eval_score = await orch.self_evaluate(message, response)
                 import os as _os
                 threshold = float(_os.getenv("SELF_EVAL_THRESHOLD", "0.6"))
                 if 0 <= self_eval_score < threshold:
-                    response = await orch.process(
-                        message=f"[Please improve this response — previous score was low]\n\n{message}",
-                        stream=False, show_routing=False,
-                        session_id=req.session_id, preferred_model=req.preferred_model,
-                    )
+                    # Use a different model for the retry to get a fresh perspective
+                    fallback = "gemini" if (req.preferred_model or "claude") == "claude" else "claude"
+                    try:
+                        response = await orch.process(
+                            message=f"[Previous answer scored {self_eval_score:.2f}/1.0 — please give a significantly better response]\n\n{message}",
+                            stream=False, show_routing=False,
+                            session_id=req.session_id, preferred_model=fallback,
+                        )
+                    except Exception:
+                        # Fallback model also failed — keep original response
+                        pass
 
             # #6 — Confidence scoring (when self-eval is also on, reuse result)
             confidence = -1.0
@@ -194,16 +200,22 @@ async def chat_stream(req: ChatRequest):
         finally:
             lock.release()
         duration_ms = int((time.time() - t_start) * 1000)
-        # #15 — record analytics for stream endpoint
+        # Record analytics with actual cost from cost tracker
         try:
+            cost_stats = orch.llm.get_cost_stats()
+            cost_usd = cost_stats.get("total_cost_usd", 0) if cost_stats else 0
+            est_tokens = orch.llm.estimate_tokens(orch.conversation_history)
+            context_limits = {"claude": 190_000, "claude-haiku": 190_000, "gemini": 1_000_000}
+            limit = context_limits.get(decision.model, 32_000)
+            context_pct = round(est_tokens / limit * 100, 1)
             await _db.analytics_db.record_request(
                 session_id=req.session_id, agent=decision.agent, model=decision.model,
-                tools=decision.tools, duration_ms=duration_ms, cost_usd=0, context_pct=0,
+                tools=decision.tools, duration_ms=duration_ms, cost_usd=cost_usd, context_pct=context_pct,
             )
         except Exception as exc:
             logger.warning("Analytics failed in /chat/stream: %s", exc)
         yield f"data: {json.dumps({'type': 'routing', 'model': decision.model, 'agent': decision.agent, 'tools': decision.tools})}\n\n"
-        yield f"data: {json.dumps({'type': 'response', 'content': response})}\n\n"
+        yield f"data: {json.dumps({'type': 'response', 'content': response, 'duration_ms': duration_ms})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
@@ -372,6 +384,79 @@ async def chat_git_diff(req: GitDiffRequest):
         max_tokens=2048, temperature=0.2,
     )
     return {"review": response, "session_id": req.session_id}
+
+
+@router.post("/chat/fan-out/stream")
+async def chat_fan_out_stream(req: FanOutRequest):
+    """Streaming fan-out: yields each agent result as it completes (SSE)."""
+    validate_session_id(req.session_id)
+    from agents.agents import AGENT_REGISTRY
+    agents = req.agents or list(AGENT_REGISTRY.keys())[:4]
+    orch = await _state.get_session(req.session_id)
+
+    async def _generate():
+        async def _call_agent(agent_name: str) -> dict:
+            t0 = time.time()
+            try:
+                agent_cls = AGENT_REGISTRY.get(agent_name)
+                if not agent_cls:
+                    return {"agent": agent_name, "error": "unknown agent", "response": None, "duration_ms": 0}
+                agent = agent_cls(orch.llm, orch.tools)
+                resp = await agent.run(
+                    message=req.message, model=req.model,
+                    tool_names=[], conversation_history=[], session_id=req.session_id,
+                )
+                return {"agent": agent_name, "response": resp, "error": None, "duration_ms": int((time.time() - t0) * 1000)}
+            except Exception as exc:
+                return {"agent": agent_name, "response": None, "error": str(exc), "duration_ms": 0}
+
+        tasks = {asyncio.create_task(_call_agent(a)): a for a in agents}
+        pending = set(tasks)
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                result = t.result()
+                yield f"data: {json.dumps(result)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(_generate(), media_type="text/event-stream")
+
+
+@router.post("/chat/simulate")
+async def chat_simulate(req: SimulateRequest):
+    """Sandboxed simulation — runs without saving to conversation history."""
+    validate_session_id(req.session_id)
+    orch = await _state.get_session(req.session_id)
+    model = req.model or "claude"
+
+    messages: list[dict] = []
+    current_msg = req.message
+    results = []
+
+    for turn in range(req.turns):
+        try:
+            response = await orch.llm.call(
+                model=model,
+                messages=messages + [{"role": "user", "content": current_msg}],
+                system_prompt=req.system_prompt or None,
+                max_tokens=1024,
+                temperature=0.7,
+            )
+            messages.append({"role": "user", "content": current_msg})
+            messages.append({"role": "assistant", "content": response})
+            results.append({"turn": turn + 1, "user": current_msg, "assistant": response})
+            current_msg = f"[Continue turn {turn + 2}]"
+        except Exception as exc:
+            results.append({"turn": turn + 1, "user": current_msg, "assistant": None, "error": str(exc)})
+            break
+
+    return {
+        "session_id": req.session_id,
+        "model": model,
+        "system_prompt": req.system_prompt,
+        "turns_completed": len(results),
+        "results": results,
+    }
 
 
 @router.post("/chat/supervisor")

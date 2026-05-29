@@ -54,6 +54,19 @@ function PanelError({ label }: { label: string }) {
 export function AgentApp() {
   const { sessionId, switchSession, newSession } = useSession();
   const { agents, events, wsStatus, costs, stats, clearAgents } = useWebSocket(sessionId);
+
+  // Offline banner: show after 5 seconds of disconnected state
+  const offlineTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [showOfflineBanner, setShowOfflineBanner] = useState(false);
+  useEffect(() => {
+    if (wsStatus === 'offline') {
+      offlineTimerRef.current = setTimeout(() => setShowOfflineBanner(true), 5000);
+    } else {
+      if (offlineTimerRef.current) clearTimeout(offlineTimerRef.current);
+      setShowOfflineBanner(false);
+    }
+    return () => { if (offlineTimerRef.current) clearTimeout(offlineTimerRef.current); };
+  }, [wsStatus]);
   const { messages, setMessages, historyLoading } = useChatHistory(sessionId);
   const { theme, toggleTheme } = useTheme();
   const { toasts, addToast, removeToast } = useToast();
@@ -113,6 +126,19 @@ export function AgentApp() {
 
       <KeyboardShortcuts open={showShortcuts} onClose={() => setShowShortcuts(false)} />
       <ToastContainer toasts={toasts} onRemove={removeToast} />
+
+      {/* Offline banner — shown after 5s of WS disconnect */}
+      {showOfflineBanner && (
+        <div className="fixed top-0 left-0 right-0 z-50 bg-red-900/90 text-red-100 text-xs text-center py-1.5 flex items-center justify-center gap-2">
+          <span>Connection lost. Reconnecting…</span>
+          <button
+            onClick={() => window.location.reload()}
+            className="underline hover:no-underline"
+          >
+            Reload
+          </button>
+        </div>
+      )}
 
       {/* #25 — ConfirmModal for clear chat (replaces window.confirm) */}
       {confirmClear && (

@@ -3,6 +3,7 @@ Chat history stored in MongoDB.
 Stores full messages (with metadata) per session_id.
 """
 import logging
+import os
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -13,6 +14,11 @@ _db = None
 
 # Sessions excluded from the history sidebar (system/library sessions)
 _SYSTEM_SESSIONS = {"default"}
+
+
+_MONGO_MAX_POOL = int(os.getenv("MONGO_MAX_POOL_SIZE", "20"))
+_MONGO_MIN_POOL = int(os.getenv("MONGO_MIN_POOL_SIZE", "5"))
+_SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "90"))
 
 
 async def init_db(mongo_url: str):
@@ -27,7 +33,15 @@ async def init_db(mongo_url: str):
         return _db
 
     # Create a fresh client; store in a local first so _db stays None on failure
-    client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
+    client = AsyncIOMotorClient(
+        mongo_url,
+        serverSelectionTimeoutMS=5000,
+        maxPoolSize=_MONGO_MAX_POOL,
+        minPoolSize=_MONGO_MIN_POOL,
+        connectTimeoutMS=5000,
+        socketTimeoutMS=30_000,
+        retryWrites=True,
+    )
     db = client["agent_system"]
 
     # Verify MongoDB is actually reachable at startup; raises on failure
@@ -38,6 +52,16 @@ async def init_db(mongo_url: str):
     _db = db
 
     await _db["conversations"].create_index("session_id", unique=True)
+    # TTL: auto-delete stale sessions after SESSION_TTL_DAYS of inactivity
+    try:
+        await _db["conversations"].drop_index("updated_at_ttl_1")
+    except Exception:
+        pass
+    await _db["conversations"].create_index(
+        "updated_at",
+        expireAfterSeconds=_SESSION_TTL_DAYS * 24 * 3600,
+        name="updated_at_ttl_1",
+    )
     # Full-text search index on message content
     try:
         await _db["conversations"].create_index([("messages.content", "text"), ("preview", "text")])

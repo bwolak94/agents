@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from config.logging import setup_logging
@@ -50,7 +51,7 @@ import api.db as _db
 import api.state as _state
 
 from api.routers import chat, sessions, knowledge, agents, ops, workflows, ws
-from api.routers import multimodal, platform, intelligence
+from api.routers import multimodal, platform, intelligence, webhook_triggers
 from core import sse as _sse_mod
 
 config = load_config()
@@ -107,12 +108,17 @@ async def lifespan(app: FastAPI):
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
+_MAX_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))  # 2 MB
+
 app = FastAPI(
     title="Agent System API",
     description="Multi-LLM Agent System — Claude, Gemini, Ollama",
     version="2.0.0",
     lifespan=lifespan,
 )
+
+# GZip compression for responses >512 bytes
+app.add_middleware(GZipMiddleware, minimum_size=512)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 
@@ -132,16 +138,42 @@ app.add_middleware(
 
 # ── #8 Structured error handler ───────────────────────────────────────────────
 
+_ERROR_CODE_MAP: dict[str, str] = {
+    "ValueError":          "VALIDATION_ERROR",
+    "PermissionError":     "FORBIDDEN",
+    "TimeoutError":        "TIMEOUT",
+    "asyncio.TimeoutError":"TIMEOUT",
+    "HTTPException":       "HTTP_ERROR",
+}
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    error_code = _ERROR_CODE_MAP.get(type(exc).__name__, "INTERNAL_ERROR")
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal server error", "type": type(exc).__name__},
+        content={
+            "detail": "Internal server error",
+            "type": type(exc).__name__,
+            "error_code": error_code,
+        },
     )
 
 
 # ── Middleware stack ───────────────────────────────────────────────────────────
+
+@app.middleware("http")
+async def body_size_limit_middleware(request: Request, call_next):
+    """Reject requests whose Content-Length exceeds MAX_REQUEST_BODY_BYTES."""
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > _MAX_BODY_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"Request body too large (max {_MAX_BODY_BYTES} bytes)", "error_code": "BODY_TOO_LARGE"},
+        )
+    return await call_next(request)
+
 
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
@@ -220,10 +252,11 @@ app.include_router(knowledge.router,    tags=["Knowledge"])
 app.include_router(agents.router,       tags=["Agents"])
 app.include_router(workflows.router,    tags=["Workflows"])
 app.include_router(ws.router,           tags=["WebSocket"])
-app.include_router(multimodal.router,   tags=["Multimodal"])
-app.include_router(platform.router,     tags=["Platform"])
-app.include_router(intelligence.router, tags=["Intelligence"])
-app.include_router(_sse_mod.router,     tags=["Events"])
+app.include_router(multimodal.router,          tags=["Multimodal"])
+app.include_router(platform.router,            tags=["Platform"])
+app.include_router(intelligence.router,        tags=["Intelligence"])
+app.include_router(webhook_triggers.router,    tags=["Webhooks"])
+app.include_router(_sse_mod.router,            tags=["Events"])
 
 # ── /api/v1/* aliases (versioned access) ─────────────────────────────────────
 from fastapi import APIRouter as _APIRouter  # noqa: E402
@@ -234,9 +267,10 @@ _v1.include_router(sessions.router,     tags=["Sessions"])
 _v1.include_router(knowledge.router,    tags=["Knowledge"])
 _v1.include_router(agents.router,       tags=["Agents"])
 _v1.include_router(workflows.router,    tags=["Workflows"])
-_v1.include_router(multimodal.router,   tags=["Multimodal"])
-_v1.include_router(platform.router,     tags=["Platform"])
-_v1.include_router(intelligence.router, tags=["Intelligence"])
+_v1.include_router(multimodal.router,          tags=["Multimodal"])
+_v1.include_router(platform.router,            tags=["Platform"])
+_v1.include_router(intelligence.router,        tags=["Intelligence"])
+_v1.include_router(webhook_triggers.router,    tags=["Webhooks"])
 app.include_router(_v1)
 
 

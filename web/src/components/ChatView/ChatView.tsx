@@ -3,7 +3,7 @@ import { useState, useRef, useEffect, useCallback, useMemo, type KeyboardEvent }
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { vscDarkPlus, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import type { Components } from 'react-markdown';
 import type { ChatMessage } from '@/types/chat';
 import type { Dispatch, SetStateAction } from 'react';
@@ -75,7 +75,8 @@ function formatTs(ts?: string): string {
 }
 
 // #22 — Markdown renderer with syntax highlighting + copy button
-const mdComponents: Components = {
+function makeMdComponents(dark: boolean): Components {
+  return {
   code({ className, children, ...props }) {
     const match   = /language-(\w+)/.exec(className || '');
     const isBlock = String(children).includes('\n');
@@ -85,7 +86,7 @@ const mdComponents: Components = {
         <div className="relative group">
           <CopyButton text={codeText} />
           <SyntaxHighlighter
-            style={vscDarkPlus as never}
+            style={(dark ? vscDarkPlus : oneLight) as never}
             language={match[1]}
             PreTag="div"
             customStyle={{ margin: '8px 0', borderRadius: 8, fontSize: 12, border: '1px solid #334155', paddingTop: 28 }}
@@ -119,14 +120,19 @@ const mdComponents: Components = {
   h1({ children })        { return <h1 className="text-lg mt-3 mb-1.5 text-text-primary">{children}</h1>; },
   h2({ children })        { return <h2 className="text-base mt-2.5 mb-1 text-text-primary">{children}</h2>; },
   h3({ children })        { return <h3 className="text-sm mt-2 mb-1 text-text-primary">{children}</h3>; },
-};
+  };
+}
+
 
 export function ChatView({ sessionId, messages, setMessages, historyLoading, onClearChat }: ChatViewProps) {
   const [input, setInput]       = useState('');
   const [chatSearch, setChatSearch] = useState('');
   const [showSearch, setShowSearch] = useState(false);
+  const [syntaxDark, setSyntaxDark] = useState(true);
+  const [focusedMsgIdx, setFocusedMsgIdx] = useState<number | null>(null);
   const bottomRef               = useRef<HTMLDivElement>(null);
   const searchRef               = useRef<HTMLInputElement>(null);
+  const msgRefs                 = useRef<(HTMLDivElement | null)[]>([]);
   const { loading, send, streamingContent } = useChat(sessionId);
 
   // Filter messages by search query
@@ -162,14 +168,42 @@ export function ChatView({ sessionId, messages, setMessages, historyLoading, onC
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
+  // Keyboard navigation through messages (up/down when not typing)
+  useEffect(() => {
+    const handler = (e: globalThis.KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'TEXTAREA' || tag === 'INPUT') return;
+      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        const len = filteredMessages.length;
+        if (len === 0) return;
+        setFocusedMsgIdx((prev) => {
+          let next = prev === null ? (e.key === 'ArrowUp' ? len - 1 : 0) : prev + (e.key === 'ArrowUp' ? -1 : 1);
+          next = Math.max(0, Math.min(len - 1, next));
+          msgRefs.current[next]?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          return next;
+        });
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [filteredMessages.length]);
+
   const handleSend = useCallback(async (text?: string) => {
     const msg = (text ?? input).trim();
     if (!msg || loading) return;
     const ts = new Date().toISOString();
+    // Optimistic: add user message immediately
     setMessages((prev) => [...prev, { role: 'user', content: msg, ts }]);
     setInput('');
-    const response = await send(msg);
-    setMessages((prev) => [...prev, { ...response, ts: new Date().toISOString() }]);
+    try {
+      const response = await send(msg);
+      setMessages((prev) => [...prev, { ...response, ts: new Date().toISOString() }]);
+    } catch {
+      // Rollback optimistic user message on error
+      setMessages((prev) => prev.filter((m) => !(m.role === 'user' && m.content === msg && m.ts === ts)));
+      setMessages((prev) => [...prev, { role: 'error', content: 'Failed to send message. Please try again.', ts: new Date().toISOString() }]);
+    }
   }, [input, loading, send, setMessages]);
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -217,6 +251,11 @@ export function ChatView({ sessionId, messages, setMessages, historyLoading, onC
                 title="Search messages (Ctrl+F)"
                 className="border border-border-strong rounded-md text-text-faint text-[11px] px-2.5 py-1 hover:text-text-secondary transition-colors">
                 🔍
+              </button>
+              <button onClick={() => setSyntaxDark(d => !d)}
+                title={syntaxDark ? 'Switch to light syntax theme' : 'Switch to dark syntax theme'}
+                className="border border-border-strong rounded-md text-text-faint text-[11px] px-2.5 py-1 hover:text-text-secondary transition-colors">
+                {syntaxDark ? '☀' : '🌙'}
               </button>
               <button onClick={() => handleExport('md')}
                 className="border border-border-strong rounded-md text-text-faint text-[11px] px-2.5 py-1 hover:text-text-secondary transition-colors">
@@ -271,19 +310,23 @@ export function ChatView({ sessionId, messages, setMessages, historyLoading, onC
 
         {/* Messages */}
         {!historyLoading && filteredMessages.map((msg, i) => (
-          <MessageBubble
-            key={`${msg.role}-${i}-${msg.content.slice(0, 20)}`}
-            message={msg}
-            messageIdx={i}
-            sessionId={sessionId}
-            searchQuery={chatSearch}
-            onRetry={msg.role === 'assistant' ? async () => {
-              const userMsg = messages.slice(0, i).reverse().find(m => m.role === 'user');
-              if (!userMsg || loading) return;
-              const response = await send(userMsg.content);
-              setMessages((prev) => [...prev, { ...response, ts: new Date().toISOString() }]);
-            } : undefined}
-          />
+          <div key={`${msg.role}-${i}-${msg.content.slice(0, 20)}`}
+            ref={el => { msgRefs.current[i] = el; }}
+            className={focusedMsgIdx === i ? 'ring-1 ring-accent-blue/40 rounded-2xl' : ''}>
+            <MessageBubble
+              message={msg}
+              messageIdx={i}
+              sessionId={sessionId}
+              searchQuery={chatSearch}
+              syntaxDark={syntaxDark}
+              onRetry={msg.role === 'assistant' ? async () => {
+                const userMsg = messages.slice(0, i).reverse().find(m => m.role === 'user');
+                if (!userMsg || loading) return;
+                const response = await send(userMsg.content);
+                setMessages((prev) => [...prev, { ...response, ts: new Date().toISOString() }]);
+              } : undefined}
+            />
+          </div>
         ))}
 
         {/* Thinking / streaming */}
@@ -324,10 +367,12 @@ interface MessageBubbleProps {
   messageIdx: number;
   sessionId: string | null;
   searchQuery?: string;
+  syntaxDark?: boolean;
   onRetry?: () => void;
 }
 
-function MessageBubble({ message: msg, messageIdx, sessionId, searchQuery, onRetry }: MessageBubbleProps) {
+function MessageBubble({ message: msg, messageIdx, sessionId, searchQuery, syntaxDark = true, onRetry }: MessageBubbleProps) {
+  const mdComps = useMemo(() => makeMdComponents(syntaxDark), [syntaxDark]);
   const agentCfg = (name?: string) => name ? (AGENT_CFG[name] ?? DEFAULT_AGENT_CFG) : DEFAULT_AGENT_CFG;
   const isUser   = msg.role === 'user';
   const isError  = msg.role === 'error';
@@ -379,7 +424,7 @@ function MessageBubble({ message: msg, messageIdx, sessionId, searchQuery, onRet
             <pre className="m-0 whitespace-pre-wrap font-[inherit]">{msg.content}</pre>
           ) : (
             <div className="font-[inherit]">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComps}>
                 {msg.content}
               </ReactMarkdown>
             </div>

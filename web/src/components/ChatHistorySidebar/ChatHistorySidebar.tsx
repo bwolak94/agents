@@ -65,6 +65,9 @@ export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTr
   // Inline rename state
   const [renamingId, setRenamingId]     = useState<string | null>(null);
   const [renameValue, setRenameValue]   = useState('');
+  // Session merge state
+  const [mergingId, setMergingId]       = useState<string | null>(null);
+  const [merging, setMerging]           = useState(false);
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Infinite scroll sentinel
   const loadMoreRef = useRef<HTMLDivElement>(null);
@@ -190,6 +193,24 @@ export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTr
     setAddingTagFor(null);
   };
 
+  const handleMerge = async (sourceId: string) => {
+    if (!activeSessionId || sourceId === activeSessionId) return;
+    setMerging(true);
+    try {
+      await fetch(`${API_URL}/sessions/merge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source_session_id: sourceId,
+          target_session_id: activeSessionId,
+          deduplicate: true,
+        }),
+      });
+    } catch { /* ignore */ }
+    setMergingId(null);
+    setMerging(false);
+  };
+
   const handleRemoveTag = async (e: React.MouseEvent, sessionId: string, tag: string) => {
     e.stopPropagation();
     await fetch(`${API_URL}/tags/${sessionId}/${encodeURIComponent(tag)}`, { method: 'DELETE' });
@@ -294,7 +315,19 @@ export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTr
               )}
 
               {/* Inline rename input */}
-              {renamingId === s.session_id ? (
+              {mergingId === s.session_id ? (
+                <div onClick={e => e.stopPropagation()} className="mt-1 flex flex-col gap-1">
+                  <p className="text-[9px] text-text-faint">Merge this session into active?</p>
+                  <div className="flex gap-1">
+                    <button onClick={() => handleMerge(s.session_id)} disabled={merging}
+                      className="text-[9px] bg-accent-blue text-white rounded px-1.5 py-0.5 hover:bg-blue-600 transition-colors disabled:opacity-50">
+                      {merging ? '…' : 'Merge'}
+                    </button>
+                    <button onClick={() => setMergingId(null)}
+                      className="text-[9px] text-text-faint hover:text-text-muted transition-colors px-1">Cancel</button>
+                  </div>
+                </div>
+              ) : renamingId === s.session_id ? (
                 <div onClick={e => e.stopPropagation()} className="mt-1 flex gap-1">
                   <input
                     autoFocus
@@ -317,6 +350,10 @@ export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTr
                     className="text-xs text-text-faint opacity-60 hover:opacity-100 transition-opacity px-0.5">✎</button>
                   <button onClick={e => { e.stopPropagation(); setAddingTagFor(addingTagFor === s.session_id ? null : s.session_id); setNewTag(''); }}
                     className="text-xs text-text-faint opacity-60 hover:opacity-100 transition-opacity px-0.5">#</button>
+                  {s.session_id !== activeSessionId && (
+                    <button onClick={e => { e.stopPropagation(); setMergingId(s.session_id); }} title="Merge into active session"
+                      className="text-xs text-text-faint opacity-60 hover:opacity-100 transition-opacity px-0.5">⤵</button>
+                  )}
                   <button onClick={e => handleDelete(e, s.session_id)} disabled={deletingId === s.session_id}
                     className="text-sm text-text-faint opacity-60 hover:opacity-100 hover:text-red-400 transition-all ml-auto px-0.5">×</button>
                 </div>

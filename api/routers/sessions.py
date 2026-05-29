@@ -1,15 +1,16 @@
 """Session / history endpoints — /sessions/*, /history/*, /search, /broadcast"""
 import asyncio
+import hashlib
 import json
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 
 import api.db as _db
 import api.state as _state
 from api.models import (
     SessionFindRequest, ImportContextRequest, IncrementalContextRequest,
-    SessionTitleRequest, BroadcastRequest, SessionForkRequest,
+    SessionTitleRequest, BroadcastRequest, SessionForkRequest, SessionMergeRequest,
 )
 from api.validators import validate_session_id
 
@@ -19,10 +20,18 @@ router = APIRouter()
 # ── History ───────────────────────────────────────────────────────────────────
 
 @router.get("/history/{session_id}")
-async def get_history(session_id: str):
+async def get_history(session_id: str, request: Request):
     validate_session_id(session_id)
     messages = await _db.load_history(session_id)
-    return {"session_id": session_id, "messages": messages}
+    body = json.dumps({"session_id": session_id, "messages": messages}, sort_keys=True, default=str)
+    etag = f'"{hashlib.md5(body.encode()).hexdigest()}"'
+    if request.headers.get("If-None-Match") == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"ETag": etag, "Cache-Control": "private, max-age=0, must-revalidate"},
+    )
 
 
 @router.delete("/history/{session_id}")
@@ -292,6 +301,33 @@ async def search_conversations(q: str = Query(..., min_length=1)):
         ).limit(20)
         results = await cursor.to_list(length=20)
         return {"results": results}
+
+
+@router.post("/sessions/merge")
+async def merge_sessions(req: SessionMergeRequest):
+    """Merge all messages from source_session_id into target_session_id."""
+    if req.source_session_id == req.target_session_id:
+        raise HTTPException(status_code=400, detail="Source and target sessions must differ")
+
+    source_msgs = await _db.load_history(req.source_session_id)
+    if not source_msgs:
+        raise HTTPException(status_code=404, detail="Source session has no history")
+
+    if req.deduplicate:
+        target_msgs = await _db.load_history(req.target_session_id)
+        target_contents = {(m.get("role"), m.get("content")) for m in target_msgs}
+        source_msgs = [m for m in source_msgs if (m.get("role"), m.get("content")) not in target_contents]
+
+    from db.history import append_message
+    for msg in source_msgs:
+        await append_message(req.target_session_id, msg.get("role", "user"), msg.get("content", ""))
+
+    return {
+        "status": "merged",
+        "source_session_id": req.source_session_id,
+        "target_session_id": req.target_session_id,
+        "messages_merged": len(source_msgs),
+    }
 
 
 @router.post("/broadcast")

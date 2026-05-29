@@ -1,5 +1,5 @@
 'use client';
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import type { AgentMap } from '@/types/agent';
 import { AgentCard } from '@/components/AgentCard/AgentCard';
 
@@ -10,8 +10,16 @@ interface AgentPanelProps {
 }
 
 export function AgentPanel({ agents, collapsed = false, onToggleCollapse }: AgentPanelProps) {
-  const agentList = Object.values(agents).filter((a) => a.status !== 'fading');
-  const count = agentList.length;
+  const [filter, setFilter] = useState('');
+  const allAgents = Object.values(agents).filter((a) => a.status !== 'fading');
+  const agentList = useMemo(() => {
+    if (!filter.trim()) return allAgents;
+    const q = filter.toLowerCase();
+    return allAgents.filter(
+      (a) => a.id?.toLowerCase().includes(q) || a.status?.toLowerCase().includes(q)
+    );
+  }, [allAgents, filter]);
+  const count = allAgents.length;
 
   if (collapsed) {
     return (
@@ -60,6 +68,18 @@ export function AgentPanel({ agents, collapsed = false, onToggleCollapse }: Agen
           )}
         </div>
       </div>
+
+      {/* Live filter input */}
+      {count > 0 && (
+        <div className="px-3 py-1.5 border-b border-border-dim flex-shrink-0">
+          <input
+            value={filter}
+            onChange={e => setFilter(e.target.value)}
+            placeholder="Filter agents…"
+            className="w-full bg-surface-hover border border-border-base rounded text-text-primary text-[10px] px-2 py-0.5 outline-none focus:border-border-strong transition-colors"
+          />
+        </div>
+      )}
 
       {/* Agent cards */}
       <div className="flex-1 overflow-y-auto p-3">
