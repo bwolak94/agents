@@ -143,14 +143,29 @@ async def health():
 # #8 Kubernetes readiness + liveness probes
 @router.get("/health/ready")
 async def health_ready():
-    """Readiness probe — reports not ready if MongoDB is unreachable."""
+    """Readiness probe — reports not ready if MongoDB is unreachable. #8: includes pool stats."""
     try:
-        from db.history import _db as hist_db
+        from db.history import _client as hist_client, _db as hist_db
         if hist_db is None:
             from fastapi.responses import JSONResponse
             return JSONResponse(status_code=503, content={"ready": False, "reason": "db_not_initialized"})
         await hist_db.command("ping")
-        return {"ready": True}
+        # #8 — include connection pool utilisation
+        pool_info: dict = {}
+        try:
+            if hist_client is not None:
+                topology = hist_client.delegate._topology  # type: ignore[attr-defined]
+                servers = topology._servers
+                for addr, server in servers.items():
+                    pool = getattr(server, "_pool", None)
+                    if pool:
+                        pool_info[str(addr)] = {
+                            "available": getattr(pool, "_available_count", "?"),
+                            "max": getattr(pool, "_max_pool_size", "?"),
+                        }
+        except Exception:
+            pass
+        return {"ready": True, "pool": pool_info}
     except Exception as exc:
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=503, content={"ready": False, "reason": str(exc)})
@@ -161,6 +176,44 @@ async def health_live():
     """Liveness probe — always 200 as long as the process is running."""
     return {"alive": True, "pid": __import__("os").getpid()}
 
+
+@router.get("/health/pool")
+async def health_pool():
+    """D14 — Expose Motor connection pool stats for monitoring dashboards."""
+    from db.history import _client
+    if _client is None:
+        return {"error": "database not initialised"}
+    try:
+        server_info = _client.topology_description
+        pools = []
+        for sd in server_info.server_descriptions().values():
+            pools.append({"host": sd.address, "type": str(sd.server_type.name)})
+        # Motor exposes pool stats via the underlying pymongo client
+        pool_state = {}
+        try:
+            pool_state = {
+                "max_pool_size": _client.options.pool_options.max_pool_size,
+                "min_pool_size": _client.options.pool_options.min_pool_size,
+            }
+        except Exception:
+            pass
+        return {"pool": pool_state, "servers": pools}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+
+
+# ── W22 Session presence ──────────────────────────────────────────────────────
+
+@router.get("/sessions/{session_id}/presence")
+async def session_presence(session_id: str):
+    """W22 — How many active WebSocket clients are subscribed to this session."""
+    from api.validators import validate_session_id
+    validate_session_id(session_id)
+    from core.events import event_bus
+    count = event_bus.subscriber_count_for(session_id)
+    return {"session_id": session_id, "active_connections": count}
 
 # ── #24 Debug sessions ────────────────────────────────────────────────────────
 
@@ -259,9 +312,19 @@ async def export_analytics(
 # ── Models ────────────────────────────────────────────────────────────────────
 
 @router.get("/models", response_model_exclude_none=True)
-async def list_models():
+async def list_models(request: Request):
     orch = await _state.get_session("default")
-    return {"models": orch.llm.available_models()}
+    data = {"models": orch.llm.available_models()}
+    # #12 — ETag: model list rarely changes; avoid re-serialisation on unchanged data
+    import hashlib as _hl
+    etag = f'"{_hl.md5(str(data["models"]).encode()).hexdigest()[:12]}"'
+    if request.headers.get("If-None-Match") == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+    return Response(
+        content=json.dumps(data),
+        media_type="application/json",
+        headers={"ETag": etag, "Cache-Control": "private, max-age=60"},
+    )
 
 
 @router.post("/models/refresh")
@@ -269,6 +332,15 @@ async def refresh_models():
     orch = await _state.get_session("default")
     models = await orch.llm.refresh_ollama_models()
     return {"ollama_models": models, "all_models": orch.llm.available_models()}
+
+
+# ── Cache admin (#19) ─────────────────────────────────────────────────────────
+
+@router.delete("/cache")
+async def invalidate_cache(model: str | None = Query(default=None, description="Limit to a specific model; omit to clear all")):
+    """#19 — Invalidate the LLM response cache (optionally per-model)."""
+    deleted = await _db.cache_db.invalidate(model)
+    return {"deleted": deleted, "model": model or "all"}
 
 
 @router.get("/models/health")
@@ -369,6 +441,18 @@ async def clear_memory(session_id: str, agent_type: str):
     validate_session_id(session_id)
     await _db.memory_db.memory_write(session_id, agent_type, "")
     return {"status": "cleared"}
+
+
+class _MemoryPatch(BaseModel):
+    fact: str = Field(..., min_length=1, max_length=5000)
+
+
+@router.patch("/memory/{session_id}/{agent_type}")
+async def patch_memory(session_id: str, agent_type: str, patch: _MemoryPatch):
+    """B6 — Merge/append a fact into existing memory instead of overwriting."""
+    validate_session_id(session_id)
+    updated = await _db.memory_db.memory_append(session_id, agent_type, patch.fact)
+    return {"status": "merged", "session_id": session_id, "agent_type": agent_type, "memory_length": len(updated)}
 
 
 # ── Prompt library ────────────────────────────────────────────────────────────
@@ -666,6 +750,51 @@ async def detect_anomalies(days: int = Query(default=7, ge=1, le=30), sigma: flo
 
     return {"anomalies": anomalies, "sigma_threshold": sigma, "days_analyzed": len(daily)}
 
+
+
+
+# ── D13 Analytics percentiles ─────────────────────────────────────────────────
+
+@router.get("/analytics/percentiles")
+async def analytics_percentiles(days: int = Query(default=7, ge=1, le=90)):
+    """D13 — p50/p95/p99 latency per model and overall using $bucketAuto."""
+    from db.analytics import _db as _adb
+    if _adb is None:
+        return {"error": "database not initialised"}
+    import math
+    cutoff = (__import__("datetime").datetime.now(__import__("datetime").timezone.utc) - __import__("datetime").timedelta(days=days)).strftime("%Y-%m-%d")
+    match = {"": {"date": {"": cutoff}, "duration_ms": {"": 0}}}
+    # Fetch raw durations grouped by model (up to 2000 docs)
+    pipe = [match, {"": {"_id": "", "durations": {"": ""}}}, {"": 100}]
+    rows = await _adb["analytics"].aggregate(pipe).to_list(100)
+    def percentile(vals, p):
+        if not vals: return 0
+        s = sorted(vals)
+        idx = int(math.ceil(p / 100 * len(s))) - 1
+        return s[max(0, idx)]
+    result = []
+    all_durations = []
+    for r in rows:
+        d = r["durations"]
+        all_durations.extend(d)
+        result.append({"model": r["_id"] or "unknown", "p50": percentile(d, 50), "p95": percentile(d, 95), "p99": percentile(d, 99), "count": len(d)})
+    return {"days": days, "overall": {"p50": percentile(all_durations, 50), "p95": percentile(all_durations, 95), "p99": percentile(all_durations, 99)}, "by_model": result}
+
+
+# ── L20 Cache stats ────────────────────────────────────────────────────────────
+
+@router.get("/cache/stats")
+async def cache_stats():
+    """L20 — Expose cache hit/miss counters alongside existing stats."""
+    base = await _db.cache_db.stats()
+    try:
+        from db.cache import _hits, _misses
+        base["hits"] = _hits
+        base["misses"] = _misses
+        base["hit_rate_pct"] = round(_hits / (_hits + _misses) * 100, 1) if (_hits + _misses) else 0
+    except ImportError:
+        pass
+    return base
 
 # ── #25 Fine-tuning dataset export ────────────────────────────────────────────
 

@@ -156,21 +156,100 @@ async def replay_session(session_id: str, model: str = Query(...)):
     return {"session_id": session_id, "model": model, "replay": results}
 
 
+@router.get("/sessions/{session_id}/replay")
+async def replay_session_diff(session_id: str, model: str = Query(default="claude")):
+    """B5 — Re-run stored messages through current agent config; return word-level diffs."""
+    import difflib
+    validate_session_id(session_id)
+    messages = await _db.load_history(session_id)
+    # Build (user_msg, stored_assistant_response) pairs
+    pairs: list[tuple[str, str]] = []
+    for i, m in enumerate(messages):
+        if m.get("role") == "user":
+            nxt = messages[i + 1] if i + 1 < len(messages) else {}
+            stored = nxt.get("content", "") if nxt.get("role") == "assistant" else ""
+            pairs.append((m["content"], stored))
+
+    if not pairs:
+        raise HTTPException(status_code=404, detail="No user/assistant pairs to replay")
+
+    orch = await _state.get_session("default")
+    history: list = []
+    results = []
+    for user_msg, stored_resp in pairs:
+        try:
+            new_resp = await orch.llm.call(
+                model=model,
+                messages=history + [{"role": "user", "content": user_msg}],
+                max_tokens=1024,
+            )
+            diff = list(difflib.unified_diff(
+                stored_resp.splitlines(), new_resp.splitlines(),
+                fromfile="stored", tofile="replay", lineterm="",
+            ))
+            results.append({
+                "user": user_msg[:200],
+                "stored": stored_resp[:400],
+                "replay": new_resp[:400],
+                "diff_lines": len(diff),
+                "diff": "\n".join(diff[:40]),
+                "changed": bool(diff),
+            })
+            history.append({"role": "user", "content": user_msg})
+            history.append({"role": "assistant", "content": new_resp})
+        except Exception as e:
+            results.append({"user": user_msg[:200], "stored": stored_resp[:200], "replay": None, "error": str(e)})
+
+    changed = sum(1 for r in results if r.get("changed"))
+    return {"session_id": session_id, "model": model, "turns": len(results), "changed": changed, "results": results}
+
+
 # ── Sessions ──────────────────────────────────────────────────────────────────
 
 @router.get("/sessions", response_model_exclude_none=True)
 async def list_sessions(
     limit: int = Query(default=50, ge=1, le=200),
     skip: int = Query(default=0, ge=0),
+    after: str | None = Query(default=None, description="Cursor: updated_at of last seen item"),
+    archived: bool = Query(default=False, description="D10 — include archived sessions"),
 ):
-    return {"sessions": await _db.db_list_sessions(limit=limit, skip=skip)}
+    sessions = await _db.db_list_sessions(limit=limit, skip=skip, after=after)
+    # D10 — filter out archived sessions unless explicitly requested
+    if not archived:
+        sessions = [s for s in sessions if not s.get("archived", False)]
+    # D11 — include next_cursor for keyset pagination
+    next_cursor = sessions[-1]["updated_at"] if len(sessions) == limit else None
+    return {"sessions": sessions, "next_cursor": next_cursor}
 
 
 @router.delete("/sessions/{session_id}")
-async def delete_session(session_id: str):
+async def delete_session(session_id: str, hard: bool = Query(default=False)):
+    """D10 — Soft-delete by default (archived=True); hard=true for permanent deletion."""
     validate_session_id(session_id)
-    deleted = _state.session_manager.delete(session_id)
-    return {"status": "deleted" if deleted else "not_found", "session_id": session_id}
+    if hard:
+        deleted = _state.session_manager.delete(session_id)
+        return {"status": "deleted" if deleted else "not_found", "session_id": session_id}
+    # Soft-delete: mark as archived in MongoDB
+    from db.history import _db as hist_db
+    if hist_db is not None:
+        await hist_db["conversations"].update_one(
+            {"session_id": session_id},
+            {"$set": {"archived": True}},
+        )
+    return {"status": "archived", "session_id": session_id}
+
+
+@router.post("/sessions/{session_id}/unarchive")
+async def unarchive_session(session_id: str):
+    """D10 — Restore a soft-deleted session."""
+    validate_session_id(session_id)
+    from db.history import _db as hist_db
+    if hist_db is not None:
+        await hist_db["conversations"].update_one(
+            {"session_id": session_id},
+            {"$set": {"archived": False}},
+        )
+    return {"status": "unarchived", "session_id": session_id}
 
 
 @router.post("/sessions/find")
@@ -255,6 +334,56 @@ async def set_title(session_id: str, req: SessionTitleRequest):
     validate_session_id(session_id)
     await _db.set_session_title(session_id, req.title)
     return {"status": "updated", "session_id": session_id, "title": req.title}
+
+
+# ── #15 PATCH /sessions/{session_id} — partial session update ─────────────────
+
+class _SessionPatch(BaseModel):
+    title: str | None = Field(default=None, max_length=200)
+    tags: list[str] | None = None
+
+
+@router.patch("/sessions/{session_id}")
+async def patch_session(session_id: str, patch: _SessionPatch):
+    """#15 — Partial update: title and/or tags without PUT semantics."""
+    validate_session_id(session_id)
+    if patch.title is not None:
+        await _db.set_session_title(session_id, patch.title)
+    if patch.tags is not None:
+        for tag in patch.tags:
+            await _db.tags_db.add_tag(session_id, tag)
+    return {"status": "updated", "session_id": session_id}
+
+
+# ── #16 GET /sessions/{session_id}/cost — per-session spend ───────────────────
+
+@router.get("/sessions/{session_id}/cost")
+async def session_cost(session_id: str):
+    """#16 — Sum cost_usd from the analytics collection for one session."""
+    validate_session_id(session_id)
+    try:
+        from db.analytics import _db as _adb
+        if _adb is None:
+            return {"session_id": session_id, "total_cost_usd": 0.0, "total_requests": 0}
+        pipeline = [
+            {"$match": {"session_id": session_id}},
+            {"$group": {
+                "_id": None,
+                "total_cost_usd": {"$sum": "$cost_usd"},
+                "total_requests": {"$sum": 1},
+                "total_duration_ms": {"$sum": "$duration_ms"},
+            }},
+        ]
+        rows = await _adb["analytics"].aggregate(pipeline).to_list(1)
+        row = rows[0] if rows else {}
+        return {
+            "session_id": session_id,
+            "total_cost_usd": round(row.get("total_cost_usd", 0.0), 6),
+            "total_requests": row.get("total_requests", 0),
+            "total_duration_ms": row.get("total_duration_ms", 0),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.post("/sessions/{session_id}/focus")
@@ -571,4 +700,95 @@ async def create_session_snapshot(
         "messages_captured": len(messages),
         "resume_prompt": resume_prompt,
         "status": "created",
+    }
+
+
+# ── B2 Session trim ───────────────────────────────────────────────────────────
+
+class _TrimRequest(BaseModel):
+    keep_last: int = Field(default=50, ge=1, le=2000, description="Number of most-recent messages to keep")
+
+
+@router.post("/sessions/{session_id}/trim")
+async def trim_session(session_id: str, req: _TrimRequest):
+    """B2 — Remove the oldest messages, keeping only the last keep_last."""
+    validate_session_id(session_id)
+    from db.history import _db as hist_db
+    if hist_db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    doc = await hist_db["conversations"].find_one({"session_id": session_id}, {"_id": 0, "messages": 1})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found")
+    messages = doc.get("messages", [])
+    original = len(messages)
+    if original <= req.keep_last:
+        return {"session_id": session_id, "removed": 0, "remaining": original}
+    trimmed = messages[-req.keep_last:]
+    await hist_db["conversations"].update_one(
+        {"session_id": session_id},
+        {"$set": {"messages": trimmed}},
+    )
+    # Also truncate in-memory orchestrator history if loaded
+    try:
+        orch = _state.session_manager.get_existing(session_id)
+        if orch:
+            orch.conversation_history = orch.conversation_history[-req.keep_last:]
+    except Exception:
+        pass
+    return {"session_id": session_id, "removed": original - req.keep_last, "remaining": req.keep_last}
+
+
+# ── B5 Session agent participation ───────────────────────────────────────────
+
+@router.get("/sessions/{session_id}/agents")
+async def session_agents(session_id: str):
+    """B5 — Which agents participated in this session (from analytics)."""
+    validate_session_id(session_id)
+    try:
+        from db.analytics import _db as _adb
+        if _adb is None:
+            return {"session_id": session_id, "agents": []}
+        pipeline = [
+            {"$match": {"session_id": session_id}},
+            {"$group": {
+                "_id": "$agent",
+                "turns": {"$sum": 1},
+                "avg_duration_ms": {"$avg": "$duration_ms"},
+                "total_cost_usd": {"$sum": "$cost_usd"},
+            }},
+            {"$sort": {"turns": -1}},
+        ]
+        rows = await _adb["analytics"].aggregate(pipeline).to_list(50)
+        return {
+            "session_id": session_id,
+            "agents": [
+                {"agent": r["_id"], "turns": r["turns"],
+                 "avg_duration_ms": round(r["avg_duration_ms"] or 0, 1),
+                 "total_cost_usd": round(r["total_cost_usd"] or 0, 6)}
+                for r in rows if r["_id"]
+            ],
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── B10 Session context usage ─────────────────────────────────────────────────
+
+@router.get("/sessions/{session_id}/context-usage")
+async def session_context_usage(session_id: str, model: str = Query(default="claude")):
+    """B10 — Return token usage % for the session without sending a message."""
+    validate_session_id(session_id)
+    from config.constants import CONTEXT_LIMITS
+    messages = await _db.load_history(session_id)
+    text = " ".join(m.get("content", "") for m in messages)
+    estimated = int(len(text.split()) * 1.3)
+    limit = CONTEXT_LIMITS.get(model, 32_000)
+    pct = round(estimated / limit * 100, 1) if limit else 0
+    return {
+        "session_id": session_id,
+        "model": model,
+        "estimated_tokens": estimated,
+        "context_limit": limit,
+        "pct": pct,
+        "summarize_recommended": pct > 75,
     }

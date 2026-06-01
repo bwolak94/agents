@@ -32,6 +32,18 @@ async function downloadBlob(url: string, filename: string) {
   URL.revokeObjectURL(link);
 }
 
+// F28 — export in-memory daily stats as CSV without hitting the API
+function exportDailyCsv(daily: { date: string; count: number }[]) {
+  const rows = ['date,count', ...daily.map(d => `${d.date},${d.count}`)].join('\n');
+  const blob = new Blob([rows], { type: 'text/csv' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = `daily-activity-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 export function AnalyticsDashboard() {
   const { data, loading, refetch } = useAnalytics();
 
@@ -137,7 +149,15 @@ export function AnalyticsDashboard() {
 
       {/* Daily Activity */}
       <div className="bg-surface-card border border-border-dim rounded-xl p-4">
-        <SectionHeader label="Daily Activity" />
+        <div className="flex items-center justify-between mb-2.5">
+          <span className="text-[10px] font-bold tracking-widest text-text-faint uppercase">Daily Activity</span>
+          {/* F28 — client-side CSV from in-memory state; no extra network request */}
+          {daily.length > 0 && (
+            <button onClick={() => exportDailyCsv(daily)}
+              className="text-[10px] text-text-faint hover:text-text-secondary transition-colors border border-border-dim rounded px-2 py-0.5">
+              ↓ CSV
+            </button>
+          )}
         {daily.length === 0 && <div className="text-xs text-text-faint">No data</div>}
         <div className="flex flex-col gap-2">
           {daily.map((d: DailyStat, i: number) => (

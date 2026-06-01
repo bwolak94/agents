@@ -1,5 +1,5 @@
 'use client';
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react';
 import { API_URL } from '@/constants/api';
 
 const PAGE_SIZE = 20;
@@ -20,6 +20,20 @@ interface Props {
   collapsed?: boolean;
   onToggleCollapse?: () => void;
 }
+
+// #44 — memoised tag badge so re-renders on hovered sibling don't repaint every tag
+const TagBadge = memo(function TagBadge({
+  tag, sessionId, onRemove,
+}: { tag: string; sessionId: string; onRemove: (e: React.MouseEvent, sid: string, tag: string) => void }) {
+  return (
+    <span
+      onClick={e => onRemove(e, sessionId, tag)}
+      className="text-[9px] bg-surface-active text-accent-blue-light rounded px-1 py-0.5 cursor-pointer hover:bg-surface-hover transition-colors"
+    >
+      #{tag}
+    </span>
+  );
+});
 
 function stripXml(text: string): string {
   return text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() || text;
@@ -58,7 +72,9 @@ export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTr
   const [searchQuery, setSearchQuery]   = useState('');
   const [searchResults, setSearchResults] = useState<{ session_id: string; preview?: string }[] | null>(null);
   const [searching, setSearching]       = useState(false);
-  const [tagFilter, setTagFilter]       = useState<string | null>(null);
+  const [tagFilter, setTagFilter]         = useState<string | null>(null);
+  const [pendingTagFilter, setPendingTagFilter] = useState<string | null>(null);
+  const tagFilterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [allTags, setAllTags]           = useState<string[]>([]);
   const [addingTagFor, setAddingTagFor] = useState<string | null>(null);
   const [newTag, setNewTag]             = useState('');
@@ -68,6 +84,7 @@ export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTr
   // Session merge state
   const [mergingId, setMergingId]       = useState<string | null>(null);
   const [merging, setMerging]           = useState(false);
+  const [kbIdx, setKbIdx]              = useState(-1);  // F27 — keyboard-focused session index
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Infinite scroll sentinel
   const loadMoreRef = useRef<HTMLDivElement>(null);
@@ -100,6 +117,13 @@ export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTr
       .catch(() => {});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tagFilter]);
+
+  // #41 — debounce tag filter changes by 200 ms to avoid rapid refetches on click
+  useEffect(() => {
+    if (tagFilterTimerRef.current) clearTimeout(tagFilterTimerRef.current);
+    tagFilterTimerRef.current = setTimeout(() => setTagFilter(pendingTagFilter), 200);
+    return () => { if (tagFilterTimerRef.current) clearTimeout(tagFilterTimerRef.current); };
+  }, [pendingTagFilter]);
 
   useEffect(() => { fetchSessions(true); setSkip(0); }, [fetchSessions, refreshTrigger]);
 
@@ -259,21 +283,27 @@ export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTr
         </div>
         <input
           value={searchQuery}
-          onChange={e => setSearchQuery(e.target.value)}
+          onChange={e => { setSearchQuery(e.target.value); setKbIdx(-1); }}
           placeholder="Search chats… (Ctrl+F)"
           className="w-full bg-surface-hover border border-border-base rounded text-text-primary text-[11px] px-2 py-1 outline-none focus:border-border-strong transition-colors"
+          onKeyDown={e => {
+            // F27 — arrow key navigation from search into session list
+            if (e.key === 'ArrowDown') { e.preventDefault(); setKbIdx(i => Math.min(i + 1, displaySessions.length - 1)); }
+            else if (e.key === 'ArrowUp') { e.preventDefault(); setKbIdx(i => Math.max(i - 1, 0)); }
+            else if (e.key === 'Enter' && kbIdx >= 0) { onSelect(displaySessions[kbIdx].session_id); setKbIdx(-1); }
+          }}
         />
       </div>
 
       {/* Tag filter bar */}
       {allTags.length > 0 && (
         <div className="px-2 py-1 border-b border-border-dim flex gap-1 flex-wrap flex-shrink-0">
-          <button onClick={() => setTagFilter(null)}
+          <button onClick={() => setPendingTagFilter(null)}
             className={`text-[10px] border rounded px-1.5 py-0.5 transition-colors ${tagFilter === null ? 'border-accent-blue text-accent-blue-light' : 'border-border-base text-text-faint hover:text-text-muted'}`}>
             All
           </button>
           {allTags.slice(0, 8).map(tag => (
-            <button key={tag} onClick={() => setTagFilter(tagFilter === tag ? null : tag)}
+            <button key={tag} onClick={() => setPendingTagFilter(tagFilter === tag ? null : tag)}
               className={`text-[10px] border rounded px-1.5 py-0.5 transition-colors ${tagFilter === tag ? 'border-accent-blue text-accent-blue-light' : 'border-border-base text-text-faint hover:text-text-muted'}`}>
               #{tag}
             </button>
@@ -289,19 +319,22 @@ export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTr
             {searchQuery ? 'No results' : 'No previous chats'}
           </div>
         )}
-        {displaySessions.map((s) => {
-          const isActive  = s.session_id === activeSessionId;
-          const isHovered = hoveredId === s.session_id;
-          const isPinned  = pinned.has(s.session_id);
-          const full      = sessions.find(x => x.session_id === s.session_id);
+        {displaySessions.map((s, sIdx) => {
+          const isActive   = s.session_id === activeSessionId;
+          const isHovered  = hoveredId === s.session_id;
+          const isKbFocused = kbIdx === sIdx;  // F27
+          const isPinned   = pinned.has(s.session_id);
+          const full       = sessions.find(x => x.session_id === s.session_id);
           return (
+            // F17 — CSS content-visibility containment for native virtual scroll (no deps)
             <div
               key={s.session_id}
-              onClick={() => onSelect(s.session_id)}
-              onMouseEnter={() => setHoveredId(s.session_id)}
+              style={{ contentVisibility: 'auto', containIntrinsicSize: '0 56px' }}
+              onClick={() => { onSelect(s.session_id); setKbIdx(-1); }}
+              onMouseEnter={() => { setHoveredId(s.session_id); setKbIdx(-1); }}
               onMouseLeave={() => { setHoveredId(null); setAddingTagFor(null); }}
               className={`px-2.5 py-2 cursor-pointer relative transition-colors border-l-2
-                ${isActive ? 'bg-surface-active border-l-accent-blue' : isHovered ? 'bg-surface-hover border-l-transparent' : 'border-l-transparent'}`}
+                ${isActive ? 'bg-surface-active border-l-accent-blue' : isKbFocused ? 'bg-surface-hover border-l-accent-blue/50' : isHovered ? 'bg-surface-hover border-l-transparent' : 'border-l-transparent'}`}
             >
               {isPinned && <span className="absolute top-1.5 right-1.5 text-[9px] text-accent-yellow">★</span>}
               <div className={`text-xs truncate pr-3 leading-snug ${isActive ? 'text-text-primary' : 'text-text-secondary'}`}>
@@ -312,10 +345,7 @@ export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTr
               {full?.tags && full.tags.length > 0 && (
                 <div className="flex gap-1 flex-wrap mt-1">
                   {full.tags.map(tag => (
-                    <span key={tag} onClick={e => handleRemoveTag(e, s.session_id, tag)}
-                      className="text-[9px] bg-surface-active text-accent-blue-light rounded px-1 py-0.5 cursor-pointer hover:bg-surface-hover transition-colors">
-                      #{tag}
-                    </span>
+                    <TagBadge key={tag} tag={tag} sessionId={s.session_id} onRemove={handleRemoveTag} />
                   ))}
                 </div>
               )}

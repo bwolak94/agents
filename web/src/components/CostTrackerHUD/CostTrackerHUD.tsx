@@ -1,6 +1,6 @@
 'use client';
-import { useState, useEffect } from 'react';
-import { API_URL } from '@/constants/api';
+import { useState, useEffect, useRef } from 'react';
+import { API_URL, WS_URL } from '@/constants/api';
 
 interface CostData {
   total_cost_usd: number;
@@ -16,8 +16,13 @@ interface Props {
 export function CostTrackerHUD({ budgetUsd = 0 }: Props) {
   const [cost, setCost] = useState<CostData | null>(null);
   const [expanded, setExpanded] = useState(false);
+  const [showSession, setShowSession] = useState(false);  // F19 — toggle daily vs. session cost
+  const sessionCostRef = useRef(0);  // #47 — accumulate per-session cost from WS events
+  const warnedRef = useRef(false);  // F29 — fire toast only once per session
+  const [budgetToast, setBudgetToast] = useState<string | null>(null);  // F29
 
   useEffect(() => {
+    // #47 — initial fetch for today's baseline; then WS cost events keep it live
     const load = () => {
       fetch(`${API_URL}/analytics?days=1`)
         .then(r => r.json())
@@ -33,17 +38,71 @@ export function CostTrackerHUD({ budgetUsd = 0 }: Props) {
         .catch(() => {});
     };
     load();
-    const id = setInterval(load, 30_000);
-    return () => clearInterval(id);
+
+    // #47 — listen for cost events from the existing WS stream
+    let ws: WebSocket | null = null;
+    let retryTimer: ReturnType<typeof setTimeout>;
+    const connect = () => {
+      ws = new WebSocket(WS_URL);
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data as string);
+          if (msg.type === 'cost' && typeof msg.usd === 'number') {
+            sessionCostRef.current += msg.usd;  // F19 — accumulate session-scoped cost
+            setCost(prev => prev ? {
+              ...prev,
+              total_cost_usd: prev.total_cost_usd + msg.usd,
+              total_requests: prev.total_requests + 1,
+            } : prev);
+          }
+        } catch { /* ignore */ }
+      };
+      ws.onclose = () => { retryTimer = setTimeout(connect, 5000); };
+      ws.onerror = () => ws?.close();
+    };
+    connect();
+    // Fallback: re-fetch every 5 min in case WS misses events
+    const id = setInterval(load, 300_000);
+    return () => {
+      clearInterval(id);
+      clearTimeout(retryTimer);
+      ws?.close();
+    };
   }, []);
+
+  // F29 — fire one-shot toast when budget crosses 80%
+  useEffect(() => {
+    if (!cost || budgetUsd <= 0 || warnedRef.current) return;
+    const pct = (cost.total_cost_usd / budgetUsd) * 100;
+    if (pct >= 80) {
+      warnedRef.current = true;
+      setBudgetToast(`Budget alert: ${pct.toFixed(0)}% of $${budgetUsd.toFixed(2)} used`);
+      setTimeout(() => setBudgetToast(null), 6000);
+    }
+  }, [cost, budgetUsd]);
 
   if (!cost) return null;
 
+  // F19 — display session cost or daily cost depending on toggle
+  const displayCost = showSession ? sessionCostRef.current : cost.total_cost_usd;
   const pct = budgetUsd > 0 ? Math.min(100, (cost.total_cost_usd / budgetUsd) * 100) : -1;
   const warning = pct >= 80;
   const barColor = pct >= 90 ? '#dc2626' : pct >= 80 ? '#eab308' : '#22c55e';
 
   return (
+    <>
+      {/* F29 — budget warning toast */}
+      {budgetToast && (
+        <div style={{
+          position: 'fixed', bottom: 72, right: 16, zIndex: 1001,
+          background: '#7f1d1d', border: '1px solid #dc2626', borderRadius: 8,
+          padding: '8px 14px', fontSize: 12, color: '#fca5a5',
+          boxShadow: '0 4px 16px rgba(0,0,0,0.5)', maxWidth: 260,
+          animation: 'fadeIn 0.2s ease',
+        }}>
+          ⚠ {budgetToast}
+        </div>
+      )}
     <div
       style={{
         position: 'fixed',
@@ -66,10 +125,17 @@ export function CostTrackerHUD({ budgetUsd = 0 }: Props) {
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <span style={{ color: warning ? '#f87171' : '#4ade80', fontWeight: 700 }}>
-          ${cost.total_cost_usd.toFixed(4)}
+          ${displayCost.toFixed(4)}
         </span>
-        <span style={{ color: '#475569' }}>today</span>
-        {pct >= 0 && (
+        {/* F19 — toggle between daily and session cost */}
+        <span
+          onClick={e => { e.stopPropagation(); setShowSession(s => !s); }}
+          style={{ color: '#475569', cursor: 'pointer', fontSize: 10, userSelect: 'none' }}
+          title="Click to toggle session / daily cost"
+        >
+          {showSession ? 'session' : 'today'}
+        </span>
+        {pct >= 0 && !showSession && (
           <span style={{ color: barColor, fontWeight: 600 }}>
             {pct.toFixed(0)}%
           </span>
@@ -92,6 +158,7 @@ export function CostTrackerHUD({ budgetUsd = 0 }: Props) {
         </div>
       )}
     </div>
+    </>
   );
 }
 

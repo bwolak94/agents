@@ -16,6 +16,8 @@ _db: AsyncIOMotorDatabase | None = None
 _TTL_SECONDS  = int(os.getenv("RESPONSE_CACHE_TTL_S", "3600"))  # 1 hour default
 _LRU_MAX      = int(os.getenv("LRU_MAX_ITEMS", "500"))           # D19 — in-memory cap
 _mem_cache: OrderedDict[str, str] = OrderedDict()                # D19 — hot LRU dict
+_hits: int = 0   # L20 — hit counter
+_misses: int = 0  # L20 — miss counter
 
 
 def set_db(db: AsyncIOMotorDatabase) -> None:
@@ -48,12 +50,15 @@ def _lru_put(key: str, value: str) -> None:
 
 async def get(model: str, messages: list, system_prompt: str | None = None) -> str | None:
     """Return cached response or None. D19 — checks in-memory LRU before MongoDB."""
+    global _hits, _misses
     key = _make_key(model, messages, system_prompt)
     # D19 — hot path: in-memory LRU hit
     if key in _mem_cache:
         _mem_cache.move_to_end(key)
+        _hits += 1  # L20
         return _mem_cache[key]
     if _db is None:
+        _misses += 1  # L20
         return None
     now = datetime.now(timezone.utc)
     doc = await _db["response_cache"].find_one(
@@ -62,6 +67,9 @@ async def get(model: str, messages: list, system_prompt: str | None = None) -> s
     )
     if doc:
         _lru_put(key, doc["response"])  # D19 — warm the in-memory cache
+        _hits += 1  # L20
+    else:
+        _misses += 1  # L20
     return doc["response"] if doc else None
 
 

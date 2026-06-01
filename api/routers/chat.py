@@ -7,24 +7,14 @@ import os
 import re
 import time
 
-_CHAT_TIMEOUT = float(os.getenv("CHAT_TIMEOUT_SECONDS", "120"))  # #3 per-request timeout
+_CHAT_TIMEOUT  = float(os.getenv("CHAT_TIMEOUT_SECONDS", "120"))   # per-request timeout
+_AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT_SECONDS", "30"))    # #17 per-agent in fan-out
 _PII_LOG_ENABLED = os.getenv("PII_REDACTION", "false").lower() == "true"  # C15
-
-_PII_LOG_PATTERNS = [
-    (__import__("re").compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"), "[EMAIL]"),
-    (__import__("re").compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"), "[PHONE]"),
-    (__import__("re").compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[SSN]"),
-]
-
-
-def _pii_scrub(text: str) -> str:
-    """C15 — Light PII scrub for logs (only when PII_REDACTION=true)."""
-    for pat, repl in _PII_LOG_PATTERNS:
-        text = pat.sub(repl, text)
-    return text
+from api.pii import scrub as _pii_scrub          # #2 shared PII module
+from config.constants import CONTEXT_LIMITS       # #7 single source of truth
 
 from fastapi import APIRouter, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 import api.db as _db
 import api.state as _state
@@ -41,11 +31,25 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+
+# B1 — request coalescing: deduplicate identical concurrent /chat calls
+# key: sha256(session_id + message) → (event, result_holder)
+_coalesce_map: dict[str, tuple[asyncio.Event, list]] = {}
+
+
+def _coalesce_key(session_id: str, message: str) -> str:
+    return hashlib.sha256(f"{session_id}\x00{message}".encode()).hexdigest()[:32]
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
-    # B9 — Idempotency-Key header takes precedence over body request_id
+    # B3/B9 — check idempotency: return cached response if key already processed
     effective_request_id = idempotency_key or req.request_id
     if effective_request_id:
+        cached_resp = await _db.idempotency_db.get(effective_request_id)
+        if cached_resp is not None:
+            return JSONResponse(content=cached_resp, headers={"X-Idempotent-Replayed": "true", "X-Session-ID": req.session_id or ""})
+        # Fall through: in-memory guard still catches same-process near-duplicate
         _state.session_manager.check_request_id(effective_request_id)
 
     _state.session_manager.check_session_rate_limit(req.session_id)
@@ -60,6 +64,18 @@ async def chat(req: ChatRequest, idempotency_key: str | None = Header(default=No
         except Exception:
             pass
 
+    # B1 — coalesce: if an identical request is already in-flight, wait for its result
+    _ck = _coalesce_key(req.session_id or "", req.message)
+    if _ck in _coalesce_map:
+        _evt, _holder = _coalesce_map[_ck]
+        await _evt.wait()
+        if _holder:
+            return _holder[0]
+
+    _evt = asyncio.Event()
+    _holder: list = []
+    _coalesce_map[_ck] = (_evt, _holder)
+
     try:
         lock = await _state.session_manager.acquire_lock(req.session_id)
         try:
@@ -72,6 +88,9 @@ async def chat(req: ChatRequest, idempotency_key: str | None = Header(default=No
                         orch.set_persona(p.get("system_prompt", ""))
                 except Exception:
                     pass
+            # F20 — UI-level system prompt override (from ABTestView, custom UIs, etc.)
+            if req.system_prompt:
+                orch.set_persona(req.system_prompt)
 
             processed_message, model_override = await _preprocessor.preprocess(req.message)
             if model_override and not req.preferred_model:
@@ -139,8 +158,9 @@ async def chat(req: ChatRequest, idempotency_key: str | None = Header(default=No
             if req.enable_self_eval:
                 self_eval_score = await orch.self_evaluate(message, response)
                 import os as _os
+                from llm.manager import _RETRY_ON_LOW_CONFIDENCE  # L19
                 threshold = float(_os.getenv("SELF_EVAL_THRESHOLD", "0.6"))
-                if 0 <= self_eval_score < threshold:
+                if _RETRY_ON_LOW_CONFIDENCE and 0 <= self_eval_score < threshold:
                     # Use a different model for the retry to get a fresh perspective
                     fallback = "gemini" if (req.preferred_model or "claude") == "claude" else "claude"
                     try:
@@ -166,8 +186,7 @@ async def chat(req: ChatRequest, idempotency_key: str | None = Header(default=No
 
         try:
             estimated = orch.llm.estimate_tokens(orch.conversation_history)
-            context_limits = {"claude": 190_000, "claude-haiku": 190_000, "gemini": 1_000_000}
-            limit = context_limits.get(d.model if d else "claude", 32_000)
+            limit = CONTEXT_LIMITS.get(d.model if d else "claude", 32_000)  # #7
             context_pct = round(estimated / limit * 100, 1)
         except Exception:
             context_pct = 0
@@ -207,7 +226,7 @@ async def chat(req: ChatRequest, idempotency_key: str | None = Header(default=No
 
         asyncio.create_task(_log_request())
 
-        return ChatResponse(
+        _resp = ChatResponse(
             response=response,
             model_used=d.model if d else "unknown",
             agent_used=d.agent if d else "unknown",
@@ -218,6 +237,16 @@ async def chat(req: ChatRequest, idempotency_key: str | None = Header(default=No
             confidence=confidence,
             self_eval_score=self_eval_score,
         )
+        _holder.append(_resp)
+        _resp_dict = _resp.model_dump()
+        # B3 — store response for idempotent replay
+        if effective_request_id:
+            asyncio.create_task(_db.idempotency_db.store(effective_request_id, _resp_dict))
+        # B6 — add X-Session-ID so clients can track which session was created/used
+        return JSONResponse(
+            content=_resp_dict,
+            headers={"X-Session-ID": req.session_id or ""},
+        )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail=f"Request timed out after {_CHAT_TIMEOUT:.0f}s")
     except HTTPException:
@@ -225,34 +254,101 @@ async def chat(req: ChatRequest, idempotency_key: str | None = Header(default=No
     except Exception as e:
         logger.exception("Unhandled error in /chat")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # B1 — signal any waiters and remove from coalesce map
+        _coalesce_map.pop(_ck, None)
+        _evt.set()
+
+
+_SESSION_TOKEN_BUDGET = int(os.getenv("SESSION_TOKEN_BUDGET", "0"))  # L13: 0 = unlimited
+_SSE_KEEPALIVE_INTERVAL = float(os.getenv("SSE_KEEPALIVE_SECONDS", "15"))  # B1
 
 
 @router.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
     async def generate():
-        lock = await _state.session_manager.acquire_lock(req.session_id)
-        t_start = time.time()
-        try:
-            orch = await _state.get_session(req.session_id)
-            decision = await orch.router.route(req.message, orch.conversation_history)
-            async with asyncio.timeout(_CHAT_TIMEOUT):  # C13 — per-request timeout
-                response = await orch.process(
-                    req.message, stream=False, show_routing=False,
-                    decision=decision, session_id=req.session_id,
-                )
-        except asyncio.TimeoutError:
-            yield f"data: {json.dumps({'type': 'error', 'detail': f'Request timed out after {_CHAT_TIMEOUT:.0f}s'})}\n\n"
+        # #18 — detect client disconnect before acquiring lock
+        if await req.is_disconnected():
             return
-        finally:
-            lock.release()
-        duration_ms = int((time.time() - t_start) * 1000)
-        # Record analytics with actual cost from cost tracker
+
+        # B4 — refuse new streams when server is draining
+        try:
+            from api.server import _shutting_down
+            if _shutting_down:
+                yield f"data: {json.dumps({'type': 'error', 'code': 'SHUTTING_DOWN', 'message': 'Server is shutting down'})}\n\n"
+                return
+        except ImportError:
+            pass
+
+        # L13 — session token budget pre-flight
+        if _SESSION_TOKEN_BUDGET > 0:
+            try:
+                from db.analytics import _db as _adb
+                if _adb is not None:
+                    rows = await _adb["analytics"].aggregate([
+                        {"$match": {"session_id": req.session_id}},
+                        {"$group": {"_id": None, "total": {"$sum": {"$add": ["$input_tokens", "$output_tokens"]}}}},
+                    ]).to_list(1)
+                    session_tokens = rows[0]["total"] if rows else 0
+                    if session_tokens >= _SESSION_TOKEN_BUDGET:
+                        yield f"data: {json.dumps({'type': 'error', 'code': 'SESSION_BUDGET_EXCEEDED', 'detail': f'Session token budget {_SESSION_TOKEN_BUDGET} exceeded'})}\n\n"
+                        return
+            except Exception:
+                pass
+
+        # B1 — run LLM work in a background task; yield SSE keepalive comments while waiting
+        _result_q: asyncio.Queue = asyncio.Queue()
+
+        async def _do_work():
+            lock = await _state.session_manager.acquire_lock(req.session_id)
+            t0 = time.time()
+            try:
+                # W21 — emit typing indicator on the event bus
+                from core.events import event_bus as _eb
+                asyncio.create_task(_eb.emit_typing(req.session_id or ""))
+                orch = await _state.get_session(req.session_id)
+                decision = await orch.router.route(req.message, orch.conversation_history)
+                async with asyncio.timeout(_CHAT_TIMEOUT):
+                    resp = await orch.process(
+                        req.message, stream=False, show_routing=False,
+                        decision=decision, session_id=req.session_id,
+                    )
+                await _result_q.put({"ok": True, "response": resp, "decision": decision, "orch": orch, "duration_ms": int((time.time() - t0) * 1000)})
+            except asyncio.TimeoutError:
+                await _result_q.put({"ok": False, "timeout": True, "partial": ""})
+            except Exception as exc:
+                await _result_q.put({"ok": False, "timeout": False, "error": str(exc)})
+            finally:
+                lock.release()
+
+        asyncio.create_task(_do_work())
+
+        # Poll with keepalive comments until the result arrives
+        while True:
+            try:
+                result = await asyncio.wait_for(_result_q.get(), timeout=_SSE_KEEPALIVE_INTERVAL)
+                break
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"  # B1 — SSE comment; proxies reset their timeout
+
+        if not result["ok"]:
+            if result.get("timeout"):
+                yield f"data: {json.dumps({'type': 'error', 'code': 'TIMEOUT', 'detail': f'Request timed out after {_CHAT_TIMEOUT:.0f}s'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'error', 'code': 'ERROR', 'detail': result.get('error', 'Unknown error')})}\n\n"
+            return
+
+        response = result["response"]
+        decision = result["decision"]
+        orch = result["orch"]
+        duration_ms = result["duration_ms"]
+
+        # Record analytics
         try:
             cost_stats = orch.llm.get_cost_stats()
             cost_usd = cost_stats.get("total_cost_usd", 0) if cost_stats else 0
             est_tokens = orch.llm.estimate_tokens(orch.conversation_history)
-            context_limits = {"claude": 190_000, "claude-haiku": 190_000, "gemini": 1_000_000}
-            limit = context_limits.get(decision.model, 32_000)
+            limit = CONTEXT_LIMITS.get(decision.model, 32_000)
             context_pct = round(est_tokens / limit * 100, 1)
             await _db.analytics_db.record_request(
                 session_id=req.session_id, agent=decision.agent, model=decision.model,
@@ -260,11 +356,20 @@ async def chat_stream(req: ChatRequest):
             )
         except Exception as exc:
             logger.warning("Analytics failed in /chat/stream: %s", exc)
+
         yield f"data: {json.dumps({'type': 'routing', 'model': decision.model, 'agent': decision.agent, 'tools': decision.tools})}\n\n"
         yield f"data: {json.dumps({'type': 'response', 'content': response, 'duration_ms': duration_ms})}\n\n"
+        # #14 — emit cost event
+        try:
+            cost_stats = orch.llm.get_cost_stats()
+            yield f"data: {json.dumps({'type': 'cost', 'usd': cost_stats.get('total_cost_usd', 0), 'model': decision.model})}\n\n"
+        except Exception:
+            pass
+        # B6 — session ID in stream too (as a data event so clients can read it)
+        yield f"data: {json.dumps({'type': 'session_id', 'session_id': req.session_id})}\n\n"
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return StreamingResponse(generate(), media_type="text/event-stream", headers={"X-Session-ID": req.session_id or ""})
 
 
 @router.post("/chat/compare")
@@ -450,7 +555,11 @@ async def chat_fan_out_stream(req: FanOutRequest):
     agents = req.agents or list(AGENT_REGISTRY.keys())[:4]
     orch = await _state.get_session(req.session_id)
 
-    async def _generate():
+    # B7 — bounded queue decouples producer tasks from SSE consumer
+    _queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+    _SENTINEL = object()
+
+    async def _produce():
         async def _call_agent(agent_name: str) -> dict:
             t0 = time.time()
             try:
@@ -458,11 +567,14 @@ async def chat_fan_out_stream(req: FanOutRequest):
                 if not agent_cls:
                     return {"agent": agent_name, "error": "unknown agent", "response": None, "duration_ms": 0}
                 agent = agent_cls(orch.llm, orch.tools)
-                resp = await agent.run(
-                    message=req.message, model=req.model,
-                    tool_names=[], conversation_history=[], session_id=req.session_id,
-                )
+                async with asyncio.timeout(_AGENT_TIMEOUT):  # #17 per-agent timeout
+                    resp = await agent.run(
+                        message=req.message, model=req.model,
+                        tool_names=[], conversation_history=[], session_id=req.session_id,
+                    )
                 return {"agent": agent_name, "response": resp, "error": None, "duration_ms": int((time.time() - t0) * 1000)}
+            except asyncio.TimeoutError:
+                return {"agent": agent_name, "response": None, "error": f"timed out after {_AGENT_TIMEOUT:.0f}s", "duration_ms": int(_AGENT_TIMEOUT * 1000)}
             except Exception as exc:
                 return {"agent": agent_name, "response": None, "error": str(exc), "duration_ms": 0}
 
@@ -471,8 +583,22 @@ async def chat_fan_out_stream(req: FanOutRequest):
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
-                result = t.result()
-                yield f"data: {json.dumps(result)}\n\n"
+                await _queue.put(t.result())
+        await _queue.put(_SENTINEL)
+
+    asyncio.create_task(_produce())
+
+    async def _generate():
+        token_total = 0
+        while True:
+            item = await _queue.get()
+            if item is _SENTINEL:
+                break
+            resp_text = item.get("response") or ""
+            # L14 — emit running token count progress event
+            token_total += len(resp_text.split()) * 4 // 3
+            yield f"data: {json.dumps({'type': 'progress', 'tokens': token_total})}\n\n"
+            yield f"data: {json.dumps(item)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(_generate(), media_type="text/event-stream")

@@ -19,6 +19,23 @@ try:
 except ImportError:
     _cache_get = _cache_put = None  # type: ignore[assignment]
 
+# L16 — per-model RPM throttle: track request timestamps per model
+import json as _json
+from collections import deque as _deque
+
+_model_rpm_limits: dict[str, int] = {}
+try:
+    _model_rpm_limits = _json.loads(os.getenv("MODEL_RPM_LIMITS", "{}"))
+except Exception:
+    pass
+_model_req_windows: dict[str, _deque] = {}
+
+# L17 — usage webhook URL (optional)
+_USAGE_WEBHOOK_URL = os.getenv("USAGE_WEBHOOK_URL", "")
+
+# L19 — global flag to control whether low-confidence retry actually fires
+_RETRY_ON_LOW_CONFIDENCE = os.getenv("RETRY_ON_LOW_CONFIDENCE", "true").lower() == "true"
+
 
 # ─────────────────────────────────────────
 # COST TRACKER
@@ -143,7 +160,7 @@ class LLMManager:
             except Exception:
                 pass
 
-        from config.constants import LLM_TIMEOUT_SECONDS, LLM_FALLBACK_CHAIN
+        from config.constants import LLM_TIMEOUT_SECONDS, LLM_FALLBACK_CHAIN, CONTEXT_LIMITS
         timeout = LLM_TIMEOUT_SECONDS
         t_start = time.perf_counter()
 
@@ -181,12 +198,42 @@ class LLMManager:
                 else:
                     raise ValueError(f"Unknown model: {m}")
 
+        # #33 — Per-model cost cap (pre-flight, best-effort)
+        _max_request_cost = float(os.getenv("MAX_REQUEST_COST_USD", "0"))
+        if _max_request_cost > 0 and "claude" in model:
+            _est_cost = self.estimate_tokens(messages, system_prompt) / 1_000_000 * 15.0
+            if _est_cost > _max_request_cost:
+                raise ValueError(
+                    f"Estimated request cost ${_est_cost:.4f} exceeds MAX_REQUEST_COST_USD=${_max_request_cost:.4f}"
+                )
+
         # 3-level fallback: try requested model, then fallback chain
         fallback_chain = [model] + [m for m in LLM_FALLBACK_CHAIN if m != model]
         last_exc: Exception = ValueError(f"No models available for fallback")
         result: str = ""
 
         for attempt_model in fallback_chain:
+            # L16 — per-model RPM throttle: delay if approaching the model's rate limit
+            if attempt_model in _model_rpm_limits:
+                _rpm = _model_rpm_limits[attempt_model]
+                _win = _model_req_windows.setdefault(attempt_model, _deque())
+                _now = time.time()
+                while _win and _win[0] < _now - 60:
+                    _win.popleft()
+                if len(_win) >= _rpm:
+                    _wait = 60 - (_now - _win[0]) + 0.1
+                    _mgr_logger.debug("Model %s RPM limit %d reached; waiting %.1fs", attempt_model, _rpm, _wait)
+                    await asyncio.sleep(max(0, _wait))
+                _win.append(time.time())
+
+            # #30 — skip if estimated tokens exceed this model's context window
+            try:
+                _limit = CONTEXT_LIMITS.get(attempt_model, 32_000)
+                if self.estimate_tokens(messages, system_prompt) + max_tokens > _limit:
+                    _mgr_logger.debug("Skipping %s — token estimate exceeds context limit %d", attempt_model, _limit)
+                    continue
+            except Exception:
+                pass
             try:
                 # B14 — Wrap each LLM call in an OTel span when tracing is enabled
                 if _otel_tracer:
@@ -226,6 +273,25 @@ class LLMManager:
             try:
                 if _cache_put is not None:
                     await _cache_put(model, messages, result, system_prompt)
+            except Exception:
+                pass
+
+        # L17 — fire-and-forget usage webhook if configured
+        if _USAGE_WEBHOOK_URL:
+            try:
+                _cost_stats = self.get_cost_stats()
+                async def _post_usage():
+                    try:
+                        async with __import__("httpx").AsyncClient(timeout=5) as _hc:
+                            await _hc.post(_USAGE_WEBHOOK_URL, json={
+                                "model": model,
+                                "input_tokens": _cost_stats.get("input_tokens", 0),
+                                "output_tokens": _cost_stats.get("output_tokens", 0),
+                                "cost_usd": _cost_stats.get("total_cost_usd", 0),
+                            })
+                    except Exception:
+                        pass
+                asyncio.create_task(_post_usage())
             except Exception:
                 pass
 
@@ -313,10 +379,21 @@ class LLMManager:
             _cb_logger.debug("Could not persist CB state: %s", exc)
 
     def load_cb_state(self) -> None:
-        """L22 — Load persisted CB state on startup so open circuits stay open."""
+        """L22/#32 — Load persisted CB state; skip if file is older than CB_RESET_TIMEOUT (stale)."""
         import json as _json
+        import os as _os
         try:
-            with open(self._CB_STATE_FILE) as fh:
+            f_path = self._CB_STATE_FILE
+            # #32 — TTL: if the file is older than the reset window, treat it as expired
+            try:
+                mtime = _os.path.getmtime(f_path)
+                if time.time() - mtime > _CB_RESET_TIMEOUT:
+                    _cb_logger.debug("CB state file is stale (age > %ds) — ignoring", _CB_RESET_TIMEOUT)
+                    _os.remove(f_path)
+                    return
+            except FileNotFoundError:
+                return
+            with open(f_path) as fh:
                 state = _json.load(fh)
             now = time.time()
             for model, info in state.items():
@@ -326,8 +403,6 @@ class LLMManager:
                     self._cb_open_at[model] = open_at
                     self._cb_failures[model] = info.get("failures", _CB_FAILURE_THRESHOLD)
                     _cb_logger.info("Restored OPEN circuit for %s from persisted state", model)
-        except FileNotFoundError:
-            pass
         except Exception as exc:
             _cb_logger.debug("Could not load CB state: %s", exc)
 
@@ -438,9 +513,12 @@ class AnthropicClient:
 
         resp = await self._post_with_retry(headers, payload)
         data = resp.json()
-        # L21 — derive variant from the model ID in the response rather than caller string
+        # L21 — prefer model ID from response body; fall back to caller-supplied variant
         _resp_model = data.get("model", "")
-        _detected_variant = "haiku" if "haiku" in _resp_model.lower() else "sonnet"
+        if _resp_model:
+            _detected_variant = "haiku" if "haiku" in _resp_model.lower() else "sonnet"
+        else:
+            _detected_variant = model_variant  # response omitted model — trust the caller
         self.cost_tracker.record(_detected_variant, data.get("usage", {}))
 
         # #11 — guard against missing 'content' key (e.g. content policy blocks)
@@ -468,11 +546,12 @@ class AnthropicClient:
     async def _stream(self, client, headers, payload, stream_callback=None) -> str:
         """Stream tokens from the API.
 
-        #10 — uses stream_callback if provided (API/programmatic use),
-        otherwise writes directly to stdout (CLI use).
+        #10  — uses stream_callback if provided (API/programmatic use).
+        #34  — parses the ``message_stop`` event to record cost from usage block.
         """
         payload["stream"] = True
         full_text = ""
+        _model_variant = "haiku" if "haiku" in payload.get("model", "").lower() else "sonnet"
         async with client.stream("POST", self.BASE_URL, json=payload, headers=headers) as resp:
             async for line in resp.aiter_lines():
                 if line.startswith("data: "):
@@ -482,7 +561,8 @@ class AnthropicClient:
                         break
                     try:
                         data = _json.loads(chunk)
-                        if data.get("type") == "content_block_delta":
+                        evt_type = data.get("type", "")
+                        if evt_type == "content_block_delta":
                             text = data["delta"].get("text", "")
                             full_text += text
                             if stream_callback is not None:
@@ -490,6 +570,11 @@ class AnthropicClient:
                             else:
                                 sys.stdout.write(text)
                                 sys.stdout.flush()
+                        elif evt_type == "message_delta":
+                            # #34 — capture usage from the final message_delta event
+                            usage = data.get("usage", {})
+                            if usage:
+                                self.cost_tracker.record(_model_variant, usage)
                     except Exception:
                         pass
         if stream_callback is None:

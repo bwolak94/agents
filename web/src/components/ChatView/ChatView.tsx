@@ -197,13 +197,17 @@ export function ChatView({ sessionId, messages, setMessages, historyLoading, onC
     const ts = new Date().toISOString();
     // Optimistic: add user message immediately
     setMessages((prev) => [...prev, { role: 'user', content: msg, ts }]);
+    // F26 — optimistic assistant placeholder shown during loading
+    const placeholderTs = new Date().toISOString();
+    setMessages((prev) => [...prev, { role: 'assistant', content: '…', loading: true, ts: placeholderTs } as any]);
     setInput('');
     try {
       const response = await send(msg);
-      setMessages((prev) => [...prev, { ...response, ts: new Date().toISOString() }]);
+      // Replace placeholder with real response
+      setMessages((prev) => prev.filter((m: any) => !m.loading).concat([{ ...response, ts: new Date().toISOString() }]));
     } catch {
-      // Rollback optimistic user message on error
-      setMessages((prev) => prev.filter((m) => !(m.role === 'user' && m.content === msg && m.ts === ts)));
+      // Rollback optimistic user message and loading placeholder on error
+      setMessages((prev) => prev.filter((m) => !(m.role === 'user' && m.content === msg && m.ts === ts) && !(m as any).loading));
       setMessages((prev) => [...prev, { role: 'error', content: 'Failed to send message. Please try again.', ts: new Date().toISOString() }]);
     }
   }, [input, loading, send, setMessages]);
@@ -496,6 +500,8 @@ function MessageBubble({ message: msg, messageIdx, sessionId, searchQuery, synta
               className={`text-sm p-0.5 transition-opacity border-none bg-transparent cursor-pointer ${rating === 1 ? 'opacity-100' : 'opacity-30 hover:opacity-70'}`}>👍</button>
             <button onClick={() => handleFeedback(-1)} title="Not helpful"
               className={`text-sm p-0.5 transition-opacity border-none bg-transparent cursor-pointer ${rating === -1 ? 'opacity-100' : 'opacity-30 hover:opacity-70'}`}>👎</button>
+            {/* F24 — copy full message text */}
+            <CopyButton text={msg.content} />
             <TtsButton text={msg.content} />
             {onRetry && (
               <button onClick={onRetry}

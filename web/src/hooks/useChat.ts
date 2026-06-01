@@ -1,5 +1,5 @@
 'use client';
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import type { ChatMessage } from '@/types/chat';
 import { API_URL } from '@/constants/api';
 
@@ -55,6 +55,7 @@ export function useChat(sessionId: string | null) {
           preferred_model: options?.preferredModel,     // F25
           enable_self_eval: options?.enableSelfEval,    // F25
           show_scratchpad: options?.showScratchpad,     // F25
+          system_prompt: options?.systemPrompt,         // F20
         }),
         signal: controller.signal,
       });
@@ -104,21 +105,36 @@ export function useChat(sessionId: string | null) {
         };
       }
 
-      // Fallback: non-streaming POST — F30: same headers
-      const res = await fetch(`${API_URL}/chat`, {
-        method: 'POST',
-        headers: baseHeaders,
-        body: JSON.stringify({
-          message: text,
-          session_id: sessionId,
-          show_routing: false,
-          request_id: requestId,
-          preferred_model: options?.preferredModel,
-          enable_self_eval: options?.enableSelfEval,
-          show_scratchpad: options?.showScratchpad,
-        }),
-        signal: controller.signal,
-      });
+      // Fallback: non-streaming POST with F16 exponential backoff on network errors
+      let res: Response | undefined;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          res = await fetch(`${API_URL}/chat`, {
+            method: 'POST',
+            headers: baseHeaders,
+            body: JSON.stringify({
+              message: text,
+              session_id: sessionId,
+              show_routing: false,
+              request_id: requestId,
+              preferred_model: options?.preferredModel,
+              enable_self_eval: options?.enableSelfEval,
+              show_scratchpad: options?.showScratchpad,
+              system_prompt: options?.systemPrompt,  // F20 — wire through to backend
+            }),
+            signal: controller.signal,
+          });
+          break;  // success — exit retry loop
+        } catch (fetchErr) {
+          // F16 — retry only on network-level TypeError (not 4xx/5xx)
+          if (fetchErr instanceof TypeError && attempt < 2) {
+            await new Promise(r => setTimeout(r, 500 * 2 ** attempt));
+            continue;
+          }
+          throw fetchErr;
+        }
+      }
+      if (!res) throw new Error('No response after retries');
       if (!res.ok) throw new Error(`HTTP ${res.status} (request-id: ${requestId})`);  // F30
       const data = (await res.json()) as ChatApiResponse;
       return {
@@ -144,6 +160,9 @@ export function useChat(sessionId: string | null) {
   };
 
   const abort = () => abortRef.current?.abort();
+
+  // #39 — cancel any in-flight request when the component unmounts
+  useEffect(() => () => { abortRef.current?.abort(); }, []);
 
   return { loading, send, abort, streamingContent };
 }

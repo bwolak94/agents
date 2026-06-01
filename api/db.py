@@ -9,6 +9,7 @@ so both lists stay in sync automatically when new modules are added here.
 """
 from db import memory as memory_db
 from db import analytics as analytics_db
+from db import idempotency as idempotency_db
 from db import prompts as prompts_db
 from db import feedback as feedback_db
 from db import rag as rag_db
@@ -48,7 +49,7 @@ from db.history import (
 # ── Module registries used by server.py lifespan ──────────────────────────────
 # Every module that needs set_db() called:
 ALL_DB_MODULES = (
-    memory_db, analytics_db, prompts_db, feedback_db,
+    memory_db, analytics_db, idempotency_db, prompts_db, feedback_db,
     rag_db, file_versions_db, cache_db, personas_db,
     tags_db, agent_checkpoints_db, collab_graph_db,
     macros_db, batch_db, workflows_db, experiments_db,
@@ -65,4 +66,6 @@ INDEXABLE_DB_MODULES = (
     memory_graph_db, webhooks_db, webhook_triggers_db, comments_db,
     session_roles_db, request_log_db, insights_db, plugins_db,
     scheduled_reports_db,
+    analytics_db,  # D11 — TTL index
+    idempotency_db,  # B3 — idempotency TTL
 )

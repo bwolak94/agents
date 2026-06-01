@@ -1,15 +1,32 @@
 """
 Analytics store — records per-request metrics and aggregates them.
+
+#22: get_summary uses secondaryPreferred to offload reads from the primary.
+#26: record_request uses w=0 (fire-and-forget) — analytics loss is acceptable
+     and avoids adding ~50 ms of write-concern latency to every chat request.
+D11: TTL index on analytics.ts (ANALYTICS_TTL_DAYS env, default 90).
 """
+import os
 from datetime import datetime, timezone, timedelta
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 _db: AsyncIOMotorDatabase | None = None
+_ANALYTICS_TTL_DAYS = int(os.getenv("ANALYTICS_TTL_DAYS", "90"))
 
 
 def set_db(db: AsyncIOMotorDatabase) -> None:
     global _db
     _db = db
+
+
+async def ensure_indexes() -> None:
+    """D11 — TTL index so analytics docs auto-expire after ANALYTICS_TTL_DAYS."""
+    if _db is None:
+        return
+    # TTL index on the `ts` field — MongoDB deletes docs once ts + TTL has passed
+    ttl_seconds = _ANALYTICS_TTL_DAYS * 86_400
+    await _db["analytics"].create_index("ts", expireAfterSeconds=ttl_seconds)
+    await _db["analytics"].create_index([("session_id", 1), ("date", -1)])
 
 
 async def record_request(
@@ -23,11 +40,13 @@ async def record_request(
     cost_usd: float = 0.0,
     context_pct: float = 0.0,
 ) -> None:
-    """Append one request record to the analytics collection."""
+    """Append one request record to the analytics collection.
+    #26 — uses w=0 write concern (fire-and-forget) to avoid blocking chat responses.
+    """
     if _db is None:
         return
     now = datetime.now(timezone.utc)
-    await _db["analytics"].insert_one({
+    await _db.get_collection("analytics", write_concern=__import__("pymongo").WriteConcern(w=0)).insert_one({
         "session_id": session_id,
         "agent": agent,
         "model": model,
@@ -72,7 +91,13 @@ async def get_summary(days: int = 30) -> dict:
             "total_output_tokens": {"$sum": "$output_tokens"},
         }},
     ]
-    cursor = _db["analytics"].aggregate(pipeline)
+    # #22 — use secondary replica for heavy analytics aggregation
+    try:
+        from pymongo import ReadPreference
+        _coll = _db.get_collection("analytics", read_preference=ReadPreference.SECONDARY_PREFERRED)
+    except Exception:
+        _coll = _db["analytics"]
+    cursor = _coll.aggregate(pipeline)
     totals_raw = await cursor.to_list(1)
 
     # Per-agent breakdown

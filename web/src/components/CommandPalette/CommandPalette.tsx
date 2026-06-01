@@ -8,6 +8,7 @@ interface Command {
   label: string;
   description?: string;
   group?: string;
+  shortcut?: string;  // F18 — keyboard shortcut hint shown inline
   action: () => void;
 }
 
@@ -18,9 +19,22 @@ interface CommandPaletteProps {
   sessionId: string | null;
 }
 
+const _RECENT_CMDS_KEY = 'cmd-palette-recent';
+const _MAX_RECENT = 5;
+function getRecentCmdIds(): string[] {
+  try { return JSON.parse(localStorage.getItem(_RECENT_CMDS_KEY) || '[]'); } catch { return []; }
+}
+function addRecentCmd(id: string) {
+  try {
+    const prev = getRecentCmdIds().filter(x => x !== id);
+    localStorage.setItem(_RECENT_CMDS_KEY, JSON.stringify([id, ...prev].slice(0, _MAX_RECENT)));
+  } catch {}
+}
+
 export function CommandPalette({ onViewChange, onNewSession, onSelectSession, sessionId }: CommandPaletteProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
+  const [recentIds, setRecentIds] = useState<string[]>([]);  // F25
   const [sessions, setSessions] = useState<{ session_id: string; preview: string }[]>([]);
   const [agents, setAgents] = useState<string[]>([]);
   const [macros, setMacros] = useState<{ name: string; description: string }[]>([]);
@@ -45,6 +59,7 @@ export function CommandPalette({ onViewChange, onNewSession, onSelectSession, se
   useEffect(() => {
     if (open) {
       setTimeout(() => inputRef.current?.focus(), 50);
+      setRecentIds(getRecentCmdIds());  // F25 — load recent on open
       // Lazy-load sessions, agents, macros when palette opens
       fetch(`${API_URL}/sessions?limit=20`).then(r => r.json()).then(d => {
         setSessions((d.sessions ?? []).map((s: { session_id: string; preview?: string }) => ({
@@ -68,14 +83,20 @@ export function CommandPalette({ onViewChange, onNewSession, onSelectSession, se
 
   const close = useCallback(() => { setOpen(false); setQuery(''); }, []);
 
+  // F25 — wrap a command action to record it in recent history
+  const tracked = useCallback((cmd: Command): Command => ({
+    ...cmd,
+    action: () => { addRecentCmd(cmd.id); setRecentIds(getRecentCmdIds()); cmd.action(); },
+  }), []);
+
   const staticCommands: Command[] = [
-    { id: 'chat',       label: 'Go to Chat',       description: 'Switch to chat view',      group: 'Navigate', action: () => { onViewChange('chat'); close(); } },
-    { id: 'analytics',  label: 'Go to Analytics',   description: 'View analytics dashboard', group: 'Navigate', action: () => { onViewChange('analytics'); close(); } },
-    { id: 'memory',     label: 'Go to Memory',      description: 'Inspect agent memory',     group: 'Navigate', action: () => { onViewChange('memory'); close(); } },
+    { id: 'chat',       label: 'Go to Chat',       description: 'Switch to chat view',      group: 'Navigate', shortcut: '⌘1', action: () => { onViewChange('chat'); close(); } },
+    { id: 'analytics',  label: 'Go to Analytics',   description: 'View analytics dashboard', group: 'Navigate', shortcut: '⌘2', action: () => { onViewChange('analytics'); close(); } },
+    { id: 'memory',     label: 'Go to Memory',      description: 'Inspect agent memory',     group: 'Navigate', shortcut: '⌘3', action: () => { onViewChange('memory'); close(); } },
     { id: 'branch',     label: 'Go to Branch',      description: 'Fork sessions',            group: 'Navigate', action: () => { onViewChange('branch'); close(); } },
     { id: 'plugins',    label: 'Go to Plugins',     description: 'Community plugins',        group: 'Navigate', action: () => { onViewChange('plugins'); close(); } },
     { id: 'ab-test',    label: 'Go to A/B Test',    description: 'System prompt A/B testing',group: 'Navigate', action: () => { onViewChange('ab-test'); close(); } },
-    { id: 'new-session',label: 'New Session',        description: 'Start a new conversation', group: 'Actions',  action: () => { onNewSession(); close(); } },
+    { id: 'new-session',label: 'New Session',        description: 'Start a new conversation', group: 'Actions',  shortcut: '⌘N', action: () => { onNewSession(); close(); } },
     {
       id: 'export-md',
       label: 'Export as Markdown',
@@ -151,32 +172,52 @@ export function CommandPalette({ onViewChange, onNewSession, onSelectSession, se
     action: () => close(),
   }));
 
-  const allCommands = [...staticCommands, ...sessionCmds, ...agentCmds, ...macroCmds];
+  const allCommands = [...staticCommands, ...sessionCmds, ...agentCmds, ...macroCmds].map(tracked);
 
-  const filtered = query.trim()
-    ? allCommands.filter(
-        (c) =>
-          c.label.toLowerCase().includes(query.toLowerCase()) ||
-          c.description?.toLowerCase().includes(query.toLowerCase()) ||
-          c.group?.toLowerCase().includes(query.toLowerCase()),
-      )
-    : allCommands;
+  // #49 — fuzzy search: score by substring match + bigram overlap for typo tolerance
+  const filtered = useCallback((q: string, cmds: Command[]): Command[] => {
+    if (!q.trim()) return cmds;
+    const lower = q.toLowerCase();
+
+    function bigrams(s: string): Set<string> {
+      const set = new Set<string>();
+      for (let i = 0; i < s.length - 1; i++) set.add(s.slice(i, i + 2));
+      return set;
+    }
+    function score(c: Command): number {
+      const haystack = `${c.label} ${c.description ?? ''} ${c.group ?? ''}`.toLowerCase();
+      if (haystack.includes(lower)) return 2;   // exact substring — top priority
+      const qBi = bigrams(lower);
+      const hBi = bigrams(haystack);
+      let overlap = 0;
+      qBi.forEach(b => { if (hBi.has(b)) overlap++; });
+      return qBi.size > 0 ? overlap / qBi.size : 0;
+    }
+
+    return cmds
+      .map(c => ({ c, s: score(c) }))
+      .filter(({ s }) => s > 0.3)
+      .sort((a, b) => b.s - a.s)
+      .map(({ c }) => c);
+  }, []);
+
+  const filteredCommands = filtered(query, allCommands);
 
   const [selected, setSelected] = useState(0);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      setSelected((s) => Math.min(s + 1, filtered.length - 1));
+      setSelected((s) => Math.min(s + 1, filteredCommands.length - 1));
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
       setSelected((s) => Math.max(s - 1, 0));
     } else if (e.key === 'Enter') {
-      filtered[selected]?.action();
+      filteredCommands[selected]?.action();
     } else if (e.key === 'Escape') {
       close();
     }
-  }, [filtered, selected, close]);
+  }, [filteredCommands, selected, close]);
 
   useEffect(() => { setSelected(0); }, [query]);
 
@@ -184,7 +225,14 @@ export function CommandPalette({ onViewChange, onNewSession, onSelectSession, se
 
   // Group results for display
   const groups: Record<string, Command[]> = {};
-  for (const cmd of filtered) {
+  // F25 — prepend "Recent" group when no search query is active
+  if (!query.trim() && recentIds.length > 0) {
+    const recentCmds = recentIds
+      .map(id => allCommands.find(c => c.id === id))
+      .filter((c): c is Command => !!c);
+    if (recentCmds.length > 0) groups['Recent'] = recentCmds;
+  }
+  for (const cmd of filteredCommands) {
     const g = cmd.group ?? 'Other';
     if (!groups[g]) groups[g] = [];
     groups[g].push(cmd);
@@ -250,12 +298,18 @@ export function CommandPalette({ onViewChange, onNewSession, onSelectSession, se
                       }}
                       onMouseEnter={() => setSelected(i)}
                     >
-                      <div>
+                      <div style={{ flex: 1 }}>
                         <div style={{ fontSize: 13, color: '#e2e8f0', fontWeight: 500 }}>{cmd.label}</div>
                         {cmd.description && (
                           <div style={{ fontSize: 11, color: '#475569', marginTop: 2 }}>{cmd.description}</div>
                         )}
                       </div>
+                      {/* F18 — keyboard shortcut hint */}
+                      {cmd.shortcut && (
+                        <span style={{ fontSize: 10, color: '#475569', border: '1px solid #334155', borderRadius: 4, padding: '1px 5px', flexShrink: 0 }}>
+                          {cmd.shortcut}
+                        </span>
+                      )}
                     </div>
                   );
                 })}

@@ -20,6 +20,8 @@ _MONGO_MAX_POOL     = int(os.getenv("MONGO_MAX_POOL_SIZE", "20"))
 _MONGO_MIN_POOL     = int(os.getenv("MONGO_MIN_POOL_SIZE", "5"))
 _SESSION_TTL_DAYS   = int(os.getenv("SESSION_TTL_DAYS", "90"))
 _MONGO_WRITE_CONCERN = os.getenv("MONGO_WRITE_CONCERN", "majority")  # D18
+_MAX_MESSAGES       = int(os.getenv("MAX_MESSAGES_PER_SESSION", "2000"))  # D12
+_READ_CONCERN       = os.getenv("MONGO_READ_CONCERN", "local")  # D15: "local" or "majority"
 
 
 async def init_db(mongo_url: str):
@@ -64,11 +66,31 @@ async def init_db(mongo_url: str):
         expireAfterSeconds=_SESSION_TTL_DAYS * 24 * 3600,
         name="updated_at_ttl_1",
     )
-    # Full-text search index on message content
+    # #21 — Sparse indexes: skip docs that lack these optional fields
     try:
-        await _db["conversations"].create_index([("messages.content", "text"), ("preview", "text")])
+        await _db["conversations"].create_index("title", sparse=True)
     except Exception:
-        pass  # Index may already exist
+        pass
+    try:
+        await _db["conversations"].create_index("auto_tags", sparse=True)
+    except Exception:
+        pass
+    # #28 — Compound index for "last user message" lookup (auto-title/tag, snapshots)
+    try:
+        await _db["conversations"].create_index(
+            [("session_id", 1), ("messages.role", 1), ("messages.ts", -1)],
+            name="session_role_ts",
+        )
+    except Exception:
+        pass
+    # #23 — Collation-aware text search index (case-insensitive, locale en)
+    try:
+        await _db["conversations"].create_index(
+            [("messages.content", "text"), ("preview", "text"), ("title", "text")],
+            default_language="english",
+        )
+    except Exception:
+        pass  # index may already exist
     # TTL index: analytics records expire after 90 days (#20).
     # Drop the old non-TTL index first if it exists so we can recreate it.
     try:
@@ -97,10 +119,13 @@ async def load_history(session_id: str, tail: int | None = None) -> list:
     projection: dict = {"_id": 0, "messages": 1}
     if tail is not None:
         projection["messages"] = {"$slice": -tail}
-    doc = await _db["conversations"].find_one(
-        {"session_id": session_id},
-        projection,
-    )
+    # D15 — use configurable read concern for critical history reads
+    try:
+        from pymongo import ReadPreference as _RP
+        _coll = _db.get_collection("conversations", read_concern=__import__("pymongo").ReadConcern(_READ_CONCERN))
+    except Exception:
+        _coll = _db["conversations"]
+    doc = await _coll.find_one({"session_id": session_id}, projection)
     return doc["messages"] if doc else []
 
 
@@ -114,17 +139,37 @@ async def load_context(session_id: str, limit: int = _CONTEXT_MESSAGE_LIMIT) -> 
     return [{"role": m["role"], "content": m["content"]} for m in recent]
 
 
+import hashlib as _hashlib
+
+
 async def append_message(session_id: str, role: str, content: str, **meta):
     """Append a single message to the session history.
 
     D17 — Eliminated a separate ``find_one`` for preview by using ``$setOnInsert``
     exclusively: preview is written only when the document is first created (upsert),
     removing one round-trip on every message append.
+
+    D12 — Before pushing, check the last message's content hash to prevent
+    double-writes from idempotent retries.
     """
+    # D12 — compute content hash for dedup check
+    _content_hash = _hashlib.md5(f"{role}:{content}".encode()).hexdigest()
+
+    # D12 — skip if the last stored message is identical (same role + content hash)
+    existing = await _db["conversations"].find_one(
+        {"session_id": session_id, "messages": {"$exists": True}},
+        {"_id": 0, "messages": {"$slice": -1}},
+    )
+    if existing:
+        last = existing.get("messages", [{}])[-1]
+        if last.get("_hash") == _content_hash:
+            return  # duplicate — skip
+
     msg = {
         "role": role,
         "content": content,
         "ts": datetime.now(timezone.utc).isoformat(),
+        "_hash": _content_hash,
         **meta,
     }
     now = datetime.now(timezone.utc).isoformat()
@@ -134,10 +179,11 @@ async def append_message(session_id: str, role: str, content: str, **meta):
     if role == "user":
         set_on_insert["preview"] = _strip_xml(content)[:100]
 
+    # D12 — cap messages array with $slice to prevent unbounded growth
     await _db["conversations"].update_one(
         {"session_id": session_id},
         {
-            "$push": {"messages": msg},
+            "$push": {"messages": {"$each": [msg], "$slice": -_MAX_MESSAGES}},
             "$set":  {"updated_at": now},
             "$setOnInsert": set_on_insert,
         },
@@ -193,10 +239,12 @@ async def list_sessions(limit: int = 50, skip: int = 0, after: str | None = None
     if after:
         base_filter["updated_at"] = {"$lt": after}
 
+    from pymongo import DESCENDING
+    # #11 — add _id as tiebreaker so concurrent inserts don't cause page drift
     cursor = _db["conversations"].find(
         base_filter,
-        {"_id": 0, "session_id": 1, "updated_at": 1, "created_at": 1, "preview": 1, "title": 1, "auto_tags": 1, "messages": {"$slice": 1}}
-    ).sort("updated_at", -1).batch_size(50)  # B10 — configurable batch_size reduces memory spikes
+        {"_id": 1, "session_id": 1, "updated_at": 1, "created_at": 1, "preview": 1, "title": 1, "auto_tags": 1, "archived": 1, "messages": {"$slice": 1}}
+    ).sort([("updated_at", DESCENDING), ("_id", DESCENDING)]).batch_size(50)
     if not after:
         cursor = cursor.skip(skip)
     cursor = cursor.limit(limit)
@@ -222,5 +270,6 @@ async def list_sessions(limit: int = 50, skip: int = 0, after: str | None = None
             "preview": preview,
             "title": doc.get("title", ""),
             "auto_tags": doc.get("auto_tags", []),
+            "archived": doc.get("archived", False),  # D10
         })
     return result

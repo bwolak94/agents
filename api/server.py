@@ -23,7 +23,9 @@ import httpx
 correlation_id: contextvars.ContextVar[str] = contextvars.ContextVar("correlation_id", default="")
 
 _active_tasks: set[asyncio.Task] = set()
-_active_tasks_lock: asyncio.Lock | None = None  # B7 — lazy-init inside event loop
+_active_tasks_lock: asyncio.Lock | None = None  # lazy-init inside event loop
+# B4 — graceful drain: set to True on shutdown so SSE generators can flush and exit
+_shutting_down: bool = False
 
 
 def _get_tasks_lock() -> asyncio.Lock:
@@ -44,6 +46,7 @@ def _track_task(coro):
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -152,6 +155,23 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.debug("Ollama warm-up skipped (not available)")
 
+    # L18 — model connectivity pre-check: mark unavailable models as unhealthy at startup
+    async def _precheck_models():
+        for m in default_orch.llm.available_models():
+            try:
+                await default_orch.llm.call(
+                    model=m,
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=1,
+                    temperature=0,
+                )
+                logger.debug("Model pre-check OK: %s", m)
+            except Exception as exc:
+                default_orch.llm.mark_model_unhealthy(m)
+                logger.warning("Model pre-check FAILED for %s: %s", m, exc)
+
+    _track_task(_precheck_models())
+
     # Shared httpx client for all outbound HTTP (webhooks, Ollama, vision) — #1 / #9
     app.state.http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(30.0),
@@ -190,7 +210,34 @@ async def lifespan(app: FastAPI):
 
     _track_task(_cleanup_rate_windows())
 
+    # B7 — background auto-archive of stale sessions
+    _SESSION_ARCHIVE_DAYS = int(os.getenv("SESSION_ARCHIVE_DAYS", "30"))
+
+    async def _auto_archive_sessions():
+        while True:
+            await asyncio.sleep(86_400)  # run once per day
+            try:
+                from db.history import _db as _hist_db
+                from datetime import datetime, timezone, timedelta
+                if _hist_db is None:
+                    continue
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=_SESSION_ARCHIVE_DAYS)).isoformat()
+                result = await _hist_db["conversations"].update_many(
+                    {"updated_at": {"$lt": cutoff}, "archived": {"$ne": True}},
+                    {"$set": {"archived": True}},
+                )
+                if result.modified_count:
+                    logger.info("Auto-archived %d stale sessions (older than %d days)", result.modified_count, _SESSION_ARCHIVE_DAYS)
+            except Exception:
+                logger.debug("Auto-archive failed", exc_info=True)
+
+    _track_task(_auto_archive_sessions())
+
     yield
+
+    global _shutting_down
+    _shutting_down = True  # B4 — signal SSE generators to drain and exit
+    await asyncio.sleep(0.1)  # B4 — yield to let generators detect shutdown
 
     await app.state.http_client.aclose()
 
@@ -257,6 +304,24 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
             "detail": "Internal server error",
             "type": type(exc).__name__,
             "error_code": error_code,
+        },
+    )
+
+
+# B8 — structured 422 validation error envelope
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    fields = [
+        {"field": ".".join(str(l) for l in e["loc"][1:]) or "body", "error": e["msg"]}
+        for e in exc.errors()
+    ]
+    return JSONResponse(
+        status_code=422,
+        content={
+            "code": "VALIDATION_ERROR",
+            "message": "Request validation failed",
+            "fields": fields,
+            "request_id": request.headers.get("X-Request-ID", ""),
         },
     )
 
@@ -342,6 +407,9 @@ def _is_fast_path(path: str) -> bool:
 
 # ── #23 Server-Timing headers ─────────────────────────────────────────────────
 
+_SLOW_REQUEST_THRESHOLD_MS = float(os.getenv("SLOW_REQUEST_MS", "1000"))
+
+
 @app.middleware("http")
 async def server_timing_middleware(request: Request, call_next):
     if _is_fast_path(request.url.path):  # B6 — skip for health/docs
@@ -351,6 +419,13 @@ async def server_timing_middleware(request: Request, call_next):
     elapsed_ms = (time.perf_counter() - t0) * 1000
     response.headers["Server-Timing"] = f"total;dur={elapsed_ms:.1f}"
     response.headers["Timing-Allow-Origin"] = "*"
+    # B2 — log slow requests for production debugging
+    if elapsed_ms >= _SLOW_REQUEST_THRESHOLD_MS:
+        logger.warning(
+            "slow_request method=%s path=%s duration_ms=%.1f request_id=%s",
+            request.method, request.url.path, elapsed_ms,
+            response.headers.get("X-Request-ID", ""),
+        )
     return response
 
 
@@ -359,6 +434,44 @@ async def server_timing_middleware(request: Request, call_next):
 from config.constants import EXPENSIVE_RATE_LIMIT_RPM as _EXP_RPM, COST_BUDGET_USD as _COST_BUDGET
 _EXPENSIVE_PATHS = {"/chat/plan", "/chat/red-team", "/chat/fan-out", "/chat/negotiate"}
 _exp_windows: dict[str, deque] = defaultdict(deque)  # B1 — deque for O(1) popleft
+
+# #6 — Concurrency semaphore: cap simultaneous heavy LLM calls
+_MAX_CONCURRENT_HEAVY = int(os.getenv("MAX_CONCURRENT_HEAVY", "5"))
+_heavy_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_HEAVY)
+
+# #3 — POST paths that require application/json content-type
+_JSON_REQUIRED_PATHS = {"/chat", "/chat/stream", "/chat/plan", "/chat/simulate", "/chat/fan-out"}
+
+
+@app.middleware("http")
+async def content_type_middleware(request: Request, call_next):
+    """#3 — Reject POST requests to JSON endpoints without correct Content-Type."""
+    if (
+        request.method == "POST"
+        and request.url.path in _JSON_REQUIRED_PATHS
+        and "application/json" not in request.headers.get("content-type", "")
+        and request.headers.get("content-length", "0") != "0"
+    ):
+        return JSONResponse(
+            status_code=415,
+            content={"detail": "Content-Type must be application/json", "error_code": "UNSUPPORTED_MEDIA_TYPE"},
+        )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def heavy_concurrency_middleware(request: Request, call_next):
+    """#6 — Cap simultaneous expensive LLM calls to prevent thundering herd."""
+    if request.url.path not in _EXPENSIVE_PATHS or request.method != "POST":
+        return await call_next(request)
+    if _heavy_semaphore.locked() and _heavy_semaphore._value == 0:  # type: ignore[attr-defined]
+        return JSONResponse(
+            status_code=503,
+            content={"code": "TOO_BUSY", "message": f"Server busy — max {_MAX_CONCURRENT_HEAVY} concurrent heavy requests", "request_id": request.headers.get("X-Request-ID", "")},
+            headers={"Retry-After": "5"},
+        )
+    async with _heavy_semaphore:
+        return await call_next(request)
 
 
 @app.middleware("http")
@@ -374,7 +487,7 @@ async def expensive_rate_limit_middleware(request: Request, call_next):
     if len(window) >= _EXP_RPM:
         return JSONResponse(
             status_code=429,
-            content={"detail": f"Rate limit for compute-heavy endpoint ({_EXP_RPM} rpm)", "error_code": "EXPENSIVE_RATE_LIMIT"},
+            content={"code": "EXPENSIVE_RATE_LIMIT", "message": f"Rate limit for compute-heavy endpoint ({_EXP_RPM} rpm)", "request_id": request.headers.get("X-Request-ID", "")},
         )
     window.append(now)
     return await call_next(request)
@@ -417,18 +530,13 @@ async def cost_budget_middleware(request: Request, call_next):
     if cached_cost >= _COST_BUDGET:
         return JSONResponse(
             status_code=429,
-            content={"detail": f"Daily cost budget ${_COST_BUDGET:.2f} exceeded", "error_code": "BUDGET_EXCEEDED"},
+            content={"code": "BUDGET_EXCEEDED", "message": f"Daily cost budget ${_COST_BUDGET:.2f} exceeded", "request_id": request.headers.get("X-Request-ID", "")},
         )
     return await call_next(request)
 
 
 _PII_ENABLED = os.getenv("PII_REDACTION", "false").lower() == "true"
-_PII_PATTERNS = [
-    (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"), "[EMAIL]"),
-    (re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"), "[PHONE]"),
-    (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[SSN]"),
-    (re.compile(r"\b(?:4\d{12}(?:\d{3})?|5[1-5]\d{14}|3[47]\d{13}|6(?:011|5\d{2})\d{12})\b"), "[CARD]"),
-]
+from api.pii import scrub as _pii_scrub_body, PATTERNS as _PII_PATTERNS  # #2 shared module
 _PII_REDACT_PATHS = {"/chat", "/chat/stream", "/chat/plan", "/chat/simulate"}
 
 
@@ -448,6 +556,7 @@ async def pii_redaction_middleware(request: Request, call_next):
             redacted = body_text
             for pattern, replacement in _PII_PATTERNS:
                 redacted = pattern.sub(replacement, redacted)
+            redacted = _pii_scrub_body(body_text)  # #2 shared scrub fn
             if redacted != body_text:
                 async def _receive():
                     return {"type": "http.request", "body": redacted.encode("utf-8"), "more_body": False}
@@ -459,9 +568,16 @@ async def pii_redaction_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
+    # B4 — use API key hash as bucket when auth is active (avoids shared-IP collisions)
+    auth_header = request.headers.get("Authorization", "")
+    if _API_KEY and auth_header.startswith("Bearer "):
+        import hashlib as _hl
+        bucket = "key:" + _hl.sha256(auth_header[7:].strip().encode()).hexdigest()[:16]
+    else:
+        bucket = request.client.host if request.client else "unknown"
     client_ip = request.client.host if request.client else "unknown"
     now = time.time()
-    window = _rate_windows[client_ip]
+    window = _rate_windows[bucket]
     # Slide window: drop timestamps older than 60s
     cutoff = now - 60
     while window and window[0] < cutoff:
@@ -469,10 +585,12 @@ async def rate_limit_middleware(request: Request, call_next):
     remaining = max(0, _RATE_LIMIT_REQUESTS - len(window))
     reset_at = int(window[0] + 60) if window else int(now + 60)
     if len(window) >= _RATE_LIMIT_REQUESTS:
-        # #4 Retry-After + #5 X-RateLimit headers on 429
+        # #10 — log rate-limit hits for security auditing
+        logger.info("rate_limit_hit ip=%s path=%s reset_at=%d", client_ip, request.url.path, reset_at)
+        # B3 — structured error envelope; #4 Retry-After + #5 X-RateLimit headers on 429
         return JSONResponse(
             status_code=429,
-            content={"detail": "Rate limit exceeded. Please slow down."},
+            content={"code": "RATE_LIMITED", "message": "Rate limit exceeded. Please slow down.", "request_id": request.headers.get("X-Request-ID", "")},
             headers={
                 "Retry-After": str(reset_at - int(now)),
                 "X-RateLimit-Limit": str(_RATE_LIMIT_REQUESTS),

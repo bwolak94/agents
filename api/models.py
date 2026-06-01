@@ -42,6 +42,7 @@ class ChatRequest(BaseModel):
     persona: str = ""
     show_scratchpad: bool = False      # #3 chain-of-thought
     enable_self_eval: bool = False     # #2 self-evaluation loop
+    system_prompt: str = Field(default="", max_length=10_000, description="F20 — UI-level system prompt override")  # F20
 
 class ChatResponse(BaseModel):
     response: str
