@@ -9,6 +9,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from api.models import DigestScheduleRequest
 
 # ── Prometheus metrics ────────────────────────────────────────────────────────
 try:
@@ -637,7 +638,7 @@ async def get_batch(batch_id: str):
 # ── #11 Scheduled digest ──────────────────────────────────────────────────────
 
 @router.post("/digests/schedule")
-async def schedule_digest(req: "DigestScheduleRequest"):
+async def schedule_digest(req: DigestScheduleRequest):
     interval = 7 * 86400 if req.frequency == "weekly" else 86400
     digest_prompt = (
         "Generate a concise digest of this conversation session:\n"
@@ -961,7 +962,6 @@ async def graphql_endpoint(request: "Request"):
     return {"data": result.data, "errors": [str(e) for e in (result.errors or [])]}
 
 
-from api.models import DigestScheduleRequest  # noqa: E402 — deferred to avoid circular at module load
 
 
 # ── F1 Daily Briefing ─────────────────────────────────────────────────────────

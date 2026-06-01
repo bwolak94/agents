@@ -158,6 +158,7 @@ export function AnalyticsDashboard() {
               ↓ CSV
             </button>
           )}
+        </div>
         {daily.length === 0 && <div className="text-xs text-text-faint">No data</div>}
         <div className="flex flex-col gap-2">
           {daily.map((d: DailyStat, i: number) => (

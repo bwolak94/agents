@@ -23,15 +23,21 @@ export function middleware(request: NextRequest) {
   }
 
   const nonce = generateNonce();
+  const isDev = process.env.NODE_ENV === 'development';
+
+  // In dev, Next.js HMR requires unsafe-eval; strict-dynamic + nonce in prod
+  const scriptSrc = isDev
+    ? `script-src 'self' 'unsafe-eval' 'nonce-${nonce}'`
+    : `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`;
 
   const csp = [
     "default-src 'self'",
-    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`,
+    scriptSrc,
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-    "font-src 'self' https://fonts.gstatic.com",
+    "font-src 'self' https://fonts.gstatic.com data:",
     "img-src 'self' data: blob:",
-    "media-src 'self' blob:",          // needed for VoiceConversation
-    "connect-src 'self' ws: wss:",
+    "media-src 'self' blob:",
+    "connect-src 'self' ws: wss: http://localhost:8000",
     "worker-src 'self' blob:",
   ].join('; ');
 

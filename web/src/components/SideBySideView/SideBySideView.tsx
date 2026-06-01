@@ -34,9 +34,9 @@ function ChatPane({ sessionId, onChangeSession, allSessions }: PaneProps) {
     setMessages(prev => [...prev, { role: 'user', content: msg, ts: new Date().toISOString() }]);
     setInput('');
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const resp = await send(msg) as any;
-      setMessages(prev => [...prev, { role: 'assistant', content: resp?.response ?? resp ?? '', ts: new Date().toISOString() }]);
+      const resp = await send(msg) as { response?: string } | string;
+      const content = typeof resp === 'string' ? resp : (resp?.response ?? '');
+      setMessages(prev => [...prev, { role: 'assistant', content, ts: new Date().toISOString() }]);
     } catch {
       setMessages(prev => [...prev, { role: 'error', content: 'Error sending message', ts: new Date().toISOString() }]);
     }

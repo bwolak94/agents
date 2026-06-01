@@ -4,7 +4,7 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 
 interface VoiceConversationProps {
-  sessionId: string;
+  sessionId: string | null;
   onClose: () => void;
 }
 
@@ -15,7 +15,7 @@ export function VoiceConversation({ sessionId, onClose }: VoiceConversationProps
   const [transcript, setTranscript] = useState('');
   const [response, setResponse] = useState('');
   const [error, setError] = useState('');
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const recognitionRef = useRef<{ start(): void; stop(): void; abort(): void } | null>(null);
   const synthRef = useRef<SpeechSynthesisUtterance | null>(null);
 
   const speak = useCallback((text: string) => {
@@ -60,18 +60,18 @@ export function VoiceConversation({ sessionId, onClose }: VoiceConversationProps
       return;
     }
 
-    const recognition = new SpeechRecognition();
+    const recognition = new SpeechRecognition() as unknown as Record<string, unknown>;
     recognition.continuous = false;
     recognition.interimResults = false;
     recognition.lang = 'en-US';
 
     recognition.onstart = () => setStatus('listening');
-    recognition.onresult = (event: SpeechRecognitionEvent) => {
+    recognition.onresult = (event: { results: Array<{ 0: { transcript: string } }> }) => {
       const text = event.results[0][0].transcript;
       setTranscript(text);
       sendToAgent(text);
     };
-    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+    recognition.onerror = (event: { error: string }) => {
       setError(event.error);
       setStatus('error');
     };
@@ -79,8 +79,8 @@ export function VoiceConversation({ sessionId, onClose }: VoiceConversationProps
       if (status === 'listening') setStatus('idle');
     };
 
-    recognitionRef.current = recognition;
-    recognition.start();
+    recognitionRef.current = recognition as unknown as { start(): void; stop(): void; abort(): void };
+    (recognition as unknown as { start(): void }).start();
   }, [sendToAgent, status]);
 
   const stopAll = useCallback(() => {
