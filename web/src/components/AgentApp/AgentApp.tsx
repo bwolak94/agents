@@ -24,9 +24,14 @@ import { BranchView } from '@/components/BranchView/BranchView';
 import { PluginMarketplace } from '@/components/PluginMarketplace/PluginMarketplace';
 import { ABTestView } from '@/components/ABTestView/ABTestView';
 import { VoiceConversation } from '@/components/VoiceConversation/VoiceConversation';
+import { CostTrackerHUD } from '@/components/CostTrackerHUD/CostTrackerHUD';
+import { SideBySideView } from '@/components/SideBySideView/SideBySideView';
+import { KnowledgeGraph } from '@/components/KnowledgeGraph/KnowledgeGraph';
 import { API_URL } from '@/constants/api';
 import type { ChatMessage } from '@/types/chat';
 import type { Dispatch, SetStateAction } from 'react';
+
+const COST_BUDGET = typeof process !== 'undefined' ? parseFloat(process.env.NEXT_PUBLIC_COST_BUDGET_USD ?? '0') : 0;
 
 // #30 — Persist layout preferences
 interface UiPrefs {
@@ -85,10 +90,15 @@ export function AgentApp() {
   const [showShortcuts, setShowShortcuts]   = useState(false);
   const [showVoice, setShowVoice]           = useState(false);
 
-  // Ctrl+? to open shortcuts
+  // Ctrl+? to open shortcuts; Escape to close all overlays (FE23)
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.key === '?') { e.preventDefault(); setShowShortcuts(s => !s); }
+      if (e.key === 'Escape') {
+        setShowShortcuts(false);
+        setShowVoice(false);
+        setConfirmClear(false);
+      }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
@@ -131,6 +141,7 @@ export function AgentApp() {
   }, [setMessages]);
 
   return (
+    <>
     <div className="flex flex-col h-screen bg-surface-base text-text-primary overflow-hidden">
 
       <KeyboardShortcuts open={showShortcuts} onClose={() => setShowShortcuts(false)} />
@@ -160,7 +171,7 @@ export function AgentApp() {
         />
       )}
 
-      <CommandPalette onViewChange={setView} onNewSession={handleNewSession} sessionId={sessionId} />
+      <CommandPalette onViewChange={setView} onNewSession={handleNewSession} onSelectSession={handleSelectSession} sessionId={sessionId} />
       {showVoice && <VoiceConversation sessionId={sessionId} onClose={() => setShowVoice(false)} />}
 
       <Header
@@ -237,6 +248,16 @@ export function AgentApp() {
                 <ABTestView />
               </ErrorBoundary>
             )}
+            {prefs.view === 'side-by-side' && (
+              <ErrorBoundary fallback={<PanelError label="Side-by-Side" />}>
+                <SideBySideView />
+              </ErrorBoundary>
+            )}
+            {prefs.view === 'graph' && (
+              <ErrorBoundary fallback={<PanelError label="Knowledge Graph" />}>
+                <KnowledgeGraph sessionId={sessionId || 'default'} />
+              </ErrorBoundary>
+            )}
           </div>
 
           {/* #19 — EventLog as collapsible drawer */}
@@ -259,5 +280,9 @@ export function AgentApp() {
         )}
       </div>
     </div>
+
+    {/* F5 — Live cost tracker HUD (fixed bottom-right) */}
+    <CostTrackerHUD budgetUsd={COST_BUDGET} />
+    </>
   );
 }

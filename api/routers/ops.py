@@ -204,8 +204,8 @@ async def get_stats(session_id: str = "default"):
     return orch.get_stats()
 
 
-@router.get("/analytics")
-@router.get("/analytics/summary")
+@router.get("/analytics", response_model_exclude_none=True)
+@router.get("/analytics/summary", response_model_exclude_none=True)
 async def get_analytics(days: int = Query(default=30, ge=1, le=365)):
     from config.constants import ANALYTICS_STALE_SECONDS
     # #11 secondaryPreferred: use secondary replica for heavy analytics reads
@@ -258,7 +258,7 @@ async def export_analytics(
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
-@router.get("/models")
+@router.get("/models", response_model_exclude_none=True)
 async def list_models():
     orch = await _state.get_session("default")
     return {"models": orch.llm.available_models()}
@@ -833,6 +833,186 @@ async def graphql_endpoint(request: "Request"):
 
 
 from api.models import DigestScheduleRequest  # noqa: E402 — deferred to avoid circular at module load
+
+
+# ── F1 Daily Briefing ─────────────────────────────────────────────────────────
+
+@router.get("/briefing/daily")
+async def daily_briefing(session_id: str = "default", model: str = Query(default="claude")):
+    """Morning briefing: pending sessions, cost burn, agent health, yesterday's activity summary."""
+    validate_session_id(session_id)
+
+    # Gather data in parallel
+    recent_sessions, analytics, history = await asyncio.gather(
+        _db.db_list_sessions(limit=10, skip=0),
+        _db.analytics_db.get_summary(1),
+        _db.load_history(session_id),
+        return_exceptions=True,
+    )
+    if isinstance(recent_sessions, Exception):
+        recent_sessions = []
+    if isinstance(analytics, Exception):
+        analytics = {}
+    if isinstance(history, Exception):
+        history = []
+
+    try:
+        sched_tasks = _sched_mod.scheduler.list_tasks(session_id)
+    except Exception:
+        sched_tasks = []
+
+    orch = await _state.get_session(session_id)
+    health = orch.llm.get_health_status()
+
+    totals   = analytics.get("totals", {})
+    cost_usd = totals.get("total_cost_usd", 0)
+
+    # LLM-generated summary of recent conversation
+    summary = ""
+    if history:
+        recent = history[-20:]
+        combined = "\n".join(f"{m['role'].upper()}: {m.get('content','')[:300]}" for m in recent)
+        try:
+            summary = await orch.llm.call(
+                model=model,
+                messages=[{"role": "user", "content":
+                    f"Summarise this conversation in 3 bullet points for a morning briefing:\n\n{combined}"}],
+                max_tokens=200, temperature=0.3,
+            )
+        except Exception:
+            summary = "(summary unavailable)"
+
+    return {
+        "date": __import__("datetime").datetime.utcnow().strftime("%Y-%m-%d"),
+        "session_id": session_id,
+        "active_sessions": len(recent_sessions),
+        "scheduled_tasks": len(sched_tasks),
+        "yesterday_cost_usd": round(cost_usd, 4),
+        "yesterday_requests": totals.get("total_requests", 0),
+        "agent_health": health,
+        "recent_summary": summary,
+        "sessions": [s.get("session_id") for s in recent_sessions[:5]],
+    }
+
+
+# ── F4 Diff-based Prompt Iteration ────────────────────────────────────────────
+
+class PromptIterateRequest(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=10_000)
+    result: str = Field(default="", max_length=10_000)
+    critique: str = Field(default="", max_length=2000)
+    model: str = "claude"
+
+
+@router.post("/prompts/iterate")
+async def iterate_prompt(req: PromptIterateRequest):
+    """Send a prompt + result + critique to Claude; get an improved version with a diff."""
+    import difflib
+
+    orch = await _state.get_session("default")
+    improve_msg = (
+        f"You are a prompt engineer. Improve the following prompt based on the result and critique.\n\n"
+        f"ORIGINAL PROMPT:\n{req.prompt}\n\n"
+        f"RESULT PRODUCED:\n{req.result[:2000]}\n\n"
+        f"CRITIQUE:\n{req.critique}\n\n"
+        "Output ONLY the improved prompt text. Do not explain."
+    )
+    try:
+        improved = await orch.llm.call(
+            model=req.model,
+            messages=[{"role": "user", "content": improve_msg}],
+            max_tokens=2000, temperature=0.3,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LLM call failed: {exc}")
+
+    # Generate a unified diff
+    diff_lines = list(difflib.unified_diff(
+        req.prompt.splitlines(keepends=True),
+        improved.splitlines(keepends=True),
+        fromfile="original", tofile="improved", lineterm="",
+    ))
+    return {
+        "original": req.prompt,
+        "improved": improved,
+        "diff": "".join(diff_lines),
+    }
+
+
+# ── F3 Smart Session Clustering ───────────────────────────────────────────────
+
+@router.post("/sessions/cluster")
+async def cluster_sessions(
+    max_sessions: int = Query(default=50, ge=5, le=200),
+    model: str = Query(default="claude"),
+):
+    """Group recent sessions into topic clusters using LLM-based similarity."""
+    sessions = await _db.db_list_sessions(limit=max_sessions, skip=0)
+    if not sessions:
+        return {"clusters": []}
+
+    previews = []
+    for s in sessions:
+        sid = s.get("session_id", "")
+        preview = s.get("preview", sid)[:150]
+        previews.append({"session_id": sid, "preview": preview})
+
+    combined = "\n".join(f"- {p['session_id']}: {p['preview']}" for p in previews)
+    prompt = (
+        "Cluster the following chat sessions into 3-7 thematic groups.\n"
+        "Output valid JSON only: {\"clusters\": [{\"label\": \"...\", \"session_ids\": [...]}]}\n\n"
+        f"Sessions:\n{combined}"
+    )
+
+    orch = await _state.get_session("default")
+    try:
+        raw = await orch.llm.call(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=800, temperature=0.2,
+        )
+        import re as _re
+        m = _re.search(r'\{.*\}', raw, _re.DOTALL)
+        if m:
+            import json as _json
+            result = _json.loads(m.group())
+        else:
+            result = {"clusters": [{"label": "All Sessions", "session_ids": [p["session_id"] for p in previews]}]}
+    except Exception:
+        result = {"clusters": [{"label": "All Sessions", "session_ids": [p["session_id"] for p in previews]}]}
+
+    return result
+
+
+# ── F10 Personal Knowledge Graph summary ──────────────────────────────────────
+
+@router.get("/memory/graph")
+async def memory_knowledge_graph(session_id: str = Query(default="default"), limit: int = Query(default=200, ge=1, le=500)):
+    """Return all memory-graph facts for a session as nodes + edges for D3/force-graph."""
+    validate_session_id(session_id)
+    facts = await _db.memory_graph_db.get_facts(session_id)
+
+    nodes: dict[str, dict] = {}
+    edges: list[dict] = []
+    for f in facts[:limit]:
+        entity = f.get("entity", "")
+        value  = f.get("value", "")
+        rel    = f.get("relation", "")
+        conf   = f.get("confidence", 1.0)
+
+        if entity and entity not in nodes:
+            nodes[entity] = {"id": entity, "group": "entity"}
+        if value and value not in nodes:
+            nodes[value] = {"id": value, "group": "value"}
+        if entity and value:
+            edges.append({"source": entity, "target": value, "label": rel, "confidence": conf})
+
+    return {
+        "session_id": session_id,
+        "nodes": list(nodes.values()),
+        "edges": edges,
+        "total_facts": len(facts),
+    }
 
 
 # ── #30 Client-error telemetry ────────────────────────────────────────────────

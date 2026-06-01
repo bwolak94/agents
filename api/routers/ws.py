@@ -1,10 +1,15 @@
 """WebSocket endpoint — real-time agent event stream."""
 import asyncio
+import logging
 import os
+import time
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from core.events import event_bus
+
+_ws_logger = logging.getLogger("ws")
+_SLOW_FRAME_MS = float(os.getenv("WS_SLOW_FRAME_MS", "200"))  # B12
 
 router = APIRouter()
 
@@ -43,7 +48,15 @@ async def websocket_endpoint(websocket: WebSocket):
         while not stop_event.is_set():
             try:
                 event = await asyncio.wait_for(q.get(), timeout=25.0)
+                # B12 — Log slow frame dispatch
+                t0 = time.perf_counter()
                 await websocket.send_json(event)
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                if elapsed_ms > _SLOW_FRAME_MS:
+                    _ws_logger.debug(
+                        "Slow WS frame: %.1fms (session=%s type=%s)",
+                        elapsed_ms, session_id, event.get("type", "?"),
+                    )
             except asyncio.TimeoutError:
                 await websocket.send_json({"type": "ping"})
             except Exception:

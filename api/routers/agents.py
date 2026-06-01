@@ -193,3 +193,46 @@ async def extract_memory_facts(session_id: str, body: dict):
     orch = await _state.get_session(session_id)
     facts = await _db.memory_graph_db.extract_and_store(session_id, text, orch.llm)
     return {"session_id": session_id, "extracted": len(facts), "facts": facts}
+
+
+# ── B15 PATCH /agents/{name} — partial config update ─────────────────────────
+
+from pydantic import BaseModel as _BaseModel, Field as _Field  # noqa: E402
+
+
+class AgentPatchRequest(_BaseModel):
+    system_prompt: str | None = None
+    description: str | None = _Field(default=None, max_length=500)
+    temperature: float | None = _Field(default=None, ge=0.0, le=2.0)
+    max_tokens: int | None = _Field(default=None, ge=64, le=8192)
+
+
+@router.patch("/agents/{agent_name}")
+async def patch_agent(agent_name: str, req: AgentPatchRequest):
+    """Partial agent config update — only supplied fields are changed."""
+    from agents.agents import AGENT_REGISTRY, set_agent_system_prompt as _set
+    if agent_name not in AGENT_REGISTRY:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{agent_name}' not found. Available: {list(AGENT_REGISTRY.keys())}",
+        )
+    updated = []
+    if req.system_prompt is not None:
+        _set(agent_name, req.system_prompt)
+        for _, orch in _state.session_manager.iter_orchestrators():
+            orch._agent_cache.pop(agent_name, None)
+        updated.append("system_prompt")
+    if req.temperature is not None:
+        # Store in a per-agent override dict (best-effort; agents read on init)
+        from agents import agents as _agents_mod
+        if not hasattr(_agents_mod, "_temperature_overrides"):
+            _agents_mod._temperature_overrides = {}
+        _agents_mod._temperature_overrides[agent_name] = req.temperature
+        updated.append("temperature")
+    if req.max_tokens is not None:
+        from agents import agents as _agents_mod
+        if not hasattr(_agents_mod, "_max_tokens_overrides"):
+            _agents_mod._max_tokens_overrides = {}
+        _agents_mod._max_tokens_overrides[agent_name] = req.max_tokens
+        updated.append("max_tokens")
+    return {"status": "patched", "agent": agent_name, "updated_fields": updated}

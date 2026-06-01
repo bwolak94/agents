@@ -1,5 +1,5 @@
 'use client';
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import type { AgentMap } from '@/types/agent';
 import { AgentCard } from '@/components/AgentCard/AgentCard';
 
@@ -11,14 +11,22 @@ interface AgentPanelProps {
 
 export function AgentPanel({ agents, collapsed = false, onToggleCollapse }: AgentPanelProps) {
   const [filter, setFilter] = useState('');
+  const [debouncedFilter, setDebouncedFilter] = useState('');
   const allAgents = Object.values(agents).filter((a) => a.status !== 'fading');
+
+  // FE16 — Debounce the filter input (150ms) so re-renders only fire after typing stops
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedFilter(filter), 150);
+    return () => clearTimeout(timer);
+  }, [filter]);
+
   const agentList = useMemo(() => {
-    if (!filter.trim()) return allAgents;
-    const q = filter.toLowerCase();
+    if (!debouncedFilter.trim()) return allAgents;
+    const q = debouncedFilter.toLowerCase();
     return allAgents.filter(
       (a) => a.id?.toLowerCase().includes(q) || a.status?.toLowerCase().includes(q)
     );
-  }, [allAgents, filter]);
+  }, [allAgents, debouncedFilter]);
   const count = allAgents.length;
 
   if (collapsed) {

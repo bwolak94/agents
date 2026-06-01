@@ -13,6 +13,12 @@ import httpx
 
 _mgr_logger = logging.getLogger("llm.manager")
 
+# L23 — module-level cache imports (safe: db.cache guards on _db is None)
+try:
+    from db.cache import get as _cache_get, put as _cache_put
+except ImportError:
+    _cache_get = _cache_put = None  # type: ignore[assignment]
+
 
 # ─────────────────────────────────────────
 # COST TRACKER
@@ -127,20 +133,29 @@ class LLMManager:
         """
         self.check_token_budget(messages, system_prompt, max_tokens, model)
 
-        # Check response cache (skip for streaming requests)
+        # Check response cache (skip for streaming requests) — L23: use module-level import
         if not stream and not stream_callback:
             try:
-                from db.cache import get as cache_get, put as cache_put
-                cached = await cache_get(model, messages, system_prompt)
-                if cached is not None:
-                    return cached
+                if _cache_get is not None:
+                    cached = await _cache_get(model, messages, system_prompt)
+                    if cached is not None:
+                        return cached
             except Exception:
-                cached = None
-                cache_get = cache_put = None  # type: ignore
+                pass
 
         from config.constants import LLM_TIMEOUT_SECONDS, LLM_FALLBACK_CHAIN
         timeout = LLM_TIMEOUT_SECONDS
         t_start = time.perf_counter()
+
+        # B14 — OTel span per LLM call (no-op when OTEL not enabled)
+        _otel_tracer = None
+        try:
+            import os as _os
+            if _os.getenv("OTEL_ENABLED", "false").lower() == "true":
+                from opentelemetry import trace as _trace
+                _otel_tracer = _trace.get_tracer("llm.manager")
+        except Exception:
+            pass
 
         async def _call_model(m: str) -> str:
             async with asyncio.timeout(timeout):
@@ -173,7 +188,15 @@ class LLMManager:
 
         for attempt_model in fallback_chain:
             try:
-                result = await _call_model(attempt_model)
+                # B14 — Wrap each LLM call in an OTel span when tracing is enabled
+                if _otel_tracer:
+                    with _otel_tracer.start_as_current_span(f"llm.call.{attempt_model}") as span:
+                        span.set_attribute("llm.model", attempt_model)
+                        span.set_attribute("llm.messages", len(messages))
+                        result = await _call_model(attempt_model)
+                        span.set_attribute("llm.response_len", len(result))
+                else:
+                    result = await _call_model(attempt_model)
                 if attempt_model != model:
                     _mgr_logger.warning("Fell back from %s → %s", model, attempt_model)
                 self.record_cb_success(attempt_model)
@@ -198,11 +221,11 @@ class LLMManager:
             model, duration_ms, len(result.split()) * 4 // 3,
         )
 
-        # Store in cache for future identical requests
+        # Store in cache for future identical requests — L23: module-level import
         if not stream and not stream_callback:
             try:
-                from db.cache import put as cache_put
-                await cache_put(model, messages, result, system_prompt)
+                if _cache_put is not None:
+                    await _cache_put(model, messages, result, system_prompt)
             except Exception:
                 pass
 
@@ -258,6 +281,7 @@ class LLMManager:
         self._unhealthy.pop(model, None)
         if prev != _CBState.CLOSED:
             _cb_logger.info("Circuit CLOSED for %s (recovered)", model)
+            self._persist_cb_state()  # L22 — update persisted state on recovery
 
     def mark_model_unhealthy(self, model: str) -> None:
         """Record a failure; open the circuit when threshold is exceeded."""
@@ -270,6 +294,42 @@ class LLMManager:
             _cb_logger.warning(
                 "Circuit OPEN for %s after %d consecutive failures", model, failures
             )
+            self._persist_cb_state()  # L22 — persist on state transition
+
+    # L22 — persist/load CB state so a restart doesn't immediately retry broken models
+    _CB_STATE_FILE = os.getenv("CB_STATE_FILE", "/tmp/llm_cb_state.json")
+
+    def _persist_cb_state(self) -> None:
+        """L22 — Write circuit-breaker state to a JSON file (survives restarts)."""
+        import json as _json
+        try:
+            state = {
+                m: {"failures": self._cb_failures.get(m, 0), "open_at": self._cb_open_at.get(m, 0)}
+                for m, s in self._cb_state.items() if s == _CBState.OPEN
+            }
+            with open(self._CB_STATE_FILE, "w") as fh:
+                _json.dump(state, fh)
+        except Exception as exc:
+            _cb_logger.debug("Could not persist CB state: %s", exc)
+
+    def load_cb_state(self) -> None:
+        """L22 — Load persisted CB state on startup so open circuits stay open."""
+        import json as _json
+        try:
+            with open(self._CB_STATE_FILE) as fh:
+                state = _json.load(fh)
+            now = time.time()
+            for model, info in state.items():
+                open_at = info.get("open_at", 0)
+                if now - open_at < _CB_RESET_TIMEOUT:
+                    self._cb_state[model] = _CBState.OPEN
+                    self._cb_open_at[model] = open_at
+                    self._cb_failures[model] = info.get("failures", _CB_FAILURE_THRESHOLD)
+                    _cb_logger.info("Restored OPEN circuit for %s from persisted state", model)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            _cb_logger.debug("Could not load CB state: %s", exc)
 
     def get_health_status(self) -> dict:
         """Return health status for all models."""
@@ -378,7 +438,10 @@ class AnthropicClient:
 
         resp = await self._post_with_retry(headers, payload)
         data = resp.json()
-        self.cost_tracker.record(model_variant, data.get("usage", {}))
+        # L21 — derive variant from the model ID in the response rather than caller string
+        _resp_model = data.get("model", "")
+        _detected_variant = "haiku" if "haiku" in _resp_model.lower() else "sonnet"
+        self.cost_tracker.record(_detected_variant, data.get("usage", {}))
 
         # #11 — guard against missing 'content' key (e.g. content policy blocks)
         content = data.get("content")

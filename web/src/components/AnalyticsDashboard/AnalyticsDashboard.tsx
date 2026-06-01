@@ -36,22 +36,35 @@ export function AnalyticsDashboard() {
   const { data, loading, refetch } = useAnalytics();
 
   if (loading) {
+    // F26 — proper skeleton instead of plain text
     return (
-      <div className="flex-1 flex items-center justify-center text-text-faint text-sm">
-        Loading analytics…
+      <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-6 animate-pulse">
+        <div className="grid grid-cols-4 gap-3">
+          {[...Array(4)].map((_, i) => (
+            <div key={i} className="bg-surface-hover rounded-xl p-4 h-20" />
+          ))}
+        </div>
+        <div className="bg-surface-hover rounded-xl h-40" />
+        <div className="grid grid-cols-2 gap-4">
+          <div className="bg-surface-hover rounded-xl h-48" />
+          <div className="bg-surface-hover rounded-xl h-48" />
+        </div>
       </div>
     );
   }
 
   if (!data) {
     return (
-      <div className="flex-1 flex flex-col items-center justify-center gap-3 text-text-faint">
-        <div className="text-4xl">📊</div>
-        <p className="text-sm m-0">No analytics data available.</p>
-        <button onClick={refetch}
-          className="border border-border-strong rounded-lg px-3.5 py-1.5 text-xs text-text-secondary hover:text-text-primary hover:border-border-strong transition-colors">
-          Retry
-        </button>
+      <div className="flex-1 flex flex-col items-center justify-center gap-3">
+        {/* F26 — error banner with retry */}
+        <div className="bg-red-900/30 border border-red-700/40 rounded-xl px-6 py-4 flex flex-col items-center gap-3 max-w-xs text-center">
+          <div className="text-3xl">⚠</div>
+          <p className="text-sm text-red-300 m-0">Failed to load analytics data.</p>
+          <button onClick={refetch}
+            className="border border-border-strong rounded-lg px-3.5 py-1.5 text-xs text-text-secondary hover:text-text-primary hover:border-border-strong transition-colors">
+            Retry
+          </button>
+        </div>
       </div>
     );
   }

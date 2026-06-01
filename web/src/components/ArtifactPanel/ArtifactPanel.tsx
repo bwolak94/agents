@@ -1,5 +1,5 @@
 'use client';
-import { useMemo, useState, useCallback } from 'react';
+import { useRef, useState, useCallback, useEffect } from 'react';
 import type { ChatMessage } from '@/types/chat';
 
 interface Artifact {
@@ -40,7 +40,30 @@ interface Props {
 
 export function ArtifactPanel({ messages, collapsed = false, onToggle }: Props) {
   const [copied, setCopied] = useState<string | null>(null);
-  const artifacts = useMemo(() => extractArtifacts(messages), [messages]);
+  // F27 — cache extracted artifacts in a ref; only re-extract when message count grows
+  const artifactsRef = useRef<Artifact[]>([]);
+  const prevLenRef   = useRef(0);
+  if (messages.length !== prevLenRef.current) {
+    // Incremental extraction: only process newly added messages
+    const newMsgs = messages.slice(prevLenRef.current);
+    const newArtifacts = extractArtifacts(newMsgs).map(a => ({
+      ...a,
+      id: `${prevLenRef.current + a.msgIdx}-${artifactsRef.current.length + a.msgIdx}`,
+      msgIdx: prevLenRef.current + a.msgIdx,
+    }));
+    artifactsRef.current = messages.length < prevLenRef.current
+      ? extractArtifacts(messages)       // messages were truncated — full re-extract
+      : [...artifactsRef.current, ...newArtifacts];
+    prevLenRef.current = messages.length;
+  }
+  const artifacts = artifactsRef.current;
+  // Reset cache when messages are fully cleared
+  useEffect(() => {
+    if (messages.length === 0) {
+      artifactsRef.current = [];
+      prevLenRef.current = 0;
+    }
+  }, [messages.length]);
 
   const handleCopy = useCallback(async (id: string, content: string) => {
     try {

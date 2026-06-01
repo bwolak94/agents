@@ -8,8 +8,22 @@ import re
 import time
 
 _CHAT_TIMEOUT = float(os.getenv("CHAT_TIMEOUT_SECONDS", "120"))  # #3 per-request timeout
+_PII_LOG_ENABLED = os.getenv("PII_REDACTION", "false").lower() == "true"  # C15
 
-from fastapi import APIRouter, HTTPException
+_PII_LOG_PATTERNS = [
+    (__import__("re").compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"), "[EMAIL]"),
+    (__import__("re").compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"), "[PHONE]"),
+    (__import__("re").compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[SSN]"),
+]
+
+
+def _pii_scrub(text: str) -> str:
+    """C15 — Light PII scrub for logs (only when PII_REDACTION=true)."""
+    for pat, repl in _PII_LOG_PATTERNS:
+        text = pat.sub(repl, text)
+    return text
+
+from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import StreamingResponse
 
 import api.db as _db
@@ -28,9 +42,11 @@ router = APIRouter()
 
 
 @router.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
-    if req.request_id:
-        _state.session_manager.check_request_id(req.request_id)
+async def chat(req: ChatRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    # B9 — Idempotency-Key header takes precedence over body request_id
+    effective_request_id = idempotency_key or req.request_id
+    if effective_request_id:
+        _state.session_manager.check_request_id(effective_request_id)
 
     _state.session_manager.check_session_rate_limit(req.session_id)
 
@@ -156,33 +172,40 @@ async def chat(req: ChatRequest):
         except Exception:
             context_pct = 0
 
-        try:
-            await _db.analytics_db.record_request(
-                session_id=req.session_id,
-                agent=d.agent if d else "unknown",
-                model=d.model if d else "unknown",
-                tools=d.tools if d else [],
-                duration_ms=duration_ms,
-                cost_usd=cost_stats.get("total_cost_usd", 0) if cost_stats else 0,
-                context_pct=context_pct,
-            )
-        except Exception as exc:
-            logger.warning("Failed to record analytics: %s", exc)
+        # C12 — fire-and-forget analytics + request-log so lock is fully released first
+        _agent  = d.agent  if d else "unknown"
+        _model  = d.model  if d else "unknown"
+        _tools  = d.tools  if d else []
+        _cost   = cost_stats.get("total_cost_usd", 0) if cost_stats else 0
 
+        async def _record_analytics():
+            try:
+                await _db.analytics_db.record_request(
+                    session_id=req.session_id, agent=_agent, model=_model,
+                    tools=_tools, duration_ms=duration_ms, cost_usd=_cost,
+                    context_pct=context_pct,
+                )
+            except Exception as exc:
+                logger.warning("Failed to record analytics: %s", exc)
+
+        asyncio.create_task(_record_analytics())
         asyncio.create_task(_state._auto_title_session(req.session_id, message, orch))
         asyncio.create_task(_state._auto_tag_session(req.session_id, message, response, orch))
 
-        # Log request for replay/regression (#13)
-        try:
-            await _db.request_log_db.log_request(
-                session_id=req.session_id,
-                message=message[:500],
-                model=d.model if d else "unknown",
-                response=response[:500],
-                duration_ms=duration_ms,
-            )
-        except Exception as exc:
-            logger.debug("Request log failed: %s", exc)
+        # C12 — request log also as background task; C15 — scrub PII when enabled
+        _log_msg  = _pii_scrub(message[:500])  if _PII_LOG_ENABLED else message[:500]
+        _log_resp = _pii_scrub(response[:500]) if _PII_LOG_ENABLED else response[:500]
+
+        async def _log_request():
+            try:
+                await _db.request_log_db.log_request(
+                    session_id=req.session_id, message=_log_msg, model=_model,
+                    response=_log_resp, duration_ms=duration_ms,
+                )
+            except Exception as exc:
+                logger.debug("Request log failed: %s", exc)
+
+        asyncio.create_task(_log_request())
 
         return ChatResponse(
             response=response,
@@ -212,10 +235,14 @@ async def chat_stream(req: ChatRequest):
         try:
             orch = await _state.get_session(req.session_id)
             decision = await orch.router.route(req.message, orch.conversation_history)
-            response = await orch.process(
-                req.message, stream=False, show_routing=False,
-                decision=decision, session_id=req.session_id,
-            )
+            async with asyncio.timeout(_CHAT_TIMEOUT):  # C13 — per-request timeout
+                response = await orch.process(
+                    req.message, stream=False, show_routing=False,
+                    decision=decision, session_id=req.session_id,
+                )
+        except asyncio.TimeoutError:
+            yield f"data: {json.dumps({'type': 'error', 'detail': f'Request timed out after {_CHAT_TIMEOUT:.0f}s'})}\n\n"
+            return
         finally:
             lock.release()
         duration_ms = int((time.time() - t_start) * 1000)
@@ -317,7 +344,7 @@ async def chat_fan_out(req: FanOutRequest):
         seen_hashes: set[str] = set()
         deduped = []
         for r in result["responses"]:
-            h = hashlib.md5(str(r.get("response", "")).encode()).hexdigest()
+            h = hashlib.md5(str(r.get("response", "")).strip().encode()).hexdigest()  # C14
             if h not in seen_hashes:
                 seen_hashes.add(h)
                 deduped.append(r)

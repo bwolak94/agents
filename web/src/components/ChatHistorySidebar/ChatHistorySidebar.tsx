@@ -196,8 +196,11 @@ export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTr
   const handleMerge = async (sourceId: string) => {
     if (!activeSessionId || sourceId === activeSessionId) return;
     setMerging(true);
+    // F24 — optimistic remove of the merged-away session so UI updates immediately
+    const snapshot = sessions;
+    setSessions(prev => prev.filter(s => s.session_id !== sourceId));
     try {
-      await fetch(`${API_URL}/sessions/merge`, {
+      const res = await fetch(`${API_URL}/sessions/merge`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -206,7 +209,10 @@ export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTr
           deduplicate: true,
         }),
       });
-    } catch { /* ignore */ }
+      if (!res.ok) throw new Error('Merge failed');
+    } catch {
+      setSessions(snapshot);  // F24 — rollback on error
+    }
     setMergingId(null);
     setMerging(false);
   };

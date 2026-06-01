@@ -27,8 +27,9 @@ async def get_history(session_id: str, request: Request):
     messages = await _db.load_history(session_id)
     body = json.dumps({"session_id": session_id, "messages": messages}, sort_keys=True, default=str)
     etag = f'"{hashlib.md5(body.encode()).hexdigest()}"'
+    # B5 — X-Cache: HIT when client sends matching ETag
     if request.headers.get("If-None-Match") == etag:
-        return Response(status_code=304, headers={"ETag": etag})
+        return Response(status_code=304, headers={"ETag": etag, "X-Cache": "HIT"})
     # #19 Last-Modified header
     last_modified = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
     return Response(
@@ -38,6 +39,7 @@ async def get_history(session_id: str, request: Request):
             "ETag": etag,
             "Cache-Control": "private, max-age=0, must-revalidate",
             "Last-Modified": last_modified,
+            "X-Cache": "MISS",
         },
     )
 
@@ -156,7 +158,7 @@ async def replay_session(session_id: str, model: str = Query(...)):
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
 
-@router.get("/sessions")
+@router.get("/sessions", response_model_exclude_none=True)
 async def list_sessions(
     limit: int = Query(default=50, ge=1, le=200),
     skip: int = Query(default=0, ge=0),
@@ -494,18 +496,60 @@ async def session_card(session_id: str):
 
 # ── F10 Session snapshot ───────────────────────────────────────────────────────
 
+# ── B13 Token count ───────────────────────────────────────────────────────────
+
+@router.get("/sessions/{session_id}/token-count")
+async def session_token_count(session_id: str):
+    """Return total estimated token count across all messages in a session."""
+    validate_session_id(session_id)
+    messages = await _db.load_history(session_id)
+    # ~4 chars per token (rough estimate)
+    total_chars = sum(len(m.get("content", "")) for m in messages)
+    total_tokens = total_chars // 4
+    return {
+        "session_id": session_id,
+        "message_count": len(messages),
+        "estimated_tokens": total_tokens,
+        "total_chars": total_chars,
+        "summarize_recommended": total_tokens > 50_000,
+    }
+
+
 class SnapshotRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     description: str = Field(default="", max_length=500)
 
 
 @router.post("/sessions/{session_id}/snapshot", status_code=201)
-async def create_session_snapshot(session_id: str, req: SnapshotRequest):
-    """Freeze current conversation state as a named snapshot (stored as checkpoint)."""
+async def create_session_snapshot(
+    session_id: str,
+    req: SnapshotRequest,
+    include_resume: bool = True,
+    model: str = Query(default="claude"),
+):
+    """Freeze current conversation state as a named snapshot. Generates a resume prompt."""
     validate_session_id(session_id)
     messages = await _db.load_history(session_id)
     if not messages:
         raise HTTPException(status_code=404, detail="No history to snapshot")
+
+    # F9 — Generate a resume prompt summarising where we left off
+    resume_prompt = ""
+    if include_resume and messages:
+        recent = messages[-30:]
+        combined = "\n".join(f"{m['role'].upper()}: {m.get('content','')[:300]}" for m in recent)
+        try:
+            orch = await _state.get_session(session_id)
+            resume_prompt = await orch.llm.call(
+                model=model,
+                messages=[{"role": "user", "content":
+                    f"Write a 'resume prompt' for continuing this conversation later. "
+                    "It should capture: what we were working on, what was decided, and what comes next. "
+                    f"Max 150 words.\n\n{combined}"}],
+                max_tokens=250, temperature=0.3,
+            )
+        except Exception:
+            resume_prompt = ""
 
     from db.agent_checkpoints import save_checkpoint
     snapshot_id = await save_checkpoint(
@@ -516,6 +560,7 @@ async def create_session_snapshot(session_id: str, req: SnapshotRequest):
             "description": req.description,
             "messages": messages,
             "message_count": len(messages),
+            "resume_prompt": resume_prompt,
             "created_at": __import__("datetime").datetime.utcnow().isoformat(),
         },
     )
@@ -524,5 +569,6 @@ async def create_session_snapshot(session_id: str, req: SnapshotRequest):
         "snapshot_id": snapshot_id,
         "name": req.name,
         "messages_captured": len(messages),
+        "resume_prompt": resume_prompt,
         "status": "created",
     }

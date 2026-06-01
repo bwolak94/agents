@@ -13,7 +13,7 @@ import os
 import re
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 import sys
@@ -23,6 +23,14 @@ import httpx
 correlation_id: contextvars.ContextVar[str] = contextvars.ContextVar("correlation_id", default="")
 
 _active_tasks: set[asyncio.Task] = set()
+_active_tasks_lock: asyncio.Lock | None = None  # B7 — lazy-init inside event loop
+
+
+def _get_tasks_lock() -> asyncio.Lock:
+    global _active_tasks_lock
+    if _active_tasks_lock is None:
+        _active_tasks_lock = asyncio.Lock()
+    return _active_tasks_lock
 
 
 def _track_task(coro):
@@ -65,7 +73,7 @@ config = load_config()
 # ── Rate limiter ──────────────────────────────────────────────────────────────
 _RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_RPM", "60"))
 _RATE_WINDOW_MAX_IPS = 10_000
-_rate_windows: dict[str, list[float]] = defaultdict(list)
+_rate_windows: dict[str, deque] = defaultdict(deque)  # B1 — deque for O(1) popleft
 
 # ── API key auth ──────────────────────────────────────────────────────────────
 _API_KEY = os.getenv("API_KEY", "")
@@ -74,8 +82,38 @@ _AUTH_SKIP_PREFIXES = ("/docs", "/openapi", "/redoc", "/health")
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
+_REQUIRED_ENV_VARS: list[tuple[str, str]] = [
+    # (var_name, hint)
+    ("MONGO_URL", "MongoDB connection string — set to mongodb://localhost:27017"),
+]
+
+# B4 — Optional env vars logged as warnings; critical ones abort startup
+_OPTIONAL_ENV_VARS: list[tuple[str, str]] = [
+    ("ANTHROPIC_API_KEY", "Required for Claude; set to your key from console.anthropic.com"),
+    ("GEMINI_API_KEY",    "Required for Gemini; set to your key from aistudio.google.com"),
+]
+
+
+def _startup_check() -> None:
+    """B4 — Fail fast if critical env vars are missing; warn for optional ones."""
+    critical_missing = []
+    for var, hint in _REQUIRED_ENV_VARS:
+        if not os.getenv(var):
+            critical_missing.append(f"  {var}  →  {hint}")
+    if critical_missing:
+        logger.error("CRITICAL env vars not set — cannot start:\n%s", "\n".join(critical_missing))
+        raise SystemExit(1)
+    optional_missing = []
+    for var, hint in _OPTIONAL_ENV_VARS:
+        if not os.getenv(var):
+            optional_missing.append(f"  {var}  →  {hint}")
+    if optional_missing:
+        logger.warning("Optional env vars not set (features may be limited):\n%s", "\n".join(optional_missing))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _startup_check()
     mongo_url = config["mongo_url"]
     db = await init_db(mongo_url)
 
@@ -87,8 +125,13 @@ async def lifespan(app: FastAPI):
     for mod in _db.INDEXABLE_DB_MODULES:
         try:
             await mod.ensure_indexes()
-        except Exception:
-            logger.exception("ensure_indexes failed for %s", mod.__name__ if hasattr(mod, '__name__') else mod)
+        except Exception as _ei_exc:
+            # D20 — WARNING (not ERROR) since index creation failures are non-fatal
+            logger.warning(
+                "ensure_indexes failed for %s: %s",
+                getattr(mod, "__name__", repr(mod)),
+                _ei_exc,
+            )
 
     # #13 Structured startup log with config summary
     logger.info(
@@ -115,10 +158,11 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
     )
 
-    # #10 Background purge of expired session role tokens (hourly)
+    # #10 Background purge of expired session role tokens (B8 — aligned to next whole hour)
     async def _purge_expired_tokens():
         while True:
-            await asyncio.sleep(3600)
+            delay = 3600 - (time.time() % 3600)  # B8: sleep until next hour boundary
+            await asyncio.sleep(delay)
             try:
                 from db import session_roles as _sr
                 purged = await _sr.purge_expired()
@@ -128,6 +172,23 @@ async def lifespan(app: FastAPI):
                 logger.debug("Token purge failed", exc_info=True)
 
     _track_task(_purge_expired_tokens())
+
+    # B2 — Periodic cleanup of stale IP entries in rate-limit windows (every 5 min)
+    async def _cleanup_rate_windows():
+        while True:
+            await asyncio.sleep(300)
+            now = time.time()
+            cutoff = now - 60
+            stale = [
+                ip for ip, w in list(_rate_windows.items())
+                if not w or w[-1] < cutoff
+            ]
+            for ip in stale:
+                del _rate_windows[ip]
+            if stale:
+                logger.debug("Cleaned %d stale rate-limit entries", len(stale))
+
+    _track_task(_cleanup_rate_windows())
 
     yield
 
@@ -254,12 +315,15 @@ _ADMIN_PATHS = {"/admin", "/debug", "/logs/client-errors"}
 
 @app.middleware("http")
 async def security_headers_middleware(request: Request, call_next):
+    if _is_fast_path(request.url.path):  # B6 — skip for health/docs
+        return await call_next(request)
     response = await call_next(request)
     response.headers["Content-Security-Policy"] = _CSP
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    # B10 — allow microphone=(self) so the voice conversation feature works
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(self), geolocation=()"
     # #26 Vary: Accept-Encoding for correct caching of compressed responses
     response.headers["Vary"] = "Accept-Encoding"
     # #10 Cache-Control: no-store on admin/auth endpoints
@@ -268,10 +332,20 @@ async def security_headers_middleware(request: Request, call_next):
     return response
 
 
+# B6 — Paths that skip non-essential middleware (health, metrics, docs)
+_FAST_PATH_PREFIXES = ("/health", "/metrics", "/docs", "/redoc", "/openapi")
+
+
+def _is_fast_path(path: str) -> bool:
+    return any(path.startswith(p) for p in _FAST_PATH_PREFIXES)
+
+
 # ── #23 Server-Timing headers ─────────────────────────────────────────────────
 
 @app.middleware("http")
 async def server_timing_middleware(request: Request, call_next):
+    if _is_fast_path(request.url.path):  # B6 — skip for health/docs
+        return await call_next(request)
     t0 = time.perf_counter()
     response = await call_next(request)
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -284,7 +358,7 @@ async def server_timing_middleware(request: Request, call_next):
 
 from config.constants import EXPENSIVE_RATE_LIMIT_RPM as _EXP_RPM, COST_BUDGET_USD as _COST_BUDGET
 _EXPENSIVE_PATHS = {"/chat/plan", "/chat/red-team", "/chat/fan-out", "/chat/negotiate"}
-_exp_windows: dict[str, list[float]] = defaultdict(list)
+_exp_windows: dict[str, deque] = defaultdict(deque)  # B1 — deque for O(1) popleft
 
 
 @app.middleware("http")
@@ -296,7 +370,7 @@ async def expensive_rate_limit_middleware(request: Request, call_next):
     window = _exp_windows[client_ip]
     cutoff = now - 60
     while window and window[0] < cutoff:
-        window.pop(0)
+        window.popleft()  # B1 — O(1) with deque
     if len(window) >= _EXP_RPM:
         return JSONResponse(
             status_code=429,
@@ -309,7 +383,9 @@ async def expensive_rate_limit_middleware(request: Request, call_next):
 # ── #F9 Cost budget guard ─────────────────────────────────────────────────────
 
 _daily_cost_cache: dict[str, float] = {}  # date -> total_cost
+_daily_cost_ts: dict[str, float] = {}      # B5 — timestamp of last cache fill (60s TTL)
 _daily_cost_lock = asyncio.Lock()  # #12 prevent race on cache reads/writes
+_COST_CACHE_TTL = 60.0             # B5 — re-fetch cost every 60 seconds
 
 
 @app.middleware("http")
@@ -317,10 +393,12 @@ async def cost_budget_middleware(request: Request, call_next):
     if _COST_BUDGET <= 0 or request.url.path not in {"/chat", "/chat/stream", "/chat/plan", "/chat/red-team"}:
         return await call_next(request)
     today = time.strftime("%Y-%m-%d")
+    now_ts = time.monotonic()
     # #12 asyncio.Lock prevents concurrent cache population races
     async with _daily_cost_lock:
         cached_cost = _daily_cost_cache.get(today, -1.0)
-        if cached_cost < 0:
+        cache_age = now_ts - _daily_cost_ts.get(today, 0.0)
+        if cached_cost < 0 or cache_age > _COST_CACHE_TTL:  # B5 — 60s TTL
             try:
                 from db.analytics import _db as _adb
                 if _adb is not None:
@@ -334,6 +412,7 @@ async def cost_budget_middleware(request: Request, call_next):
             except Exception:
                 cached_cost = 0.0
             _daily_cost_cache[today] = cached_cost
+            _daily_cost_ts[today] = now_ts  # B5 — record fill time
 
     if cached_cost >= _COST_BUDGET:
         return JSONResponse(
@@ -355,8 +434,14 @@ _PII_REDACT_PATHS = {"/chat", "/chat/stream", "/chat/plan", "/chat/simulate"}
 
 @app.middleware("http")
 async def pii_redaction_middleware(request: Request, call_next):
-    """#20 — Redact PII from request bodies before they reach LLM endpoints."""
-    if _PII_ENABLED and request.url.path in _PII_REDACT_PATHS and request.method == "POST":
+    """B3/#20 — Redact PII from JSON request bodies before they reach LLM endpoints."""
+    content_type = request.headers.get("content-type", "")
+    if (
+        _PII_ENABLED
+        and request.url.path in _PII_REDACT_PATHS
+        and request.method == "POST"
+        and "application/json" in content_type  # B3 — skip non-JSON (e.g. multipart)
+    ):
         try:
             body = await request.body()
             body_text = body.decode("utf-8", errors="replace")
@@ -380,7 +465,7 @@ async def rate_limit_middleware(request: Request, call_next):
     # Slide window: drop timestamps older than 60s
     cutoff = now - 60
     while window and window[0] < cutoff:
-        window.pop(0)
+        window.popleft()  # B1 — O(1) with deque
     remaining = max(0, _RATE_LIMIT_REQUESTS - len(window))
     reset_at = int(window[0] + 60) if window else int(now + 60)
     if len(window) >= _RATE_LIMIT_REQUESTS:

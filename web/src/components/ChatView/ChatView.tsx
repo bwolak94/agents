@@ -130,8 +130,10 @@ export function ChatView({ sessionId, messages, setMessages, historyLoading, onC
   const [showSearch, setShowSearch] = useState(false);
   const [syntaxDark, setSyntaxDark] = useState(true);
   const [focusedMsgIdx, setFocusedMsgIdx] = useState<number | null>(null);
+  const [clipboardOffer, setClipboardOffer] = useState<string | null>(null);
   const bottomRef               = useRef<HTMLDivElement>(null);
   const searchRef               = useRef<HTMLInputElement>(null);
+  const prevStreamRef           = useRef<string>('');
   const msgRefs                 = useRef<(HTMLDivElement | null)[]>([]);
   const { loading, send, streamingContent } = useChat(sessionId);
 
@@ -206,8 +208,34 @@ export function ChatView({ sessionId, messages, setMessages, historyLoading, onC
     }
   }, [input, loading, send, setMessages]);
 
+  // FE22 — Auto-scroll to bottom when streaming completes
+  useEffect(() => {
+    if (prevStreamRef.current && !streamingContent) {
+      // Stream just ended
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+    prevStreamRef.current = streamingContent;
+  }, [streamingContent]);
+
+  // FE7 — Clipboard-aware context injection: detect clipboard on textarea focus
+  const handleTextareaFocus = useCallback(async () => {
+    try {
+      const clip = await navigator.clipboard.readText();
+      if (clip && clip.length > 10 && clip.length < 5000 && !input.includes(clip)) {
+        // Only offer if clipboard looks like code or text (not a single word)
+        if (clip.includes('\n') || clip.length > 80) {
+          setClipboardOffer(clip);
+        }
+      }
+    } catch {
+      // Clipboard read denied — ignore silently
+    }
+  }, [input]);
+
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+    // FE18 — Ctrl+Enter also submits
+    if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); handleSend(); }
   };
 
   const handleFileUploaded = (reference: string) => {
@@ -345,12 +373,35 @@ export function ChatView({ sessionId, messages, setMessages, historyLoading, onC
         <div ref={bottomRef} />
       </div>
 
+      {/* FE7 — Clipboard offer banner */}
+      {clipboardOffer && (
+        <div className="px-4 py-2 border-t border-border-dim bg-surface-panel flex items-center gap-3 text-xs flex-shrink-0">
+          <span className="text-text-faint flex-1 truncate">
+            Clipboard: <span className="text-text-secondary">{clipboardOffer.slice(0, 80)}{clipboardOffer.length > 80 ? '…' : ''}</span>
+          </span>
+          <button
+            onClick={() => { setInput(prev => prev ? `${prev}\n\n${clipboardOffer}` : clipboardOffer); setClipboardOffer(null); }}
+            className="border border-accent-blue text-accent-blue-light rounded px-2 py-0.5 hover:bg-blue-900/30 transition-colors"
+          >
+            Inject
+          </button>
+          <button
+            onClick={() => setClipboardOffer(null)}
+            className="text-text-ghost hover:text-text-faint transition-colors px-1"
+            title="Dismiss"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
       <ChatInput
         value={input}
         loading={loading}
         sessionId={sessionId}
         onChange={setInput}
         onKeyDown={handleKeyDown}
+        onFocus={handleTextareaFocus}
         onSend={() => handleSend()}
         onFileUploaded={handleFileUploaded}
         onTranscript={handleTranscript}
@@ -500,6 +551,7 @@ function ThinkingIndicator() {
 interface ChatInputProps {
   value: string; loading: boolean; sessionId: string | null;
   onChange: (v: string) => void; onKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => void;
+  onFocus?: () => void;
   onSend: () => void; onFileUploaded: (ref: string, name: string) => void;
   onTranscript: (t: string) => void; onSelectPrompt: (c: string) => void;
 }
@@ -507,7 +559,7 @@ interface ChatInputProps {
 const _CHAR_WARN = 2000;
 const _CHAR_MAX  = 4000;
 
-function ChatInput({ value, loading, sessionId, onChange, onKeyDown, onSend, onFileUploaded, onTranscript, onSelectPrompt }: ChatInputProps) {
+function ChatInput({ value, loading, sessionId, onChange, onKeyDown, onFocus, onSend, onFileUploaded, onTranscript, onSelectPrompt }: ChatInputProps) {
   const isDisabled  = loading || !value.trim();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const charCount   = value.length;
@@ -526,7 +578,7 @@ function ChatInput({ value, loading, sessionId, onChange, onKeyDown, onSend, onF
       {/* Character / token counter */}
       {value.length > 0 && (
         <div className={`text-right text-[10px] mb-1 max-w-[800px] mx-auto ${counterColor}`}>
-          {charCount} chars · ~{tokenEst} tokens
+          {charCount} chars · ~{tokenEst} tokens · Ctrl+Enter to send
         </div>
       )}
       <div className="flex gap-2 max-w-[800px] mx-auto items-end">
@@ -539,7 +591,8 @@ function ChatInput({ value, loading, sessionId, onChange, onKeyDown, onSend, onF
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="Ask a question… (Enter to send, Shift+Enter for new line)"
+          onFocus={onFocus}
+          placeholder="Ask a question… (Enter to send, Ctrl+Enter, Shift+Enter for new line)"
           rows={1}
           className="flex-1 bg-surface-input text-text-primary border border-border-strong rounded-xl px-3.5 py-2.5 text-sm resize-none outline-none font-[inherit] leading-relaxed overflow-y-auto min-h-[42px] max-h-[300px] focus:border-accent-blue transition-colors"
         />

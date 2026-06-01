@@ -11,6 +11,14 @@ interface ChatApiResponse {
   reasoning?: string;
 }
 
+// F25 — typed options for send() so callers can override model, eval, etc.
+export interface ChatOptions {
+  preferredModel?: string;
+  enableSelfEval?: boolean;
+  showScratchpad?: boolean;
+  systemPrompt?: string;
+}
+
 const CHAT_TIMEOUT_MS = 120_000;
 
 export function useChat(sessionId: string | null) {
@@ -19,7 +27,7 @@ export function useChat(sessionId: string | null) {
   const [streamingContent, setStreamingContent] = useState('');
   const abortRef = useRef<AbortController | null>(null);
 
-  const send = async (text: string): Promise<ChatMessage> => {
+  const send = async (text: string, options?: ChatOptions): Promise<ChatMessage> => {  // F25
     setLoading(true);
     setStreamingContent('');
     const controller = new AbortController();
@@ -28,16 +36,25 @@ export function useChat(sessionId: string | null) {
 
     try {
       const requestId = crypto.randomUUID();
+      // F30 — thread X-Request-ID + Idempotency-Key through all fetch calls
+      const baseHeaders: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'X-Request-ID': requestId,
+        'Idempotency-Key': requestId,
+      };
 
       // Try SSE streaming endpoint first
       const streamRes = await fetch(`${API_URL}/chat/stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: baseHeaders,
         body: JSON.stringify({
           message: text,
           session_id: sessionId,
           show_routing: false,
           request_id: requestId,
+          preferred_model: options?.preferredModel,     // F25
+          enable_self_eval: options?.enableSelfEval,    // F25
+          show_scratchpad: options?.showScratchpad,     // F25
         }),
         signal: controller.signal,
       });
@@ -87,19 +104,22 @@ export function useChat(sessionId: string | null) {
         };
       }
 
-      // Fallback: non-streaming POST
+      // Fallback: non-streaming POST — F30: same headers
       const res = await fetch(`${API_URL}/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: baseHeaders,
         body: JSON.stringify({
           message: text,
           session_id: sessionId,
           show_routing: false,
           request_id: requestId,
+          preferred_model: options?.preferredModel,
+          enable_self_eval: options?.enableSelfEval,
+          show_scratchpad: options?.showScratchpad,
         }),
         signal: controller.signal,
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status} (request-id: ${requestId})`);  // F30
       const data = (await res.json()) as ChatApiResponse;
       return {
         role: 'assistant',

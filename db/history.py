@@ -16,9 +16,10 @@ _db = None
 _SYSTEM_SESSIONS = {"default"}
 
 
-_MONGO_MAX_POOL = int(os.getenv("MONGO_MAX_POOL_SIZE", "20"))
-_MONGO_MIN_POOL = int(os.getenv("MONGO_MIN_POOL_SIZE", "5"))
-_SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "90"))
+_MONGO_MAX_POOL     = int(os.getenv("MONGO_MAX_POOL_SIZE", "20"))
+_MONGO_MIN_POOL     = int(os.getenv("MONGO_MIN_POOL_SIZE", "5"))
+_SESSION_TTL_DAYS   = int(os.getenv("SESSION_TTL_DAYS", "90"))
+_MONGO_WRITE_CONCERN = os.getenv("MONGO_WRITE_CONCERN", "majority")  # D18
 
 
 async def init_db(mongo_url: str):
@@ -41,6 +42,7 @@ async def init_db(mongo_url: str):
         connectTimeoutMS=5000,
         socketTimeoutMS=30_000,
         retryWrites=True,
+        w=_MONGO_WRITE_CONCERN,  # D18 — configurable write concern
     )
     db = client["agent_system"]
 
@@ -86,11 +88,18 @@ def reset_db() -> None:
     _db = None
 
 
-async def load_history(session_id: str) -> list:
-    """Return list of messages for display in the UI."""
+async def load_history(session_id: str, tail: int | None = None) -> list:
+    """Return list of messages for display in the UI.
+
+    D16 — ``tail`` uses a ``$slice`` projection to load only the last N messages
+    without fetching the entire conversation array.
+    """
+    projection: dict = {"_id": 0, "messages": 1}
+    if tail is not None:
+        projection["messages"] = {"$slice": -tail}
     doc = await _db["conversations"].find_one(
         {"session_id": session_id},
-        {"_id": 0, "messages": 1}
+        projection,
     )
     return doc["messages"] if doc else []
 
@@ -106,7 +115,12 @@ async def load_context(session_id: str, limit: int = _CONTEXT_MESSAGE_LIMIT) -> 
 
 
 async def append_message(session_id: str, role: str, content: str, **meta):
-    """Append a single message to the session history."""
+    """Append a single message to the session history.
+
+    D17 — Eliminated a separate ``find_one`` for preview by using ``$setOnInsert``
+    exclusively: preview is written only when the document is first created (upsert),
+    removing one round-trip on every message append.
+    """
     msg = {
         "role": role,
         "content": content,
@@ -115,24 +129,18 @@ async def append_message(session_id: str, role: str, content: str, **meta):
     }
     now = datetime.now(timezone.utc).isoformat()
 
-    update = {
-        "$push": {"messages": msg},
-        "$set": {"updated_at": now},
-        "$setOnInsert": {"created_at": now},
-    }
-
-    # Store preview (first user message, XML tags stripped) for the sidebar
+    set_on_insert: dict = {"created_at": now}
+    # D17 — preview only on new document creation; no extra find_one needed
     if role == "user":
-        existing = await _db["conversations"].find_one(
-            {"session_id": session_id}, {"_id": 0, "preview": 1}
-        )
-        if not existing or not existing.get("preview"):
-            preview = _strip_xml(content)[:100]
-            update["$setOnInsert"]["preview"] = preview  # type: ignore[index]
+        set_on_insert["preview"] = _strip_xml(content)[:100]
 
     await _db["conversations"].update_one(
         {"session_id": session_id},
-        update,
+        {
+            "$push": {"messages": msg},
+            "$set":  {"updated_at": now},
+            "$setOnInsert": set_on_insert,
+        },
         upsert=True,
     )
 
@@ -188,11 +196,16 @@ async def list_sessions(limit: int = 50, skip: int = 0, after: str | None = None
     cursor = _db["conversations"].find(
         base_filter,
         {"_id": 0, "session_id": 1, "updated_at": 1, "created_at": 1, "preview": 1, "title": 1, "auto_tags": 1, "messages": {"$slice": 1}}
-    ).sort("updated_at", -1)
+    ).sort("updated_at", -1).batch_size(50)  # B10 — configurable batch_size reduces memory spikes
     if not after:
         cursor = cursor.skip(skip)
     cursor = cursor.limit(limit)
-    docs = await cursor.to_list(length=limit)
+    # B10 — Use `async for` to stream results from MongoDB instead of loading all at once
+    docs: list = []
+    async for doc in cursor:
+        docs.append(doc)
+        if len(docs) >= limit:
+            break
 
     result = []
     for doc in docs:

@@ -11,6 +11,9 @@ _BUILTIN_MACROS: dict[str, str] = {
     "/code":     "Write clean, production-ready code for the following task. Include type annotations, error handling, and a brief explanation of the approach:\n\n",
     "/explain":  "Explain the following concept clearly. Start with a one-sentence summary, then give a detailed explanation with an analogy and a concrete example:\n\n",
     "/debug":    "Debug the following code or error. Identify the root cause, explain why it happens, and provide a minimal fix with explanation:\n\n",
+    # F6 — quick-access shortcut aliases
+    "/fix":      "Fix the following bug or error. Identify the root cause, explain why it happens, and provide the corrected code:\n\n",
+    "/doc":      "Write clear, concise documentation (docstrings + README section) for the following code. Include parameters, return values, and usage examples:\n\n",
     "/refactor": "Refactor the following code to improve readability, performance, and maintainability. Preserve all existing behaviour. Explain each change:\n\n",
     "/test":     "Write comprehensive tests for the following code. Cover happy path, edge cases, and error conditions. Use pytest:\n\n",
     "/review":   "Review the following code for correctness, security vulnerabilities, performance issues, and style. Provide specific, actionable feedback:\n\n",

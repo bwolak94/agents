@@ -2,7 +2,7 @@ import type { Stats, Costs } from '@/types/chat';
 import type { WsStatus } from '@/hooks/useWebSocket';
 import type { Theme } from '@/hooks/useTheme';
 
-export type ViewId = 'chat' | 'analytics' | 'memory' | 'branch' | 'plugins' | 'ab-test';
+export type ViewId = 'chat' | 'analytics' | 'memory' | 'branch' | 'plugins' | 'ab-test' | 'side-by-side' | 'graph';
 
 interface HeaderProps {
   wsStatus: WsStatus;
@@ -29,12 +29,14 @@ const WS_DOT_COLOR: Record<WsStatus, string> = {
 
 // #28 — NAV_TABS with full ARIA support
 const NAV_TABS: { id: ViewId; label: string }[] = [
-  { id: 'chat',      label: 'Chat'      },
-  { id: 'analytics', label: 'Analytics' },
-  { id: 'memory',    label: 'Memory'    },
-  { id: 'branch',    label: 'Branch'    },
-  { id: 'plugins',   label: 'Plugins'   },
-  { id: 'ab-test',   label: 'A/B Test'  },
+  { id: 'chat',        label: 'Chat'        },
+  { id: 'analytics',   label: 'Analytics'   },
+  { id: 'memory',      label: 'Memory'      },
+  { id: 'branch',      label: 'Branch'      },
+  { id: 'plugins',     label: 'Plugins'     },
+  { id: 'ab-test',     label: 'A/B Test'    },
+  { id: 'side-by-side',label: 'Side-by-Side'},
+  { id: 'graph',       label: 'Graph'       },
 ];
 
 interface StatPillProps {
