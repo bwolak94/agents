@@ -1,0 +1,24 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+      - id: mypy
+        additional_dependencies: [types-requests]
+        args: [--ignore-missing-imports, --no-strict-optional]
+        files: ^(api|core|db|agents|tools)/
+
+  - repo: local
+    hooks:
+      - id: pytest-collect
+        name: pytest --collect-only (smoke check)
+        language: system
+        entry: python3 -m pytest --collect-only -q
+        pass_filenames: false
+        always_run: true

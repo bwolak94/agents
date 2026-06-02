@@ -44,6 +44,18 @@ class EventBus:
     def subscriber_count(self) -> int:
         return len(self._subscribers)
 
+    def subscriber_count_for(self, session_id: str) -> int:
+        """Count subscribers filtering on a specific session_id."""
+        return sum(1 for s in self._subscribers.values() if s == session_id)
+
+    async def emit_typing(self, session_id: str) -> None:
+        """W21 — Emit a typing indicator so other clients see agent is processing."""
+        await self.emit({"type": "typing", "session_id": session_id})
+
+    async def emit_error(self, session_id: str, code: str, message: str) -> None:
+        """W23 — Emit a unified structured error event."""
+        await self.emit({"type": "error", "code": code, "message": message, "session_id": session_id})
+
 
 # Global singleton
 event_bus = EventBus()

@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
 MAX_TOKENS_BY_COMPLEXITY = {"low": 1024, "medium": 2048, "high": 4096}
 MAX_RESPONSE_IN_HISTORY = 2000
 HISTORY_WINDOW = 20
-SUMMARIZE_THRESHOLD = 16
+# #10 — Make summarization threshold configurable via env var
+SUMMARIZE_THRESHOLD = int(__import__("os").getenv("SUMMARIZE_THRESHOLD", "16"))
 MAX_PARALLEL_SUBTASKS = 3
 
 SUMMARIZE_PROMPT = """Summarize the conversation so far in 3-5 concise bullet points.
@@ -113,6 +114,16 @@ class AgentOrchestrator:
         if show_routing:
             self._display_routing_info(decision)
 
+        # STEP 1.5: Auto-RAG — inject relevant knowledge-base chunks (if any) into the message
+        try:
+            from db.rag import search as _rag_search
+            rag_chunks = await _rag_search(session_id, message, limit=3)
+            if rag_chunks:
+                ctx = "\n\n".join(f"[{c['title']}]\n{c['content'][:500]}" for c in rag_chunks)
+                message = f"<context>\n{ctx}\n</context>\n\n{message}"
+        except Exception:
+            pass  # RAG is best-effort; never block the main flow
+
         # STEP 2: Parallel subtasks (if router decided to parallelize)
         if decision.parallel_tasks:
             return await self._process_parallel(
@@ -140,6 +151,98 @@ class AgentOrchestrator:
 
         await self._update_history(session_id, message, response)
         return response
+
+    # ─────────────────────────────────────────
+    # PUBLIC: self-evaluation loop (#2)
+    # ─────────────────────────────────────────
+    async def self_evaluate(self, message: str, response: str, model: str = "claude-haiku") -> float:
+        """Ask the LLM to grade a response 0-10. Returns score / 10 as float."""
+        prompt = (
+            f"Rate the following response on a scale of 0-10 for quality, accuracy, and helpfulness.\n\n"
+            f"User question: {message[:500]}\n\nResponse: {response[:1000]}\n\n"
+            "Output ONLY a single number (0-10). No explanation."
+        )
+        try:
+            raw = await self.llm.call(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=5,
+                temperature=0.1,
+            )
+            score = float(raw.strip().split()[0])
+            return max(0.0, min(10.0, score)) / 10.0
+        except Exception:
+            return -1.0
+
+    # ─────────────────────────────────────────
+    # PUBLIC: extract chain-of-thought scratchpad (#3)
+    # ─────────────────────────────────────────
+    async def get_scratchpad(self, message: str, model: str = "claude") -> tuple[str, str]:
+        """Ask the LLM to reason step-by-step. Returns (scratchpad, final_answer)."""
+        prompt = (
+            f"{message}\n\n"
+            "First, think step-by-step inside <thinking> tags. "
+            "Then provide your final answer after </thinking>."
+        )
+        try:
+            raw = await self.llm.call(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=2048,
+                temperature=0.7,
+            )
+            import re
+            m = re.search(r"<thinking>(.*?)</thinking>(.*)", raw, re.DOTALL)
+            if m:
+                return m.group(1).strip(), m.group(2).strip()
+            return "", raw
+        except Exception:
+            return "", ""
+
+    # ─────────────────────────────────────────
+    # PUBLIC: confidence scoring (#6)
+    # ─────────────────────────────────────────
+    async def estimate_confidence(self, message: str, response: str) -> float:
+        """Return a 0-1 confidence score for the response."""
+        prompt = (
+            f"How confident are you in this response?\n\n"
+            f"Question: {message[:300]}\nResponse: {response[:500]}\n\n"
+            "Output ONLY a decimal number 0.0-1.0 representing your confidence."
+        )
+        try:
+            raw = await self.llm.call(
+                model="claude-haiku",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=5,
+                temperature=0.1,
+            )
+            return max(0.0, min(1.0, float(raw.strip().split()[0])))
+        except Exception:
+            return -1.0
+
+    # ─────────────────────────────────────────
+    # PUBLIC: smart context compression (#14)
+    # ─────────────────────────────────────────
+    async def smart_compress_history(self, message: str, max_messages: int = 10) -> list[dict]:
+        """Select the most semantically relevant messages from history using embeddings."""
+        if len(self.conversation_history) <= max_messages:
+            return self.conversation_history
+        try:
+            from db.embeddings import get_embedder
+            embedder = get_embedder()
+            query_vec = await embedder.embed(message)
+            scored = []
+            for i, msg in enumerate(self.conversation_history):
+                vec = await embedder.embed(msg.get("content", "")[:500])
+                score = embedder.cosine_similarity(query_vec, vec)
+                scored.append((score, i, msg))
+            scored.sort(key=lambda x: -x[0])
+            # Always keep most recent N/2 messages + top scoring
+            recent = self.conversation_history[-max_messages // 2:]
+            top = [msg for _, _, msg in scored[:max_messages // 2] if msg not in recent]
+            return top + recent
+        except Exception:
+            return self.conversation_history[-max_messages:]
 
     # ─────────────────────────────────────────
     # PUBLIC: agent handoff pipeline (Feature 2)
@@ -325,12 +428,12 @@ class AgentOrchestrator:
         models_to_try = [decision.model] + (decision.fallback_models or [])
 
         for model in models_to_try:
-            # Skip unhealthy models (Imp 6)
+            # Skip unhealthy / open-circuit models (Imp 6 + circuit breaker)
             if not self.llm.is_model_healthy(model):
-                logger.info("Skipping unhealthy model %s", model)
+                logger.info("Skipping model %s (circuit open)", model)
                 continue
             try:
-                return await self._run_agent_with_events(
+                result = await self._run_agent_with_events(
                     agent_name=decision.agent,
                     model=model,
                     tools=decision.tools,
@@ -341,6 +444,8 @@ class AgentOrchestrator:
                     enable_reflection=enable_reflection,
                     checkpoint_id=checkpoint_id,
                 )
+                self.llm.record_cb_success(model)  # reset circuit on success
+                return result
             except Exception as e:
                 console.print(f"[yellow]Model {model} failed: {e} — trying fallback...[/yellow]")
                 self.llm.mark_model_unhealthy(model)

@@ -1,7 +1,10 @@
 'use client';
-import { useState, useRef, useEffect, useCallback, type KeyboardEvent } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo, type KeyboardEvent } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { vscDarkPlus, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import type { Components } from 'react-markdown';
 import type { ChatMessage } from '@/types/chat';
 import type { Dispatch, SetStateAction } from 'react';
 import { AGENT_CFG, DEFAULT_AGENT_CFG, MODEL_COLORS } from '@/constants/agents';
@@ -9,7 +12,38 @@ import { useChat } from '@/hooks/useChat';
 import { FileUpload } from '@/components/FileUpload/FileUpload';
 import { VoiceInput } from '@/components/VoiceInput/VoiceInput';
 import { PromptLibrary } from '@/components/PromptLibrary/PromptLibrary';
+import { StreamingCursor } from '@/components/StreamingCursor/StreamingCursor';
 import { API_URL } from '@/constants/api';
+
+// Approximate token count (4 chars ≈ 1 token)
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+// Copy-to-clipboard button for code blocks
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch { /* ignore */ }
+  }, [text]);
+  return (
+    <button
+      onClick={handleCopy}
+      title="Copy code"
+      className={`absolute top-2 right-2 text-[10px] px-2 py-0.5 rounded border transition-all cursor-pointer
+        ${copied
+          ? 'bg-green-900 border-green-700 text-green-300'
+          : 'bg-surface-active border-border-strong text-text-faint hover:text-text-secondary'
+        }`}
+    >
+      {copied ? '✓ Copied' : 'Copy'}
+    </button>
+  );
+}
 
 interface ChatViewProps {
   sessionId: string | null;
@@ -19,175 +53,351 @@ interface ChatViewProps {
   onClearChat?: () => void;
 }
 
-const THINKING_DOTS = [0, 1, 2];
+// #26 — Quick-start chips for empty state
+const QUICK_PROMPTS = [
+  'Explain this codebase structure',
+  'Write a Python async function',
+  'How does vector search work?',
+  'Debug this error: ',
+  'Summarise recent changes',
+  'Generate unit tests for: ',
+];
+
+// #23 — format timestamp
+function formatTs(ts?: string): string {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const now = new Date();
+  const diffMin = Math.floor((now.getTime() - d.getTime()) / 60000);
+  if (diffMin < 1)  return 'just now';
+  if (diffMin < 60) return `${diffMin}m ago`;
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+// #22 — Markdown renderer with syntax highlighting + copy button
+function makeMdComponents(dark: boolean): Components {
+  return {
+  code({ className, children, ...props }) {
+    const match   = /language-(\w+)/.exec(className || '');
+    const isBlock = String(children).includes('\n');
+    const codeText = String(children).replace(/\n$/, '');
+    if (isBlock && match) {
+      return (
+        <div className="relative group">
+          <CopyButton text={codeText} />
+          <SyntaxHighlighter
+            style={(dark ? vscDarkPlus : oneLight) as never}
+            language={match[1]}
+            PreTag="div"
+            customStyle={{ margin: '8px 0', borderRadius: 8, fontSize: 12, border: '1px solid #334155', paddingTop: 28 }}
+          >
+            {codeText}
+          </SyntaxHighlighter>
+        </div>
+      );
+    }
+    if (isBlock) {
+      return (
+        <div className="relative group">
+          <CopyButton text={codeText} />
+          <pre className="bg-surface-code border border-border-strong rounded-lg p-3 overflow-x-auto my-2 text-xs font-mono leading-relaxed pt-7">
+            <code className={className} {...props}>{children}</code>
+          </pre>
+        </div>
+      );
+    }
+    return (
+      <code className="bg-surface-code border border-border-strong rounded px-1 py-0.5 text-[0.9em] font-mono" {...props}>
+        {children}
+      </code>
+    );
+  },
+  p({ children })         { return <p className="my-1.5 leading-relaxed">{children}</p>; },
+  ul({ children })        { return <ul className="my-1.5 pl-5">{children}</ul>; },
+  ol({ children })        { return <ol className="my-1.5 pl-5">{children}</ol>; },
+  li({ children })        { return <li className="mb-1">{children}</li>; },
+  blockquote({ children }){ return <blockquote className="border-l-[3px] border-border-strong ml-0 pl-3 my-2 text-text-secondary">{children}</blockquote>; },
+  h1({ children })        { return <h1 className="text-lg mt-3 mb-1.5 text-text-primary">{children}</h1>; },
+  h2({ children })        { return <h2 className="text-base mt-2.5 mb-1 text-text-primary">{children}</h2>; },
+  h3({ children })        { return <h3 className="text-sm mt-2 mb-1 text-text-primary">{children}</h3>; },
+  };
+}
+
 
 export function ChatView({ sessionId, messages, setMessages, historyLoading, onClearChat }: ChatViewProps) {
-  const [input, setInput] = useState('');
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const [input, setInput]       = useState('');
+  const [chatSearch, setChatSearch] = useState('');
+  const [showSearch, setShowSearch] = useState(false);
+  const [syntaxDark, setSyntaxDark] = useState(true);
+  const [focusedMsgIdx, setFocusedMsgIdx] = useState<number | null>(null);
+  const [clipboardOffer, setClipboardOffer] = useState<string | null>(null);
+  const bottomRef               = useRef<HTMLDivElement>(null);
+  const searchRef               = useRef<HTMLInputElement>(null);
+  const prevStreamRef           = useRef<string>('');
+  const msgRefs                 = useRef<(HTMLDivElement | null)[]>([]);
   const { loading, send, streamingContent } = useChat(sessionId);
+
+  // Filter messages by search query
+  const filteredMessages = useMemo(() => {
+    if (!chatSearch.trim()) return messages;
+    const q = chatSearch.toLowerCase();
+    return messages.filter(m => m.content.toLowerCase().includes(q));
+  }, [messages, chatSearch]);
+
+  // Toggle in-chat search with Ctrl+F
+  useEffect(() => {
+    const handler = (e: globalThis.KeyboardEvent) => {
+      if (e.ctrlKey && e.key === 'f') {
+        e.preventDefault();
+        setShowSearch(s => !s);
+        setTimeout(() => searchRef.current?.focus(), 50);
+      }
+      if (e.key === 'Escape') setShowSearch(false);
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
 
   const handleExport = useCallback(async (format: 'json' | 'md') => {
     if (!sessionId) return;
     const resp = await fetch(`${API_URL}/history/${sessionId}/export?format=${format}`);
     const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${sessionId}.${format}`;
-    a.click();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = `${sessionId}.${format}`; a.click();
     URL.revokeObjectURL(url);
   }, [sessionId]);
 
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+
+  // Keyboard navigation through messages (up/down when not typing)
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    const handler = (e: globalThis.KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'TEXTAREA' || tag === 'INPUT') return;
+      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        const len = filteredMessages.length;
+        if (len === 0) return;
+        setFocusedMsgIdx((prev) => {
+          let next = prev === null ? (e.key === 'ArrowUp' ? len - 1 : 0) : prev + (e.key === 'ArrowUp' ? -1 : 1);
+          next = Math.max(0, Math.min(len - 1, next));
+          msgRefs.current[next]?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          return next;
+        });
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [filteredMessages.length]);
 
-  const handleSend = useCallback(async () => {
-    const text = input.trim();
-    if (!text || loading) return;
-
-    setMessages((prev) => [...prev, { role: 'user', content: text }]);
+  const handleSend = useCallback(async (text?: string) => {
+    const msg = (text ?? input).trim();
+    if (!msg || loading) return;
+    const ts = new Date().toISOString();
+    // Optimistic: add user message immediately
+    setMessages((prev) => [...prev, { role: 'user', content: msg, ts }]);
+    // F26 — optimistic assistant placeholder shown during loading
+    const placeholderTs = new Date().toISOString();
+    setMessages((prev) => [...prev, { role: 'assistant', content: '…', loading: true, ts: placeholderTs } as any]);
     setInput('');
-
-    const response = await send(text);
-    setMessages((prev) => [...prev, response]);
+    try {
+      const response = await send(msg);
+      // Replace placeholder with real response
+      setMessages((prev) => prev.filter((m: any) => !m.loading).concat([{ ...response, ts: new Date().toISOString() }]));
+    } catch {
+      // Rollback optimistic user message and loading placeholder on error
+      setMessages((prev) => prev.filter((m) => !(m.role === 'user' && m.content === msg && m.ts === ts) && !(m as any).loading));
+      setMessages((prev) => [...prev, { role: 'error', content: 'Failed to send message. Please try again.', ts: new Date().toISOString() }]);
+    }
   }, [input, loading, send, setMessages]);
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
+  // FE22 — Auto-scroll to bottom when streaming completes
+  useEffect(() => {
+    if (prevStreamRef.current && !streamingContent) {
+      // Stream just ended
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
+    prevStreamRef.current = streamingContent;
+  }, [streamingContent]);
+
+  // FE7 — Clipboard-aware context injection: detect clipboard on textarea focus
+  const handleTextareaFocus = useCallback(async () => {
+    try {
+      const clip = await navigator.clipboard.readText();
+      if (clip && clip.length > 10 && clip.length < 5000 && !input.includes(clip)) {
+        // Only offer if clipboard looks like code or text (not a single word)
+        if (clip.includes('\n') || clip.length > 80) {
+          setClipboardOffer(clip);
+        }
+      }
+    } catch {
+      // Clipboard read denied — ignore silently
+    }
+  }, [input]);
+
+  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+    // FE18 — Ctrl+Enter also submits
+    if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); handleSend(); }
   };
 
-  const handleFileUploaded = (reference: string, _filename: string) => {
-    setInput((prev) => (prev ? `${prev} ${reference}` : reference));
+  const handleFileUploaded = (reference: string) => {
+    setInput((prev) => prev ? `${prev} ${reference}` : reference);
   };
 
-  // #18 — memoized so VoiceInput doesn't re-create SpeechRecognition on every render
-  const handleTranscript = useCallback((text: string) => {
-    setInput(text);
-  }, []);
-
-  const handleSelectPrompt = useCallback((content: string) => {
-    setInput(content);
-  }, []);
+  const handleTranscript  = useCallback((text: string) => { setInput(text); }, []);
+  const handleSelectPrompt = useCallback((content: string) => { setInput(content); }, []);
 
   const isEmpty = messages.length === 0;
 
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-      {/* Chat header with clear + export buttons */}
+    <div className="flex-1 flex flex-col overflow-hidden" role="tabpanel" id="panel-chat" aria-labelledby="tab-chat">
+      {/* In-chat search bar */}
+      {showSearch && (
+        <div className="px-4 py-1.5 border-b border-border-dim bg-surface-base flex items-center gap-2 flex-shrink-0">
+          <span className="text-text-faint text-xs">🔍</span>
+          <input
+            ref={searchRef}
+            value={chatSearch}
+            onChange={e => setChatSearch(e.target.value)}
+            placeholder="Search messages… (Esc to close)"
+            className="flex-1 bg-transparent text-text-primary text-xs outline-none"
+          />
+          {chatSearch && (
+            <span className="text-text-ghost text-[10px]">
+              {filteredMessages.length}/{messages.length}
+            </span>
+          )}
+          <button onClick={() => { setChatSearch(''); setShowSearch(false); }}
+            className="text-text-ghost hover:text-text-faint transition-colors text-sm">×</button>
+        </div>
+      )}
+
+      {/* Toolbar */}
       {(messages.length > 0 || onClearChat) && (
-        <div
-          style={{
-            display: 'flex',
-            justifyContent: 'flex-end',
-            gap: 6,
-            padding: '6px 16px',
-            borderBottom: '1px solid #1a1a2e',
-            flexShrink: 0,
-          }}
-        >
+        <div className="flex justify-end gap-1.5 px-4 py-1.5 border-b border-border-dim flex-shrink-0">
           {messages.length > 0 && (
             <>
-              <button
-                onClick={() => handleExport('md')}
-                title="Export as Markdown"
-                style={{ background: 'none', border: '1px solid #334155', borderRadius: 6, color: '#475569', cursor: 'pointer', fontSize: 11, padding: '3px 10px' }}
-              >
+              <button onClick={() => { setShowSearch(s => !s); setTimeout(() => searchRef.current?.focus(), 50); }}
+                title="Search messages (Ctrl+F)"
+                className="border border-border-strong rounded-md text-text-faint text-[11px] px-2.5 py-1 hover:text-text-secondary transition-colors">
+                🔍
+              </button>
+              <button onClick={() => setSyntaxDark(d => !d)}
+                title={syntaxDark ? 'Switch to light syntax theme' : 'Switch to dark syntax theme'}
+                className="border border-border-strong rounded-md text-text-faint text-[11px] px-2.5 py-1 hover:text-text-secondary transition-colors">
+                {syntaxDark ? '☀' : '🌙'}
+              </button>
+              <button onClick={() => handleExport('md')}
+                className="border border-border-strong rounded-md text-text-faint text-[11px] px-2.5 py-1 hover:text-text-secondary transition-colors">
                 Export .md
               </button>
-              <button
-                onClick={() => handleExport('json')}
-                title="Export as JSON"
-                style={{ background: 'none', border: '1px solid #334155', borderRadius: 6, color: '#475569', cursor: 'pointer', fontSize: 11, padding: '3px 10px' }}
-              >
+              <button onClick={() => handleExport('json')}
+                className="border border-border-strong rounded-md text-text-faint text-[11px] px-2.5 py-1 hover:text-text-secondary transition-colors">
                 Export .json
               </button>
             </>
           )}
           {messages.length > 0 && onClearChat && (
-            <button
-              onClick={onClearChat}
-              title="Clear chat history"
-              style={{ background: 'none', border: '1px solid #334155', borderRadius: 6, color: '#475569', cursor: 'pointer', fontSize: 11, padding: '3px 10px' }}
-            >
+            <button onClick={onClearChat}
+              className="border border-border-strong rounded-md text-text-faint text-[11px] px-2.5 py-1 hover:text-text-secondary transition-colors">
               Clear chat
             </button>
           )}
         </div>
       )}
 
-      <div
-        style={{
-          flex: 1,
-          overflowY: 'auto',
-          padding: '16px',
-          display: 'flex',
-          flexDirection: 'column',
-          gap: 12,
-        }}
-      >
-        {/* #17 — loading skeleton while history fetches */}
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
+        {/* Loading skeleton */}
         {historyLoading && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: '20px 0' }}>
+          <div className="flex flex-col gap-2.5 py-5">
             {[80, 55, 95, 65].map((w, i) => (
-              <div
-                key={i}
-                style={{
-                  display: 'flex',
-                  justifyContent: i % 2 === 0 ? 'flex-end' : 'flex-start',
-                }}
-              >
-                <div
-                  style={{
-                    width: `${w}%`,
-                    height: 40,
-                    borderRadius: 14,
-                    background: 'linear-gradient(90deg, #1a1a2e 25%, #1e293b 50%, #1a1a2e 75%)',
-                    backgroundSize: '200% 100%',
-                    animation: 'shimmer 1.5s infinite',
-                  }}
-                />
+              <div key={i} className={`flex ${i % 2 === 0 ? 'justify-end' : 'justify-start'}`}>
+                <div className="h-10 rounded-2xl animate-shimmer bg-gradient-to-r from-surface-card via-surface-active to-surface-card bg-[length:200%_100%]"
+                  style={{ width: `${w}%` }} />
               </div>
             ))}
           </div>
         )}
 
+        {/* #26 — Empty state with quick-start chips */}
         {!historyLoading && isEmpty && (
-          <div style={{ textAlign: 'center', color: '#475569', marginTop: 60 }}>
-            <div style={{ fontSize: 48 }}>🧠</div>
-            <p style={{ marginTop: 12, color: '#64748b' }}>How can I help you?</p>
+          <div className="flex flex-col items-center justify-center flex-1 gap-6 py-16">
+            <div className="text-center">
+              <div className="text-5xl mb-3">🧠</div>
+              <p className="text-text-faint text-sm">How can I help you today?</p>
+            </div>
+            <div className="flex flex-wrap justify-center gap-2 max-w-lg">
+              {QUICK_PROMPTS.map((prompt) => (
+                <button key={prompt} onClick={() => handleSend(prompt)}
+                  className="bg-surface-card border border-border-strong rounded-xl px-3 py-2 text-xs text-text-secondary hover:text-text-primary hover:border-accent-blue transition-all animate-fade-in">
+                  {prompt}
+                </button>
+              ))}
+            </div>
           </div>
         )}
 
-        {!historyLoading && messages.map((msg, i) => (
-          <MessageBubble
-            key={`${msg.role}-${i}-${msg.content.slice(0, 20)}`}
-            message={msg}
-            messageIdx={i}
-            sessionId={sessionId}
-            onRetry={msg.role === 'assistant' ? async () => {
-              // Find the preceding user message and resend it
-              const userMsg = messages.slice(0, i).reverse().find(m => m.role === 'user');
-              if (!userMsg || loading) return;
-              const response = await send(userMsg.content);
-              setMessages((prev) => [...prev, response]);
-            } : undefined}
-          />
+        {/* Messages */}
+        {!historyLoading && filteredMessages.map((msg, i) => (
+          <div key={`${msg.role}-${i}-${msg.content.slice(0, 20)}`}
+            ref={el => { msgRefs.current[i] = el; }}
+            className={focusedMsgIdx === i ? 'ring-1 ring-accent-blue/40 rounded-2xl' : ''}>
+            <MessageBubble
+              message={msg}
+              messageIdx={i}
+              sessionId={sessionId}
+              searchQuery={chatSearch}
+              syntaxDark={syntaxDark}
+              onRetry={msg.role === 'assistant' ? async () => {
+                const userMsg = messages.slice(0, i).reverse().find(m => m.role === 'user');
+                if (!userMsg || loading) return;
+                const response = await send(userMsg.content);
+                setMessages((prev) => [...prev, { ...response, ts: new Date().toISOString() }]);
+              } : undefined}
+            />
+          </div>
         ))}
 
+        {/* Thinking / streaming */}
         {loading && !streamingContent && <ThinkingIndicator />}
         {loading && streamingContent && (
-          <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
-            <div style={{ maxWidth: '75%', background: '#1e1e2e', borderRadius: 14, borderBottomLeftRadius: 4, padding: '10px 14px', fontSize: 13, color: '#e2e8f0', lineHeight: 1.6 }}>
-              <div style={{ fontFamily: 'inherit', whiteSpace: 'pre-wrap' }}>{streamingContent}<span style={{ display: 'inline-block', width: 8, height: 14, background: '#475569', borderRadius: 2, marginLeft: 2, animation: 'dotBounce 1s ease-in-out infinite', verticalAlign: 'middle' }} /></div>
+          <div className="flex justify-start">
+            <div className="max-w-[75%] bg-surface-card rounded-2xl rounded-bl-sm px-3.5 py-2.5 text-sm text-text-primary leading-relaxed">
+              <span className="whitespace-pre-wrap font-[inherit]">{streamingContent}</span>
+              <StreamingCursor />
+              <div className="text-[10px] text-text-ghost mt-1">
+                ~{estimateTokens(streamingContent)} tokens
+              </div>
             </div>
           </div>
         )}
         <div ref={bottomRef} />
       </div>
+
+      {/* FE7 — Clipboard offer banner */}
+      {clipboardOffer && (
+        <div className="px-4 py-2 border-t border-border-dim bg-surface-panel flex items-center gap-3 text-xs flex-shrink-0">
+          <span className="text-text-faint flex-1 truncate">
+            Clipboard: <span className="text-text-secondary">{clipboardOffer.slice(0, 80)}{clipboardOffer.length > 80 ? '…' : ''}</span>
+          </span>
+          <button
+            onClick={() => { setInput(prev => prev ? `${prev}\n\n${clipboardOffer}` : clipboardOffer); setClipboardOffer(null); }}
+            className="border border-accent-blue text-accent-blue-light rounded px-2 py-0.5 hover:bg-blue-900/30 transition-colors"
+          >
+            Inject
+          </button>
+          <button
+            onClick={() => setClipboardOffer(null)}
+            className="text-text-ghost hover:text-text-faint transition-colors px-1"
+            title="Dismiss"
+          >
+            ×
+          </button>
+        </div>
+      )}
 
       <ChatInput
         value={input}
@@ -195,7 +405,8 @@ export function ChatView({ sessionId, messages, setMessages, historyLoading, onC
         sessionId={sessionId}
         onChange={setInput}
         onKeyDown={handleKeyDown}
-        onSend={handleSend}
+        onFocus={handleTextareaFocus}
+        onSend={() => handleSend()}
         onFileUploaded={handleFileUploaded}
         onTranscript={handleTranscript}
         onSelectPrompt={handleSelectPrompt}
@@ -204,95 +415,23 @@ export function ChatView({ sessionId, messages, setMessages, historyLoading, onC
   );
 }
 
-import type { Components } from 'react-markdown';
-
-// #21 — markdown renderer styles
-const mdComponents: Components = {
-  code({ className, children, ...props }) {
-    const isBlock = String(children).includes('\n');
-    if (!isBlock) {
-      return (
-        <code
-          style={{
-            background: '#0d0d1a',
-            border: '1px solid #334155',
-            borderRadius: 4,
-            padding: '1px 5px',
-            fontSize: '0.9em',
-            fontFamily: 'monospace',
-          }}
-          {...props}
-        >
-          {children}
-        </code>
-      );
-    }
-    return (
-      <pre
-        style={{
-          background: '#0d0d1a',
-          border: '1px solid #334155',
-          borderRadius: 8,
-          padding: '12px 14px',
-          overflowX: 'auto',
-          margin: '8px 0',
-          fontSize: 12,
-          fontFamily: 'monospace',
-          lineHeight: 1.5,
-        }}
-      >
-        <code className={className} {...props}>
-          {children}
-        </code>
-      </pre>
-    );
-  },
-  p({ children }) {
-    return <p style={{ margin: '6px 0', lineHeight: 1.6 }}>{children}</p>;
-  },
-  ul({ children }) {
-    return <ul style={{ margin: '6px 0', paddingLeft: 20 }}>{children}</ul>;
-  },
-  ol({ children }) {
-    return <ol style={{ margin: '6px 0', paddingLeft: 20 }}>{children}</ol>;
-  },
-  li({ children }) {
-    return <li style={{ marginBottom: 4 }}>{children}</li>;
-  },
-  blockquote({ children }) {
-    return (
-      <blockquote
-        style={{
-          borderLeft: '3px solid #334155',
-          margin: '8px 0',
-          paddingLeft: 12,
-          color: '#94a3b8',
-        }}
-      >
-        {children}
-      </blockquote>
-    );
-  },
-  h1({ children }) { return <h1 style={{ fontSize: 18, margin: '12px 0 6px', color: '#e2e8f0' }}>{children}</h1>; },
-  h2({ children }) { return <h2 style={{ fontSize: 16, margin: '10px 0 4px', color: '#e2e8f0' }}>{children}</h2>; },
-  h3({ children }) { return <h3 style={{ fontSize: 14, margin: '8px 0 4px', color: '#e2e8f0' }}>{children}</h3>; },
-};
+// ── MessageBubble ─────────────────────────────────────────────────────────────
 
 interface MessageBubbleProps {
   message: ChatMessage;
   messageIdx: number;
   sessionId: string | null;
+  searchQuery?: string;
+  syntaxDark?: boolean;
   onRetry?: () => void;
 }
 
-function MessageBubble({ message: msg, messageIdx, sessionId, onRetry }: MessageBubbleProps) {
-  const agentCfg = (name?: string) => (name ? (AGENT_CFG[name] ?? DEFAULT_AGENT_CFG) : DEFAULT_AGENT_CFG);
-  const isUser = msg.role === 'user';
-  const isError = msg.role === 'error';
+function MessageBubble({ message: msg, messageIdx, sessionId, searchQuery, syntaxDark = true, onRetry }: MessageBubbleProps) {
+  const mdComps = useMemo(() => makeMdComponents(syntaxDark), [syntaxDark]);
+  const agentCfg = (name?: string) => name ? (AGENT_CFG[name] ?? DEFAULT_AGENT_CFG) : DEFAULT_AGENT_CFG;
+  const isUser   = msg.role === 'user';
+  const isError  = msg.role === 'error';
   const [rating, setRating] = useState<1 | -1 | null>(null);
-
-  const bubbleBg = isUser ? '#1d4ed8' : isError ? '#450a0a' : '#1e1e2e';
-  const bubbleColor = isError ? '#fca5a5' : '#e2e8f0';
 
   const handleFeedback = useCallback(async (r: 1 | -1) => {
     if (!sessionId) return;
@@ -308,60 +447,67 @@ function MessageBubble({ message: msg, messageIdx, sessionId, onRetry }: Message
   }, [sessionId, messageIdx, rating]);
 
   return (
-    <div style={{ display: 'flex', justifyContent: isUser ? 'flex-end' : 'flex-start' }}>
-      <div style={{ maxWidth: '75%' }}>
-        {msg.role === 'assistant' && msg.model && (
-          <div
-            style={{
-              display: 'flex',
-              gap: 8,
-              marginBottom: 4,
-              fontSize: 11,
-              color: '#475569',
-              alignItems: 'center',
-            }}
-          >
-            <span style={{ color: MODEL_COLORS[msg.model] ?? '#94a3b8' }}>◆ {msg.model}</span>
-            <span>
-              {agentCfg(msg.agent).icon} {msg.agent}
-            </span>
+    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} animate-fade-in`}>
+      <div className="max-w-[75%]">
+        {/* #29 — agent/model badge row as pills */}
+        {msg.role === 'assistant' && (msg.model || msg.agent) && (
+          <div className="flex items-center gap-1.5 mb-1 flex-wrap">
+            {msg.model && (
+              <span className="inline-flex items-center gap-1 text-[11px] border border-border-strong rounded-full px-2 py-0.5"
+                style={{ color: MODEL_COLORS[msg.model] ?? '#94a3b8', borderColor: `${MODEL_COLORS[msg.model] ?? '#334155'}40` }}>
+                ◆ {msg.model}
+              </span>
+            )}
+            {msg.agent && (
+              <span className="inline-flex items-center gap-1 text-[11px] border border-border-dim rounded-full px-2 py-0.5 text-text-faint">
+                {agentCfg(msg.agent).icon} {msg.agent}
+              </span>
+            )}
             {msg.tools && msg.tools.length > 0 && (
-              <span style={{ color: '#ca8a04' }}>🔧 {msg.tools.join(', ')}</span>
+              <span className="inline-flex items-center gap-1 text-[11px] border border-yellow-900 rounded-full px-2 py-0.5 text-accent-yellow">
+                🔧 {msg.tools.join(', ')}
+              </span>
             )}
           </div>
         )}
-        <div
-          style={{
-            borderRadius: 14,
-            padding: '10px 14px',
-            fontSize: 13,
-            lineHeight: 1.6,
-            background: bubbleBg,
-            color: bubbleColor,
-            borderBottomRightRadius: isUser ? 4 : 14,
-            borderBottomLeftRadius: isUser ? 14 : 4,
-          }}
-        >
+
+        <div className={`rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed
+          ${isUser  ? 'bg-accent-blue text-white rounded-br-sm'
+          : isError ? 'bg-red-950 text-red-300 rounded-bl-sm border border-red-900'
+          :           'bg-surface-card text-text-primary rounded-bl-sm'}`}>
           {isUser || isError ? (
-            <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'inherit' }}>
-              {msg.content}
-            </pre>
+            <pre className="m-0 whitespace-pre-wrap font-[inherit]">{msg.content}</pre>
           ) : (
-            <div style={{ fontFamily: 'inherit' }}>
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+            <div className="font-[inherit]">
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComps}>
                 {msg.content}
               </ReactMarkdown>
             </div>
           )}
         </div>
-        {/* Feedback + Retry + TTS controls for assistant messages */}
+
+        {/* #23 — timestamp */}
+        {msg.ts && (
+          <div className={`text-[10px] text-text-ghost mt-0.5 ${isUser ? 'text-right' : 'text-left'}`}>
+            {formatTs(msg.ts)}
+          </div>
+        )}
+
+        {/* Actions for assistant messages */}
         {msg.role === 'assistant' && (
-          <div style={{ display: 'flex', gap: 6, marginTop: 4, alignItems: 'center' }}>
-            <button onClick={() => handleFeedback(1)} title="Helpful" style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 14, opacity: rating === 1 ? 1 : 0.35, padding: '2px 4px', transition: 'opacity 0.15s' }}>👍</button>
-            <button onClick={() => handleFeedback(-1)} title="Not helpful" style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 14, opacity: rating === -1 ? 1 : 0.35, padding: '2px 4px', transition: 'opacity 0.15s' }}>👎</button>
+          <div className="flex items-center gap-1.5 mt-1">
+            <button onClick={() => handleFeedback(1)} title="Helpful"
+              className={`text-sm p-0.5 transition-opacity border-none bg-transparent cursor-pointer ${rating === 1 ? 'opacity-100' : 'opacity-30 hover:opacity-70'}`}>👍</button>
+            <button onClick={() => handleFeedback(-1)} title="Not helpful"
+              className={`text-sm p-0.5 transition-opacity border-none bg-transparent cursor-pointer ${rating === -1 ? 'opacity-100' : 'opacity-30 hover:opacity-70'}`}>👎</button>
+            {/* F24 — copy full message text */}
+            <CopyButton text={msg.content} />
             <TtsButton text={msg.content} />
             {onRetry && (
-              <button onClick={onRetry} title="Retry" style={{ background: 'none', border: '1px solid #334155', borderRadius: 4, color: '#64748b', cursor: 'pointer', fontSize: 10, padding: '2px 6px', marginLeft: 4 }}>↺ retry</button>
+              <button onClick={onRetry}
+                className="border border-border-strong rounded px-1.5 py-0.5 text-[10px] text-text-muted hover:text-text-secondary transition-colors ml-1">
+                ↺ retry
+              </button>
             )}
           </div>
         )}
@@ -370,59 +516,36 @@ function MessageBubble({ message: msg, messageIdx, sessionId, onRetry }: Message
   );
 }
 
-// ─── TTS Button ───────────────────────────────────────────────────────────────
+// ── TTS Button ────────────────────────────────────────────────────────────────
 function TtsButton({ text }: { text: string }) {
   const [speaking, setSpeaking] = useState(false);
-
   const toggle = useCallback(() => {
     if (!window.speechSynthesis) return;
-    if (speaking) {
-      window.speechSynthesis.cancel();
-      setSpeaking(false);
-      return;
-    }
-    // Strip markdown/XML for cleaner speech
+    if (speaking) { window.speechSynthesis.cancel(); setSpeaking(false); return; }
     const clean = text.replace(/[#*`_\[\]<>]/g, '').slice(0, 3000);
-    const utt = new SpeechSynthesisUtterance(clean);
-    utt.onend = () => setSpeaking(false);
-    utt.onerror = () => setSpeaking(false);
+    const utt   = new SpeechSynthesisUtterance(clean);
+    utt.onend = utt.onerror = () => setSpeaking(false);
     window.speechSynthesis.speak(utt);
     setSpeaking(true);
   }, [text, speaking]);
-
   if (typeof window === 'undefined' || !('speechSynthesis' in window)) return null;
-
   return (
-    <button onClick={toggle} title={speaking ? 'Stop reading' : 'Read aloud'} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 13, opacity: 0.5, padding: '2px 4px', transition: 'opacity 0.15s' }}>
+    <button onClick={toggle} title={speaking ? 'Stop reading' : 'Read aloud'}
+      className={`text-sm p-0.5 border-none bg-transparent cursor-pointer transition-opacity ${speaking ? 'opacity-80' : 'opacity-30 hover:opacity-60'}`}>
       {speaking ? '⏹' : '🔊'}
     </button>
   );
 }
 
-
+// ── ThinkingIndicator ─────────────────────────────────────────────────────────
 function ThinkingIndicator() {
   return (
-    <div style={{ display: 'flex' }}>
-      <div
-        style={{
-          background: '#1e1e2e',
-          borderRadius: 14,
-          borderBottomLeftRadius: 4,
-          padding: '10px 14px',
-        }}
-      >
-        <div style={{ display: 'flex', gap: 4 }}>
-          {THINKING_DOTS.map((i) => (
-            <div
-              key={i}
-              style={{
-                width: 7,
-                height: 7,
-                borderRadius: '50%',
-                background: '#475569',
-                animation: `dotBounce 1.2s ease-in-out ${i * 0.15}s infinite`,
-              }}
-            />
+    <div className="flex">
+      <div className="bg-surface-card rounded-2xl rounded-bl-sm px-3.5 py-2.5">
+        <div className="flex gap-1">
+          {[0, 1, 2].map((i) => (
+            <div key={i} className="w-[7px] h-[7px] rounded-full bg-text-faint animate-dot-bounce"
+              style={{ animationDelay: `${i * 0.15}s` }} />
           ))}
         </div>
       </div>
@@ -430,31 +553,24 @@ function ThinkingIndicator() {
   );
 }
 
+// ── ChatInput ─────────────────────────────────────────────────────────────────
 interface ChatInputProps {
-  value: string;
-  loading: boolean;
-  sessionId: string | null;
-  onChange: (value: string) => void;
-  onKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => void;
-  onSend: () => void;
-  onFileUploaded: (reference: string, filename: string) => void;
-  onTranscript: (text: string) => void;
-  onSelectPrompt: (content: string) => void;
+  value: string; loading: boolean; sessionId: string | null;
+  onChange: (v: string) => void; onKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => void;
+  onFocus?: () => void;
+  onSend: () => void; onFileUploaded: (ref: string, name: string) => void;
+  onTranscript: (t: string) => void; onSelectPrompt: (c: string) => void;
 }
 
-function ChatInput({
-  value,
-  loading,
-  sessionId,
-  onChange,
-  onKeyDown,
-  onSend,
-  onFileUploaded,
-  onTranscript,
-  onSelectPrompt,
-}: ChatInputProps) {
-  const isDisabled = loading || !value.trim();
+const _CHAR_WARN = 2000;
+const _CHAR_MAX  = 4000;
+
+function ChatInput({ value, loading, sessionId, onChange, onKeyDown, onFocus, onSend, onFileUploaded, onTranscript, onSelectPrompt }: ChatInputProps) {
+  const isDisabled  = loading || !value.trim();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const charCount   = value.length;
+  const tokenEst    = estimateTokens(value);
+  const counterColor = charCount >= _CHAR_MAX ? 'text-red-400' : charCount >= _CHAR_WARN ? 'text-accent-yellow' : 'text-text-ghost';
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -464,10 +580,15 @@ function ChatInput({
   }, [value]);
 
   return (
-    <div style={{ padding: '12px 16px', background: '#0a0a1a', borderTop: '1px solid #1e1e2e' }}>
-      <div style={{ display: 'flex', gap: 8, maxWidth: 800, margin: '0 auto', alignItems: 'flex-end' }}>
-        {/* Left controls */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 2, paddingBottom: 2 }}>
+    <div className="px-4 py-3 bg-surface-base border-t border-border-dim flex-shrink-0">
+      {/* Character / token counter */}
+      {value.length > 0 && (
+        <div className={`text-right text-[10px] mb-1 max-w-[800px] mx-auto ${counterColor}`}>
+          {charCount} chars · ~{tokenEst} tokens · Ctrl+Enter to send
+        </div>
+      )}
+      <div className="flex gap-2 max-w-[800px] mx-auto items-end">
+        <div className="flex items-center gap-0.5 pb-0.5">
           <FileUpload sessionId={sessionId} onUploaded={onFileUploaded} />
         </div>
 
@@ -476,48 +597,22 @@ function ChatInput({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="Ask a question... (Enter to send, Shift+Enter for new line)"
+          onFocus={onFocus}
+          placeholder="Ask a question… (Enter to send, Ctrl+Enter, Shift+Enter for new line)"
           rows={1}
-          style={{
-            flex: 1,
-            background: '#1e1e2e',
-            color: '#e2e8f0',
-            border: '1px solid #334155',
-            borderRadius: 12,
-            padding: '10px 14px',
-            fontSize: 13,
-            resize: 'none',
-            outline: 'none',
-            fontFamily: 'inherit',
-            lineHeight: 1.6,
-            overflowY: 'auto',
-            minHeight: 42,
-            maxHeight: 300,
-          }}
+          className="flex-1 bg-surface-input text-text-primary border border-border-strong rounded-xl px-3.5 py-2.5 text-sm resize-none outline-none font-[inherit] leading-relaxed overflow-y-auto min-h-[42px] max-h-[300px] focus:border-accent-blue transition-colors"
         />
 
-        {/* Right controls */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 2, paddingBottom: 2 }}>
-          <PromptLibrary
-            sessionId={sessionId}
-            onSelectPrompt={onSelectPrompt}
-            currentInput={value}
-          />
+        <div className="flex items-center gap-0.5 pb-0.5">
+          <PromptLibrary sessionId={sessionId} onSelectPrompt={onSelectPrompt} currentInput={value} />
           <VoiceInput onTranscript={onTranscript} disabled={loading} />
           <button
             onClick={onSend}
             disabled={isDisabled}
             aria-label="Send message"
-            style={{
-              background: isDisabled ? '#1e293b' : '#2563eb',
-              color: '#e2e8f0',
-              border: 'none',
-              borderRadius: 12,
-              padding: '10px 18px',
-              cursor: isDisabled ? 'not-allowed' : 'pointer',
-              fontSize: 16,
-              transition: 'background 0.2s',
-            }}
+            className={`rounded-xl px-4 py-2.5 text-base text-text-primary transition-colors ${
+              isDisabled ? 'bg-surface-active cursor-not-allowed' : 'bg-accent-blue hover:bg-blue-500 cursor-pointer'
+            }`}
           >
             ↑
           </button>

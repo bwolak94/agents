@@ -1,3 +1,7 @@
+/**
+ * Game-specific CSS injected only when the WorldView / AgentSprite are mounted.
+ * Base animations (shimmer, dotBounce, etc.) live in globals.css.
+ */
 export const GAME_CSS = `
   @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
 

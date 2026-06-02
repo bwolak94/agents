@@ -1,0 +1,74 @@
+@import "tailwindcss";
+@config "../../tailwind.config.js";
+
+/* ── Base resets ── */
+*, *::before, *::after { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; padding: 0; }
+body {
+  background: #0a0a1a;
+  color: #e2e8f0;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #334155; }
+
+/* ── Game / agent animations (kept for WorldView/AgentSprite) ── */
+@keyframes agentWalk   { 0%,100%{transform:translateY(0)scale(1)}50%{transform:translateY(-5px)scale(1.05)} }
+@keyframes agentThink  { 0%,100%{filter:brightness(1);transform:scale(1)}50%{filter:brightness(1.6);transform:scale(1.15)} }
+@keyframes agentDone   { 0%{transform:scale(1)rotate(0)}20%{transform:scale(1.4)rotate(-15deg)}60%{transform:scale(1.2)rotate(-8deg)}100%{transform:scale(1)rotate(0)} }
+@keyframes agentSpawn  { 0%{transform:scale(0)rotate(360deg);opacity:0}70%{transform:scale(1.3)rotate(-10deg);opacity:1}100%{transform:scale(1)rotate(0);opacity:1} }
+@keyframes agentFade   { 0%{opacity:1}100%{transform:scale(0)translateY(-20px);opacity:0} }
+@keyframes bubblePop   { 0%{transform:scale(0.5)translateY(4px);opacity:0}60%{transform:scale(1.05)translateY(0);opacity:1}100%{transform:scale(1)translateY(0);opacity:1} }
+@keyframes routingPulse{ 0%,100%{opacity:.6}50%{opacity:1} }
+@keyframes counterPop  { 0%,100%{transform:scale(1)}50%{transform:scale(1.4)} }
+@keyframes pulseBar    { 0%,100%{opacity:.5}50%{opacity:1} }
+
+.walk  { animation: agentWalk  0.5s ease-in-out infinite; }
+.think { animation: agentThink 0.8s ease-in-out infinite; }
+.done  { animation: agentDone  0.6s ease-in-out; }
+.spawn { animation: agentSpawn 0.4s cubic-bezier(.36,.07,.19,.97) forwards; }
+.fade  { animation: agentFade  0.5s ease-in forwards; }
+.bubble-pop    { animation: bubblePop    0.3s cubic-bezier(.36,.07,.19,.97) forwards; }
+.routing-pulse { animation: routingPulse 1s ease-in-out infinite; }
+.counter-pop   { animation: counterPop   0.3s ease-out; }
+.progress-pulse{ animation: pulseBar     1.5s ease-in-out infinite; }
+.progress-shimmer {
+  background: linear-gradient(90deg, transparent 25%, currentColor 50%, transparent 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+.zone-cell {
+  position: relative; overflow: hidden;
+  transition: border-color 0.3s ease;
+}
+.zone-cell::after {
+  content: '';
+  position: absolute; inset: 0;
+  background: repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.08) 3px,rgba(0,0,0,.08) 4px);
+  pointer-events: none;
+}
+.crt-overlay {
+  position: absolute; inset: 0;
+  background: repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.03) 2px,rgba(0,0,0,.03) 4px);
+  pointer-events: none; z-index: 10;
+}
+
+/* ── Resizable panels ── */
+.resize-handle {
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  flex-shrink: 0;
+  transition: background 0.15s;
+}
+.resize-handle:hover, .resize-handle.dragging {
+  background: #2563eb;
+}
+
+/* ── Drawer ── */
+.drawer-enter { animation: slideUp 0.25s ease-out; }

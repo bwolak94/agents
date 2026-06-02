@@ -8,6 +8,7 @@ Tools for agents:
 - AgentCall (delegate to a specialist agent)
 """
 import asyncio
+import hashlib
 import json
 import shlex
 import subprocess
@@ -15,9 +16,44 @@ import tempfile
 import os
 import sys
 import re
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 import httpx
+
+# ── Tool result cache ─────────────────────────────────────────────────────────
+_TOOL_CACHE_TTL   = int(os.getenv("TOOL_CACHE_TTL", "300"))   # 5 minutes
+_TOOL_CACHE_MAX   = int(os.getenv("TOOL_CACHE_MAX", "500"))
+# Cacheable tool names (read-only / idempotent operations only)
+_CACHEABLE_TOOLS  = {"web_search", "file_read"}
+_tool_result_cache: dict[str, tuple[str, float]] = {}  # key -> (result, expires_at)
+
+
+def _cache_key(tool_name: str, args: str) -> str:
+    raw = f"{tool_name}:{args}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _cache_get(tool_name: str, args: str) -> str | None:
+    if tool_name not in _CACHEABLE_TOOLS:
+        return None
+    key = _cache_key(tool_name, args)
+    entry = _tool_result_cache.get(key)
+    if entry and time.time() < entry[1]:
+        return entry[0]
+    _tool_result_cache.pop(key, None)
+    return None
+
+
+def _cache_put(tool_name: str, args: str, result: str) -> None:
+    if tool_name not in _CACHEABLE_TOOLS:
+        return
+    # Evict oldest entries if at capacity
+    if len(_tool_result_cache) >= _TOOL_CACHE_MAX:
+        oldest = min(_tool_result_cache, key=lambda k: _tool_result_cache[k][1])
+        _tool_result_cache.pop(oldest, None)
+    key = _cache_key(tool_name, args)
+    _tool_result_cache[key] = (result, time.time() + _TOOL_CACHE_TTL)
 
 if TYPE_CHECKING:
     pass
@@ -399,6 +435,21 @@ class ToolsManager:
 
     def get(self, name: str):
         return self._tools.get(name)
+
+    async def run_cached(self, name: str, args: str) -> str | None:
+        """Run a tool with cross-request result caching for idempotent tools.
+
+        Returns cached result string if available; None if cache miss (caller should invoke tool).
+        """
+        cached = _cache_get(name, args)
+        if cached is not None:
+            return cached
+        tool = self._tools.get(name)
+        if tool is None:
+            return None
+        result = await tool.run(args)
+        _cache_put(name, args, str(result))
+        return str(result)
 
     def register(self, name: str, tool) -> None:
         self._tools[name] = tool

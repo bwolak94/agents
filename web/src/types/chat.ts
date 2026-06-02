@@ -5,6 +5,7 @@ export interface ChatMessage {
   agent?: string;
   tools?: string[];
   reasoning?: string;
+  ts?: string;          // ISO timestamp (#23)
 }
 
 export interface Stats {

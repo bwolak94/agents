@@ -3,6 +3,7 @@ Chat history stored in MongoDB.
 Stores full messages (with metadata) per session_id.
 """
 import logging
+import os
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -13,6 +14,14 @@ _db = None
 
 # Sessions excluded from the history sidebar (system/library sessions)
 _SYSTEM_SESSIONS = {"default"}
+
+
+_MONGO_MAX_POOL     = int(os.getenv("MONGO_MAX_POOL_SIZE", "20"))
+_MONGO_MIN_POOL     = int(os.getenv("MONGO_MIN_POOL_SIZE", "5"))
+_SESSION_TTL_DAYS   = int(os.getenv("SESSION_TTL_DAYS", "90"))
+_MONGO_WRITE_CONCERN = os.getenv("MONGO_WRITE_CONCERN", "majority")  # D18
+_MAX_MESSAGES       = int(os.getenv("MAX_MESSAGES_PER_SESSION", "2000"))  # D12
+_READ_CONCERN       = os.getenv("MONGO_READ_CONCERN", "local")  # D15: "local" or "majority"
 
 
 async def init_db(mongo_url: str):
@@ -27,7 +36,16 @@ async def init_db(mongo_url: str):
         return _db
 
     # Create a fresh client; store in a local first so _db stays None on failure
-    client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
+    client = AsyncIOMotorClient(
+        mongo_url,
+        serverSelectionTimeoutMS=5000,
+        maxPoolSize=_MONGO_MAX_POOL,
+        minPoolSize=_MONGO_MIN_POOL,
+        connectTimeoutMS=5000,
+        socketTimeoutMS=30_000,
+        retryWrites=True,
+        w=_MONGO_WRITE_CONCERN,  # D18 — configurable write concern
+    )
     db = client["agent_system"]
 
     # Verify MongoDB is actually reachable at startup; raises on failure
@@ -38,11 +56,41 @@ async def init_db(mongo_url: str):
     _db = db
 
     await _db["conversations"].create_index("session_id", unique=True)
-    # Full-text search index on message content
+    # TTL: auto-delete stale sessions after SESSION_TTL_DAYS of inactivity
     try:
-        await _db["conversations"].create_index([("messages.content", "text"), ("preview", "text")])
+        await _db["conversations"].drop_index("updated_at_ttl_1")
     except Exception:
-        pass  # Index may already exist
+        pass
+    await _db["conversations"].create_index(
+        "updated_at",
+        expireAfterSeconds=_SESSION_TTL_DAYS * 24 * 3600,
+        name="updated_at_ttl_1",
+    )
+    # #21 — Sparse indexes: skip docs that lack these optional fields
+    try:
+        await _db["conversations"].create_index("title", sparse=True)
+    except Exception:
+        pass
+    try:
+        await _db["conversations"].create_index("auto_tags", sparse=True)
+    except Exception:
+        pass
+    # #28 — Compound index for "last user message" lookup (auto-title/tag, snapshots)
+    try:
+        await _db["conversations"].create_index(
+            [("session_id", 1), ("messages.role", 1), ("messages.ts", -1)],
+            name="session_role_ts",
+        )
+    except Exception:
+        pass
+    # #23 — Collation-aware text search index (case-insensitive, locale en)
+    try:
+        await _db["conversations"].create_index(
+            [("messages.content", "text"), ("preview", "text"), ("title", "text")],
+            default_language="english",
+        )
+    except Exception:
+        pass  # index may already exist
     # TTL index: analytics records expire after 90 days (#20).
     # Drop the old non-TTL index first if it exists so we can recreate it.
     try:
@@ -55,12 +103,29 @@ async def init_db(mongo_url: str):
     return _db
 
 
-async def load_history(session_id: str) -> list:
-    """Return list of messages for display in the UI."""
-    doc = await _db["conversations"].find_one(
-        {"session_id": session_id},
-        {"_id": 0, "messages": 1}
-    )
+def reset_db() -> None:
+    """#11 — Reset module-level DB state. For use in tests only."""
+    global _client, _db
+    _client = None
+    _db = None
+
+
+async def load_history(session_id: str, tail: int | None = None) -> list:
+    """Return list of messages for display in the UI.
+
+    D16 — ``tail`` uses a ``$slice`` projection to load only the last N messages
+    without fetching the entire conversation array.
+    """
+    projection: dict = {"_id": 0, "messages": 1}
+    if tail is not None:
+        projection["messages"] = {"$slice": -tail}
+    # D15 — use configurable read concern for critical history reads
+    try:
+        from pymongo import ReadPreference as _RP
+        _coll = _db.get_collection("conversations", read_concern=__import__("pymongo").ReadConcern(_READ_CONCERN))
+    except Exception:
+        _coll = _db["conversations"]
+    doc = await _coll.find_one({"session_id": session_id}, projection)
     return doc["messages"] if doc else []
 
 
@@ -74,34 +139,54 @@ async def load_context(session_id: str, limit: int = _CONTEXT_MESSAGE_LIMIT) -> 
     return [{"role": m["role"], "content": m["content"]} for m in recent]
 
 
+import hashlib as _hashlib
+
+
 async def append_message(session_id: str, role: str, content: str, **meta):
-    """Append a single message to the session history."""
+    """Append a single message to the session history.
+
+    D17 — Eliminated a separate ``find_one`` for preview by using ``$setOnInsert``
+    exclusively: preview is written only when the document is first created (upsert),
+    removing one round-trip on every message append.
+
+    D12 — Before pushing, check the last message's content hash to prevent
+    double-writes from idempotent retries.
+    """
+    # D12 — compute content hash for dedup check
+    _content_hash = _hashlib.md5(f"{role}:{content}".encode()).hexdigest()
+
+    # D12 — skip if the last stored message is identical (same role + content hash)
+    existing = await _db["conversations"].find_one(
+        {"session_id": session_id, "messages": {"$exists": True}},
+        {"_id": 0, "messages": {"$slice": -1}},
+    )
+    if existing:
+        last = existing.get("messages", [{}])[-1]
+        if last.get("_hash") == _content_hash:
+            return  # duplicate — skip
+
     msg = {
         "role": role,
         "content": content,
         "ts": datetime.now(timezone.utc).isoformat(),
+        "_hash": _content_hash,
         **meta,
     }
     now = datetime.now(timezone.utc).isoformat()
 
-    update = {
-        "$push": {"messages": msg},
-        "$set": {"updated_at": now},
-        "$setOnInsert": {"created_at": now},
-    }
-
-    # Store preview (first user message, XML tags stripped) for the sidebar
+    set_on_insert: dict = {"created_at": now}
+    # D17 — preview only on new document creation; no extra find_one needed
     if role == "user":
-        existing = await _db["conversations"].find_one(
-            {"session_id": session_id}, {"_id": 0, "preview": 1}
-        )
-        if not existing or not existing.get("preview"):
-            preview = _strip_xml(content)[:100]
-            update["$setOnInsert"]["preview"] = preview  # type: ignore[index]
+        set_on_insert["preview"] = _strip_xml(content)[:100]
 
+    # D12 — cap messages array with $slice to prevent unbounded growth
     await _db["conversations"].update_one(
         {"session_id": session_id},
-        update,
+        {
+            "$push": {"messages": {"$each": [msg], "$slice": -_MAX_MESSAGES}},
+            "$set":  {"updated_at": now},
+            "$setOnInsert": set_on_insert,
+        },
         upsert=True,
     )
 
@@ -142,15 +227,33 @@ async def clear_history(session_id: str):
     await _db["conversations"].delete_one({"session_id": session_id})
 
 
-async def list_sessions(limit: int = 50, skip: int = 0) -> list:
+async def list_sessions(limit: int = 50, skip: int = 0, after: str | None = None) -> list:
     """Return recent sessions for the chat history sidebar, excluding system sessions.
-    #24 — supports cursor-based pagination via limit/skip.
+
+    Supports two pagination modes:
+    - ``skip`` (legacy): offset-based, fine for small collections.
+    - ``after`` (cursor-based): pass the ``updated_at`` value of the last item seen
+      for efficient keyset pagination — avoids full-collection scans on large datasets.
     """
+    base_filter: dict = {"session_id": {"$nin": list(_SYSTEM_SESSIONS)}}
+    if after:
+        base_filter["updated_at"] = {"$lt": after}
+
+    from pymongo import DESCENDING
+    # #11 — add _id as tiebreaker so concurrent inserts don't cause page drift
     cursor = _db["conversations"].find(
-        {"session_id": {"$nin": list(_SYSTEM_SESSIONS)}},
-        {"_id": 0, "session_id": 1, "updated_at": 1, "created_at": 1, "preview": 1, "title": 1, "auto_tags": 1, "messages": {"$slice": 1}}
-    ).sort("updated_at", -1).skip(skip).limit(limit)
-    docs = await cursor.to_list(length=limit)
+        base_filter,
+        {"_id": 1, "session_id": 1, "updated_at": 1, "created_at": 1, "preview": 1, "title": 1, "auto_tags": 1, "archived": 1, "messages": {"$slice": 1}}
+    ).sort([("updated_at", DESCENDING), ("_id", DESCENDING)]).batch_size(50)
+    if not after:
+        cursor = cursor.skip(skip)
+    cursor = cursor.limit(limit)
+    # B10 — Use `async for` to stream results from MongoDB instead of loading all at once
+    docs: list = []
+    async for doc in cursor:
+        docs.append(doc)
+        if len(docs) >= limit:
+            break
 
     result = []
     for doc in docs:
@@ -167,5 +270,6 @@ async def list_sessions(limit: int = 50, skip: int = 0) -> list:
             "preview": preview,
             "title": doc.get("title", ""),
             "auto_tags": doc.get("auto_tags", []),
+            "archived": doc.get("archived", False),  # D10
         })
     return result

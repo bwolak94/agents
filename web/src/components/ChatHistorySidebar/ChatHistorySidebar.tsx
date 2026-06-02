@@ -1,5 +1,5 @@
 'use client';
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react';
 import { API_URL } from '@/constants/api';
 
 const PAGE_SIZE = 20;
@@ -17,11 +17,26 @@ interface Props {
   onSelect: (id: string) => void;
   onNew: () => void;
   refreshTrigger?: number;
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
 }
 
+// #44 — memoised tag badge so re-renders on hovered sibling don't repaint every tag
+const TagBadge = memo(function TagBadge({
+  tag, sessionId, onRemove,
+}: { tag: string; sessionId: string; onRemove: (e: React.MouseEvent, sid: string, tag: string) => void }) {
+  return (
+    <span
+      onClick={e => onRemove(e, sessionId, tag)}
+      className="text-[9px] bg-surface-active text-accent-blue-light rounded px-1 py-0.5 cursor-pointer hover:bg-surface-hover transition-colors"
+    >
+      #{tag}
+    </span>
+  );
+});
+
 function stripXml(text: string): string {
-  const clean = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-  return clean || text;
+  return text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() || text;
 }
 
 function formatDate(iso: string): string {
@@ -32,10 +47,10 @@ function formatDate(iso: string): string {
   const diffMin = Math.floor(diffMs / 60000);
   const diffH = Math.floor(diffMs / 3600000);
   const diffD = Math.floor(diffMs / 86400000);
-  if (diffMin < 1) return 'just now';
+  if (diffMin < 1)  return 'just now';
   if (diffMin < 60) return `${diffMin}m ago`;
-  if (diffH < 24) return `${diffH}h ago`;
-  if (diffD < 7) return `${diffD}d ago`;
+  if (diffH < 24)   return `${diffH}h ago`;
+  if (diffD < 7)    return `${diffD}d ago`;
   return d.toLocaleDateString();
 }
 
@@ -47,23 +62,33 @@ function savePinned(pinned: Set<string>) {
   localStorage.setItem(PINNED_KEY, JSON.stringify([...pinned]));
 }
 
-export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTrigger }: Props) {
-  const [sessions, setSessions] = useState<SessionItem[]>([]);
-  const [hoveredId, setHoveredId] = useState<string | null>(null);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [skip, setSkip] = useState(0);
-  const [hasMore, setHasMore] = useState(false);
-  const [pinned, setPinned] = useState<Set<string>>(new Set());
-  const [searchQuery, setSearchQuery] = useState('');
+export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTrigger, collapsed = false, onToggleCollapse }: Props) {
+  const [sessions, setSessions]         = useState<SessionItem[]>([]);
+  const [hoveredId, setHoveredId]       = useState<string | null>(null);
+  const [deletingId, setDeletingId]     = useState<string | null>(null);
+  const [skip, setSkip]                 = useState(0);
+  const [hasMore, setHasMore]           = useState(false);
+  const [pinned, setPinned]             = useState<Set<string>>(new Set());
+  const [searchQuery, setSearchQuery]   = useState('');
   const [searchResults, setSearchResults] = useState<{ session_id: string; preview?: string }[] | null>(null);
-  const [searching, setSearching] = useState(false);
-  const [tagFilter, setTagFilter] = useState<string | null>(null);
-  const [allTags, setAllTags] = useState<string[]>([]);
+  const [searching, setSearching]       = useState(false);
+  const [tagFilter, setTagFilter]         = useState<string | null>(null);
+  const [pendingTagFilter, setPendingTagFilter] = useState<string | null>(null);
+  const tagFilterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [allTags, setAllTags]           = useState<string[]>([]);
   const [addingTagFor, setAddingTagFor] = useState<string | null>(null);
-  const [newTag, setNewTag] = useState('');
+  const [newTag, setNewTag]             = useState('');
+  // Inline rename state
+  const [renamingId, setRenamingId]     = useState<string | null>(null);
+  const [renameValue, setRenameValue]   = useState('');
+  // Session merge state
+  const [mergingId, setMergingId]       = useState<string | null>(null);
+  const [merging, setMerging]           = useState(false);
+  const [kbIdx, setKbIdx]              = useState(-1);  // F27 — keyboard-focused session index
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Infinite scroll sentinel
+  const loadMoreRef = useRef<HTMLDivElement>(null);
 
-  // Load pinned from localStorage
   useEffect(() => { setPinned(getPinned()); }, []);
 
   const togglePin = useCallback((e: React.MouseEvent, sessionId: string) => {
@@ -86,43 +111,97 @@ export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTr
       .then((d) => {
         const incoming: SessionItem[] = d.sessions ?? d.session_ids?.map((id: string) => ({ session_id: id, updated_at: '', created_at: '', preview: id })) ?? [];
         if (reset) { setSessions(incoming); setSkip(incoming.length); }
-        else { setSessions((prev) => [...prev, ...incoming]); setSkip((s) => s + incoming.length); }
+        else       { setSessions((prev) => [...prev, ...incoming]); setSkip((s) => s + incoming.length); }
         setHasMore(incoming.length === PAGE_SIZE && !tagFilter);
       })
       .catch(() => {});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tagFilter]);
 
+  // #41 — debounce tag filter changes by 200 ms to avoid rapid refetches on click
+  useEffect(() => {
+    if (tagFilterTimerRef.current) clearTimeout(tagFilterTimerRef.current);
+    tagFilterTimerRef.current = setTimeout(() => setTagFilter(pendingTagFilter), 200);
+    return () => { if (tagFilterTimerRef.current) clearTimeout(tagFilterTimerRef.current); };
+  }, [pendingTagFilter]);
+
   useEffect(() => { fetchSessions(true); setSkip(0); }, [fetchSessions, refreshTrigger]);
 
-  // Fetch all tags for the tag filter bar
   useEffect(() => {
     fetch(`${API_URL}/tags`).then(r => r.json()).then(d => setAllTags(d.tags ?? [])).catch(() => {});
   }, [refreshTrigger]);
 
-  // Search with debounce
   useEffect(() => {
     if (!searchQuery.trim()) { setSearchResults(null); return; }
     if (searchTimer.current) clearTimeout(searchTimer.current);
     searchTimer.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const r = await fetch(`${API_URL}/search?q=${encodeURIComponent(searchQuery)}`);
-        const d = await r.json();
+        const r  = await fetch(`${API_URL}/search?q=${encodeURIComponent(searchQuery)}`);
+        const d  = await r.json();
         setSearchResults(d.results ?? []);
       } catch { setSearchResults([]); }
-      finally { setSearching(false); }
+      finally   { setSearching(false); }
     }, 400);
     return () => { if (searchTimer.current) clearTimeout(searchTimer.current); };
   }, [searchQuery]);
 
+  // Infinite scroll via IntersectionObserver
+  useEffect(() => {
+    if (!loadMoreRef.current || !hasMore || searchQuery || tagFilter) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting) fetchSessions(false);
+      },
+      { threshold: 0.1 },
+    );
+    observer.observe(loadMoreRef.current);
+    return () => observer.disconnect();
+  }, [hasMore, searchQuery, tagFilter, fetchSessions]);
+
+  // Optimistic delete with rollback on error
   const handleDelete = async (e: React.MouseEvent, sessionId: string) => {
     e.stopPropagation();
-    setDeletingId(sessionId);
-    await fetch(`${API_URL}/history/${sessionId}`, { method: 'DELETE' });
+    const snapshot = sessions;
+    // Optimistic update
     setSessions((prev) => prev.filter((s) => s.session_id !== sessionId));
     if (activeSessionId === sessionId) onNew();
-    setDeletingId(null);
+    setDeletingId(sessionId);
+    try {
+      const res = await fetch(`${API_URL}/history/${sessionId}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error('Delete failed');
+    } catch {
+      // Rollback
+      setSessions(snapshot);
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  // Inline session rename
+  const handleStartRename = (e: React.MouseEvent, sessionId: string, currentTitle: string) => {
+    e.stopPropagation();
+    setRenamingId(sessionId);
+    setRenameValue(currentTitle || '');
+  };
+
+  const handleRename = async (sessionId: string) => {
+    const title = renameValue.trim();
+    const snapshot = sessions;
+    // Optimistic update
+    setSessions(prev => prev.map(s => s.session_id === sessionId ? { ...s, preview: title || s.preview } : s));
+    setRenamingId(null);
+    if (!title) return;
+    try {
+      const res = await fetch(`${API_URL}/sessions/${sessionId}/title`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      });
+      if (!res.ok) throw new Error('Rename failed');
+    } catch {
+      setSessions(snapshot);
+    }
   };
 
   const handleAddTag = async (sessionId: string) => {
@@ -132,133 +211,206 @@ export function ChatHistorySidebar({ activeSessionId, onSelect, onNew, refreshTr
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: sessionId, tag: newTag.trim() }),
     });
-    setSessions(prev => prev.map(s => s.session_id === sessionId
-      ? { ...s, tags: [...(s.tags ?? []), newTag.trim().toLowerCase()] }
-      : s
-    ));
+    setSessions(prev => prev.map(s => s.session_id === sessionId ? { ...s, tags: [...(s.tags ?? []), newTag.trim().toLowerCase()] } : s));
     setAllTags(prev => [...new Set([...prev, newTag.trim().toLowerCase()])].sort());
     setNewTag('');
     setAddingTagFor(null);
   };
 
+  const handleMerge = async (sourceId: string) => {
+    if (!activeSessionId || sourceId === activeSessionId) return;
+    setMerging(true);
+    // F24 — optimistic remove of the merged-away session so UI updates immediately
+    const snapshot = sessions;
+    setSessions(prev => prev.filter(s => s.session_id !== sourceId));
+    try {
+      const res = await fetch(`${API_URL}/sessions/merge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source_session_id: sourceId,
+          target_session_id: activeSessionId,
+          deduplicate: true,
+        }),
+      });
+      if (!res.ok) throw new Error('Merge failed');
+    } catch {
+      setSessions(snapshot);  // F24 — rollback on error
+    }
+    setMergingId(null);
+    setMerging(false);
+  };
+
   const handleRemoveTag = async (e: React.MouseEvent, sessionId: string, tag: string) => {
     e.stopPropagation();
     await fetch(`${API_URL}/tags/${sessionId}/${encodeURIComponent(tag)}`, { method: 'DELETE' });
-    setSessions(prev => prev.map(s => s.session_id === sessionId
-      ? { ...s, tags: (s.tags ?? []).filter(t => t !== tag) }
-      : s
-    ));
+    setSessions(prev => prev.map(s => s.session_id === sessionId ? { ...s, tags: (s.tags ?? []).filter(t => t !== tag) } : s));
   };
 
-  // Sort: pinned first, then by updated_at
   const displaySessions = searchResults
     ? searchResults.map(r => ({ session_id: r.session_id, updated_at: '', created_at: '', preview: r.preview || r.session_id }))
-    : [...sessions].sort((a, b) => {
-        const ap = pinned.has(a.session_id) ? 1 : 0;
-        const bp = pinned.has(b.session_id) ? 1 : 0;
-        return bp - ap;
-      });
+    : [...sessions].sort((a, b) => (pinned.has(b.session_id) ? 1 : 0) - (pinned.has(a.session_id) ? 1 : 0));
 
-  const btnStyle = {
-    background: 'none', border: 'none', cursor: 'pointer',
-    color: '#475569', fontSize: 12, padding: '1px 3px', lineHeight: 1, borderRadius: 3,
-  } as const;
+  // #20 — collapsed view
+  if (collapsed) {
+    return (
+      <div className="w-8 flex-shrink-0 border-r border-border-dim bg-[#080812] flex flex-col items-center pt-3">
+        <button onClick={onToggleCollapse} title="Expand sidebar" aria-label="Expand sidebar"
+          className="text-text-ghost hover:text-text-faint transition-colors text-lg">›</button>
+      </div>
+    );
+  }
 
   return (
-    <div style={{ width: 220, flexShrink: 0, borderRight: '1px solid #1a1a2e', display: 'flex', flexDirection: 'column', background: '#080812', overflow: 'hidden' }}>
+    <div className="w-[220px] flex-shrink-0 border-r border-border-dim flex flex-col bg-[#080812] overflow-hidden">
       {/* Header */}
-      <div style={{ padding: '10px 10px 6px', borderBottom: '1px solid #1a1a2e', flexShrink: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-          <span style={{ fontSize: 11, fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Chats</span>
-          <button onClick={onNew} title="New chat" style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 8, color: '#94a3b8', cursor: 'pointer', fontSize: 16, lineHeight: 1, padding: '3px 8px' }}>+</button>
+      <div className="px-2.5 pt-2.5 pb-1.5 border-b border-border-dim flex-shrink-0">
+        <div className="flex items-center justify-between mb-1.5">
+          <span className="text-[11px] font-semibold text-text-faint uppercase tracking-wider">Chats</span>
+          <div className="flex items-center gap-1">
+            <button onClick={onNew} title="New chat" aria-label="New chat"
+              className="bg-surface-active border border-border-strong rounded-lg text-text-secondary text-base px-2 py-0.5 hover:text-text-primary transition-colors">
+              +
+            </button>
+            {/* #20 — collapse button */}
+            {onToggleCollapse && (
+              <button onClick={onToggleCollapse} title="Collapse sidebar" aria-label="Collapse sidebar"
+                className="text-text-ghost hover:text-text-faint transition-colors text-base leading-none px-1">
+                ‹
+              </button>
+            )}
+          </div>
         </div>
-        {/* Search bar */}
         <input
           value={searchQuery}
-          onChange={e => setSearchQuery(e.target.value)}
+          onChange={e => { setSearchQuery(e.target.value); setKbIdx(-1); }}
           placeholder="Search chats… (Ctrl+F)"
-          style={{ width: '100%', background: '#0f172a', border: '1px solid #1e293b', borderRadius: 6, color: '#e2e8f0', fontSize: 11, padding: '5px 8px', outline: 'none', boxSizing: 'border-box' }}
+          className="w-full bg-surface-hover border border-border-base rounded text-text-primary text-[11px] px-2 py-1 outline-none focus:border-border-strong transition-colors"
+          onKeyDown={e => {
+            // F27 — arrow key navigation from search into session list
+            if (e.key === 'ArrowDown') { e.preventDefault(); setKbIdx(i => Math.min(i + 1, displaySessions.length - 1)); }
+            else if (e.key === 'ArrowUp') { e.preventDefault(); setKbIdx(i => Math.max(i - 1, 0)); }
+            else if (e.key === 'Enter' && kbIdx >= 0) { onSelect(displaySessions[kbIdx].session_id); setKbIdx(-1); }
+          }}
         />
       </div>
 
       {/* Tag filter bar */}
       {allTags.length > 0 && (
-        <div style={{ padding: '4px 8px', borderBottom: '1px solid #1a1a2e', display: 'flex', gap: 4, flexWrap: 'wrap', flexShrink: 0 }}>
-          <button onClick={() => setTagFilter(null)} style={{ ...btnStyle, color: tagFilter === null ? '#60a5fa' : '#475569', fontSize: 10, border: '1px solid #1e293b', borderRadius: 4, padding: '2px 6px' }}>All</button>
+        <div className="px-2 py-1 border-b border-border-dim flex gap-1 flex-wrap flex-shrink-0">
+          <button onClick={() => setPendingTagFilter(null)}
+            className={`text-[10px] border rounded px-1.5 py-0.5 transition-colors ${tagFilter === null ? 'border-accent-blue text-accent-blue-light' : 'border-border-base text-text-faint hover:text-text-muted'}`}>
+            All
+          </button>
           {allTags.slice(0, 8).map(tag => (
-            <button key={tag} onClick={() => setTagFilter(tagFilter === tag ? null : tag)} style={{ ...btnStyle, color: tagFilter === tag ? '#60a5fa' : '#64748b', fontSize: 10, border: `1px solid ${tagFilter === tag ? '#2563eb' : '#1e293b'}`, borderRadius: 4, padding: '2px 6px' }}>#{tag}</button>
+            <button key={tag} onClick={() => setPendingTagFilter(tagFilter === tag ? null : tag)}
+              className={`text-[10px] border rounded px-1.5 py-0.5 transition-colors ${tagFilter === tag ? 'border-accent-blue text-accent-blue-light' : 'border-border-base text-text-faint hover:text-text-muted'}`}>
+              #{tag}
+            </button>
           ))}
         </div>
       )}
 
       {/* Session list */}
-      <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
-        {searching && <div style={{ padding: '12px', color: '#475569', fontSize: 11, textAlign: 'center' }}>Searching…</div>}
+      <div className="flex-1 overflow-y-auto flex flex-col">
+        {searching && <div className="px-3 py-3 text-[11px] text-text-faint text-center">Searching…</div>}
         {displaySessions.length === 0 && !searching && (
-          <div style={{ padding: '20px 12px', color: '#334155', fontSize: 12, textAlign: 'center' }}>
+          <div className="px-3 py-5 text-xs text-border-strong text-center">
             {searchQuery ? 'No results' : 'No previous chats'}
           </div>
         )}
-        {displaySessions.map((s) => {
-          const isActive = s.session_id === activeSessionId;
-          const isHovered = hoveredId === s.session_id;
-          const isPinned = pinned.has(s.session_id);
-          const fullSession = sessions.find(x => x.session_id === s.session_id);
+        {displaySessions.map((s, sIdx) => {
+          const isActive   = s.session_id === activeSessionId;
+          const isHovered  = hoveredId === s.session_id;
+          const isKbFocused = kbIdx === sIdx;  // F27
+          const isPinned   = pinned.has(s.session_id);
+          const full       = sessions.find(x => x.session_id === s.session_id);
           return (
+            // F17 — CSS content-visibility containment for native virtual scroll (no deps)
             <div
               key={s.session_id}
-              onClick={() => onSelect(s.session_id)}
-              onMouseEnter={() => setHoveredId(s.session_id)}
+              style={{ contentVisibility: 'auto', containIntrinsicSize: '0 56px' }}
+              onClick={() => { onSelect(s.session_id); setKbIdx(-1); }}
+              onMouseEnter={() => { setHoveredId(s.session_id); setKbIdx(-1); }}
               onMouseLeave={() => { setHoveredId(null); setAddingTagFor(null); }}
-              style={{ padding: '9px 10px 6px', cursor: 'pointer', background: isActive ? '#1e293b' : isHovered ? '#0f172a' : 'transparent', borderLeft: isActive ? '2px solid #2563eb' : '2px solid transparent', position: 'relative', transition: 'background 0.1s' }}
+              className={`px-2.5 py-2 cursor-pointer relative transition-colors border-l-2
+                ${isActive ? 'bg-surface-active border-l-accent-blue' : isKbFocused ? 'bg-surface-hover border-l-accent-blue/50' : isHovered ? 'bg-surface-hover border-l-transparent' : 'border-l-transparent'}`}
             >
-              {/* Pin indicator */}
-              {isPinned && <span style={{ position: 'absolute', top: 6, right: 6, fontSize: 9, color: '#ca8a04' }}>★</span>}
-
-              <div style={{ fontSize: 12, color: isActive ? '#e2e8f0' : '#94a3b8', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', paddingRight: 14, lineHeight: 1.4 }}>
+              {isPinned && <span className="absolute top-1.5 right-1.5 text-[9px] text-accent-yellow">★</span>}
+              <div className={`text-xs truncate pr-3 leading-snug ${isActive ? 'text-text-primary' : 'text-text-secondary'}`}>
                 {stripXml(s.preview)}
               </div>
-              <div style={{ fontSize: 10, color: '#334155', marginTop: 2 }}>{formatDate(s.updated_at)}</div>
+              <div className="text-[10px] text-border-strong mt-0.5">{formatDate(s.updated_at)}</div>
 
-              {/* Tags */}
-              {fullSession?.tags && fullSession.tags.length > 0 && (
-                <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap', marginTop: 4 }}>
-                  {fullSession.tags.map(tag => (
-                    <span key={tag} onClick={e => handleRemoveTag(e, s.session_id, tag)} title="Click to remove tag" style={{ fontSize: 9, background: '#1e293b', color: '#60a5fa', borderRadius: 3, padding: '1px 4px', cursor: 'pointer' }}>#{tag}</span>
+              {full?.tags && full.tags.length > 0 && (
+                <div className="flex gap-1 flex-wrap mt-1">
+                  {full.tags.map(tag => (
+                    <TagBadge key={tag} tag={tag} sessionId={s.session_id} onRemove={handleRemoveTag} />
                   ))}
                 </div>
               )}
 
-              {/* Hover actions */}
-              {isHovered && (
-                <div style={{ display: 'flex', gap: 4, marginTop: 4, alignItems: 'center' }}>
-                  <button onClick={e => togglePin(e, s.session_id)} title={isPinned ? 'Unpin' : 'Pin'} style={{ ...btnStyle, color: isPinned ? '#ca8a04' : '#475569' }}>★</button>
-                  <button onClick={e => { e.stopPropagation(); setAddingTagFor(addingTagFor === s.session_id ? null : s.session_id); setNewTag(''); }} title="Add tag" style={btnStyle}>#</button>
-                  <button onClick={e => handleDelete(e, s.session_id)} disabled={deletingId === s.session_id} title="Delete" style={{ ...btnStyle, marginLeft: 'auto', fontSize: 14 }}>×</button>
+              {/* Inline rename input */}
+              {mergingId === s.session_id ? (
+                <div onClick={e => e.stopPropagation()} className="mt-1 flex flex-col gap-1">
+                  <p className="text-[9px] text-text-faint">Merge this session into active?</p>
+                  <div className="flex gap-1">
+                    <button onClick={() => handleMerge(s.session_id)} disabled={merging}
+                      className="text-[9px] bg-accent-blue text-white rounded px-1.5 py-0.5 hover:bg-blue-600 transition-colors disabled:opacity-50">
+                      {merging ? '…' : 'Merge'}
+                    </button>
+                    <button onClick={() => setMergingId(null)}
+                      className="text-[9px] text-text-faint hover:text-text-muted transition-colors px-1">Cancel</button>
+                  </div>
+                </div>
+              ) : renamingId === s.session_id ? (
+                <div onClick={e => e.stopPropagation()} className="mt-1 flex gap-1">
+                  <input
+                    autoFocus
+                    value={renameValue}
+                    onChange={e => setRenameValue(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') handleRename(s.session_id);
+                      if (e.key === 'Escape') setRenamingId(null);
+                    }}
+                    onBlur={() => handleRename(s.session_id)}
+                    placeholder="Session name"
+                    className="flex-1 text-[10px] bg-surface-hover border border-border-strong rounded px-1.5 py-0.5 text-text-primary outline-none"
+                  />
+                </div>
+              ) : isHovered && (
+                <div className="flex gap-1 mt-1 items-center">
+                  <button onClick={e => togglePin(e, s.session_id)} title={isPinned ? 'Unpin' : 'Pin'}
+                    className={`text-xs px-0.5 hover:opacity-100 transition-opacity ${isPinned ? 'text-accent-yellow' : 'text-text-faint opacity-60'}`}>★</button>
+                  <button onClick={e => handleStartRename(e, s.session_id, s.preview)} title="Rename"
+                    className="text-xs text-text-faint opacity-60 hover:opacity-100 transition-opacity px-0.5">✎</button>
+                  <button onClick={e => { e.stopPropagation(); setAddingTagFor(addingTagFor === s.session_id ? null : s.session_id); setNewTag(''); }}
+                    className="text-xs text-text-faint opacity-60 hover:opacity-100 transition-opacity px-0.5">#</button>
+                  {s.session_id !== activeSessionId && (
+                    <button onClick={e => { e.stopPropagation(); setMergingId(s.session_id); }} title="Merge into active session"
+                      className="text-xs text-text-faint opacity-60 hover:opacity-100 transition-opacity px-0.5">⤵</button>
+                  )}
+                  <button onClick={e => handleDelete(e, s.session_id)} disabled={deletingId === s.session_id}
+                    className="text-sm text-text-faint opacity-60 hover:opacity-100 hover:text-red-400 transition-all ml-auto px-0.5">×</button>
                 </div>
               )}
 
-              {/* Inline tag input */}
               {addingTagFor === s.session_id && (
-                <div onClick={e => e.stopPropagation()} style={{ marginTop: 4, display: 'flex', gap: 4 }}>
-                  <input
-                    autoFocus
-                    value={newTag}
-                    onChange={e => setNewTag(e.target.value)}
+                <div onClick={e => e.stopPropagation()} className="mt-1 flex gap-1">
+                  <input autoFocus value={newTag} onChange={e => setNewTag(e.target.value)}
                     onKeyDown={e => { if (e.key === 'Enter') handleAddTag(s.session_id); if (e.key === 'Escape') setAddingTagFor(null); }}
                     placeholder="tag name"
-                    style={{ flex: 1, fontSize: 10, background: '#0f172a', border: '1px solid #334155', borderRadius: 4, color: '#e2e8f0', padding: '2px 5px', outline: 'none' }}
-                  />
-                  <button onClick={() => handleAddTag(s.session_id)} style={{ ...btnStyle, color: '#60a5fa' }}>+</button>
+                    className="flex-1 text-[10px] bg-surface-hover border border-border-strong rounded px-1.5 py-0.5 text-text-primary outline-none" />
+                  <button onClick={() => handleAddTag(s.session_id)}
+                    className="text-[10px] text-accent-blue-light hover:text-accent-blue transition-colors px-1">+</button>
                 </div>
               )}
             </div>
           );
         })}
-        {hasMore && !searchQuery && (
-          <button onClick={() => fetchSessions(false)} style={{ margin: '8px 10px', background: 'none', border: '1px solid #1e293b', borderRadius: 6, color: '#475569', cursor: 'pointer', fontSize: 11, padding: '5px 0' }}>
-            Load more
-          </button>
+        {/* Infinite scroll sentinel (replaces Load more button) */}
+        {hasMore && !searchQuery && !tagFilter && (
+          <div ref={loadMoreRef} className="h-4" aria-hidden="true" />
         )}
       </div>
     </div>

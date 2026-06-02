@@ -1,9 +1,30 @@
 'use client';
 import { Component, type ReactNode, type ErrorInfo } from 'react';
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
+
+async function reportClientError(error: Error, info: ErrorInfo, component?: string) {
+  try {
+    await fetch(`${API_BASE}/logs/client-error`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: error.message.slice(0, 500),
+        stack: (error.stack ?? '').slice(0, 5000),
+        component: (component ?? info.componentStack?.split('\n')[1] ?? '').slice(0, 200),
+        url: typeof window !== 'undefined' ? window.location.href.slice(0, 500) : '',
+        user_agent: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 300) : '',
+      }),
+    });
+  } catch {
+    // Telemetry must never throw
+  }
+}
+
 interface Props {
   children: ReactNode;
   fallback?: ReactNode;
+  component?: string;
 }
 
 interface State {
@@ -19,6 +40,7 @@ export class ErrorBoundary extends Component<Props, State> {
 
   componentDidCatch(error: Error, info: ErrorInfo) {
     console.error('[ErrorBoundary] Uncaught error:', error, info.componentStack);
+    reportClientError(error, info, this.props.component);
   }
 
   render() {

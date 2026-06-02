@@ -68,6 +68,50 @@ services:
       start_period: 30s
 
   # ─────────────────────────────────────────
+  # Agent Monitor MFE (port 3003)
+  # Real-time agent activity dashboard
+  # ─────────────────────────────────────────
+  monitor:
+    build:
+      context: ./web/apps/monitor
+      dockerfile: Dockerfile
+    container_name: agent-monitor
+    ports:
+      - "3003:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - agent-net
+    profiles:
+      - mfe
+
+  # ─────────────────────────────────────────
+  # Workflow Builder MFE (port 3004)
+  # Drag-and-drop LangGraph workflow editor
+  # ─────────────────────────────────────────
+  workflow-builder:
+    build:
+      context: ./web/apps/workflow
+      dockerfile: Dockerfile
+    container_name: agent-workflow
+    ports:
+      - "3004:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - agent-net
+    profiles:
+      - mfe
+
+  # ─────────────────────────────────────────
   # MongoDB - chat history
   # ─────────────────────────────────────────
   mongo:
