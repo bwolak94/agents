@@ -210,6 +210,7 @@ class LLMManager:
         # 3-level fallback: try requested model, then fallback chain
         fallback_chain = [model] + [m for m in LLM_FALLBACK_CHAIN if m != model]
         last_exc: Exception = ValueError(f"No models available for fallback")
+        primary_exc: Exception | None = None
         result: str = ""
 
         for attempt_model in fallback_chain:
@@ -250,6 +251,8 @@ class LLMManager:
                 break
             except (ValueError, asyncio.TimeoutError, TimeoutError) as exc:
                 last_exc = exc
+                if attempt_model == model and isinstance(exc, ValueError):
+                    primary_exc = exc
                 self.mark_model_unhealthy(attempt_model)
                 _mgr_logger.warning("Model %s failed (%s), trying next in chain", attempt_model, exc)
                 continue
@@ -259,7 +262,7 @@ class LLMManager:
                 _mgr_logger.exception("Model %s error, trying next in chain", attempt_model)
                 continue
         else:
-            raise last_exc
+            raise primary_exc if primary_exc is not None else last_exc
 
         # Structured LLM call log (#18)
         duration_ms = int((time.perf_counter() - t_start) * 1000)

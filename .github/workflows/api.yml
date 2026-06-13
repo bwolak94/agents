@@ -28,6 +28,20 @@ jobs:
     name: Test & Lint
     runs-on: ubuntu-latest
 
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ping:1})'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      MONGO_URL: mongodb://localhost:27017
+
     steps:
       - uses: actions/checkout@v4
 
@@ -57,17 +71,23 @@ jobs:
 
       - name: Generate coverage diff report
         if: github.event_name == 'pull_request'
+        id: coverage_diff
         run: |
           git fetch origin ${{ github.base_ref }} --depth=1
           diff-cover coverage.xml --compare-branch=origin/${{ github.base_ref }} \
             --markdown-report=coverage_diff.md --fail-under=0 || true
+          content=$(cat coverage_diff.md 2>/dev/null || echo "_No coverage diff available._")
+          echo "report<<EOF" >> $GITHUB_OUTPUT
+          echo "$content" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Post coverage diff as PR comment
         if: github.event_name == 'pull_request'
+        continue-on-error: true
         uses: marocchino/sticky-pull-request-comment@v2
         with:
-          path: coverage_diff.md
           header: Coverage Delta
+          message: ${{ steps.coverage_diff.outputs.report }}
 
   build:
     name: Docker Build
