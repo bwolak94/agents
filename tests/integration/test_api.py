@@ -330,7 +330,7 @@ class TestSessionsEndpoint:
             mock_list.return_value = []
             resp = client.get("/sessions?limit=5&skip=10")
         assert resp.status_code == 200
-        mock_list.assert_awaited_once_with(limit=5, skip=10)
+        mock_list.assert_awaited_once_with(limit=5, skip=10, after=None)
 
 
 # ─── Analytics ────────────────────────────────────────────────────────────────
