@@ -77,7 +77,7 @@ jobs:
             --markdown-report=coverage_diff.md --fail-under=0 || true
 
       - name: Post coverage diff as PR comment
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && hashFiles('coverage_diff.md') != ''
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           path: coverage_diff.md
