@@ -165,7 +165,7 @@ class CodeExecutorTool:
 
     async def _execute(self, code: str) -> str:
         # Use an isolated temp directory per execution
-        with tempfile.TemporaryDirectory(prefix="agent_exec_", dir=str(WORKSPACE_DIR)) as exec_dir:
+        with tempfile.TemporaryDirectory(prefix="agent_exec_", dir=str(WORKSPACE_DIR), ignore_cleanup_errors=True) as exec_dir:
             tmp_path = Path(exec_dir) / "script.py"
             tmp_path.write_text(code)
 

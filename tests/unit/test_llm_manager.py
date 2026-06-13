@@ -153,14 +153,14 @@ class TestLLMManager:
     async def test_call_raises_value_error_for_unknown_model(self):
         config = {"anthropic_api_key": "key", "gemini_api_key": "", "ollama_url": "http://localhost:11434"}
         mgr = LLMManager(config)
-        with pytest.raises(ValueError, match="Nieznany model"):
+        with pytest.raises(ValueError, match="Unknown model"):
             await mgr.call(model="gpt-99-turbo", messages=[{"role": "user", "content": "hi"}])
 
     @pytest.mark.asyncio
     async def test_call_raises_value_error_when_claude_key_missing(self):
         config = {"anthropic_api_key": "", "gemini_api_key": "", "ollama_url": "http://localhost:11434"}
         mgr = LLMManager(config)
-        with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
+        with pytest.raises(ValueError, match="Anthropic API key not configured"):
             await mgr.call(model="claude", messages=[{"role": "user", "content": "hi"}])
 
     @pytest.mark.asyncio
